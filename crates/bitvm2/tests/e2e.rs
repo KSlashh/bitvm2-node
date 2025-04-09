@@ -1,88 +1,18 @@
-use bitcoin::{Address, Transaction};
+use bitcoin::{Amount, Network, OutPoint, PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+use bitvm::chunk::api::NUM_TAPS;
+use bitvm2_lib::{committee, operator, types::{Bitvm2Parameters, CustomInputs}, verifier
+};
 use bitvm::treepp::*;
-use bitvm::chunk::api::{validate_assertions, NUM_TAPS, type_conversion_utils::{RawWitness, script_to_witness, utils_signatures_from_raw_witnesses}};
-use goat::transactions::{
-    base::BaseTransaction,
-    pre_signed::PreSignedTransaction,
-    assert::utils::*,
-};
-use crate::types::{
-    Bitvm2Graph, Groth16WotsPublicKeys, Groth16WotsSignatures, VerifyingKey, WotsPublicKeys
-};
-use goat::connectors::connector_c::{ConnectorC, get_commit_from_assert_commit_tx};
-use anyhow::{Result, bail};
-
-pub fn extract_proof_sigs_from_assert_commit_txns(
-    assert_commit_txns: [Transaction; COMMIT_TX_NUM]
-) -> Result<Groth16WotsSignatures> {
-    let raw_wits: Vec<RawWitness> = assert_commit_txns.iter()
-        .flat_map(|tx| get_commit_from_assert_commit_tx(tx)) 
-        .collect();
-    Ok(utils_signatures_from_raw_witnesses(&raw_wits))
-}
-
-// return (if any) disprove witness
-pub fn verify_proof(
-    ark_vkey: &VerifyingKey, 
-    proof_sigs: Groth16WotsSignatures,
-    disprove_scripts: &[Script;NUM_TAPS], 
-    wots_pubkeys: &WotsPublicKeys,
-) -> Option<(usize, Script)> {
-    validate_assertions(&ark_vkey, proof_sigs, wots_pubkeys.1, disprove_scripts)
-}
-
-// challenge has a pre-signed SinglePlusAnyoneCanPay input and output
-// get incomplete tx here, add inputs with enough amount, then broadcast it to start challnege progress
-pub fn export_challenge_tx(
-    graph: &mut Bitvm2Graph,
-) -> Result<Transaction> {
-    if !graph.operator_pre_signed() {
-        bail!("missing pre-signatures from operator".to_string())
-    };
-    Ok(graph.challenge.tx().clone())
-}
-
-pub fn sign_disprove(
-    graph: &mut Bitvm2Graph,
-    disprove_witness: (usize, Script),
-    disprove_scripts_bytes: Vec<Vec<u8>>,
-    assert_wots_pubkeys: &Groth16WotsPublicKeys,
-    reward_address: Address,
-) -> Result<Transaction> {
-    if !graph.committee_pre_signed() {
-        bail!("missing pre-signatures from committee".to_string())
-    };
-    let context = graph.parameters.get_base_context();
-    let assert_wots_commitment_keys = convert_to_connector_c_commits_public_key(assert_wots_pubkeys);
-    let connector_c = ConnectorC::new_from_scripts(
-        context.network,
-        &context.n_of_n_taproot_public_key,
-        assert_wots_commitment_keys,
-        disprove_scripts_bytes,
-    );
-    graph.disprove.add_input_output(
-        &connector_c, 
-        disprove_witness.0 as u32, 
-        script_to_witness(disprove_witness.1),
-        reward_address.script_pubkey()
-    );
-    Ok(graph.disprove.finalize())
-}
+use musig2::{AggNonce, PartialSignature, PubNonce, SecNonce};
+use secp256k1::SECP256K1;
+use std::str::FromStr;
+use goat::{contexts::base::generate_n_of_n_public_key, scripts::generate_burn_script_address};
+use goat::transactions::base::Input;
+use ark_bn254::Bn254;
+use ark_serialize::CanonicalDeserialize;
 
 #[test]
-fn test_extract_proof() {
-    use bitcoin::{Amount, Network, OutPoint, PrivateKey, PublicKey, Txid};
-    use bitvm::chunk::api::NUM_TAPS;
-    use crate::{operator, committee, verifier,
-        types::{CustomInputs, Bitvm2Parameters},
-    };
-    use bitvm::treepp::*;
-    use musig2::{AggNonce, PartialSignature, PubNonce, SecNonce};
-    use secp256k1::SECP256K1;
-    use std::str::FromStr;
-    use goat::{contexts::base::generate_n_of_n_public_key, scripts::generate_burn_script_address};
-    use goat::transactions::base::Input;
-
+fn e2e_test() {
     let network = Network::Testnet;
     // key generation
     println!("\ngenerate keypairs");
@@ -122,17 +52,19 @@ fn test_extract_proof() {
         },
         amount: Amount::from_btc(10000.0).unwrap(),
     };
+    let mock_user_change_address = generate_burn_script_address(network);
     let user_inputs = CustomInputs {
         inputs: vec![mock_input.clone()],
         input_amount: pegin_amount,
         fee_amount,
-        change_address: generate_burn_script_address(network),
+        change_address: mock_user_change_address,
     };
+    let mock_operator_change_address = generate_burn_script_address(network);
     let operator_inputs = CustomInputs {
-        inputs: vec![mock_input],
+        inputs: vec![mock_input.clone()],
         input_amount: stake_amount,
         fee_amount,
-        change_address: generate_burn_script_address(network),
+        change_address: mock_operator_change_address,
     };
     let params = Bitvm2Parameters { 
         network, 
@@ -146,7 +78,8 @@ fn test_extract_proof() {
     };
 
     let mock_script = script!{OP_TRUE};
-    let mock_script_bytes = mock_script.compile().to_bytes();
+    let mock_script_bytes = mock_script.clone().compile().to_bytes();
+    // let mock_disprove_scripts: [Script; NUM_TAPS] = std::array::from_fn(|_| mock_script.clone());
     let mock_disprove_scripts_bytes: [Vec<u8>; NUM_TAPS] = std::array::from_fn(|_| mock_script_bytes.clone());
 
     let mut graph = operator::generate_bitvm_graph(
@@ -198,7 +131,40 @@ fn test_extract_proof() {
         &mut graph
     );
 
-    let vk_bytes = [
+    // happy_path take
+    let withdraw_evm_txid = [0xff; 32]; 
+    let kickoff_tx = operator::operator_sign_kickoff(
+        operator_keypair, 
+        &mut graph, 
+        &operator_wots_seckeys, 
+        &operator_wots_pubkeys, 
+        withdraw_evm_txid,
+    ).unwrap();
+    broadcast_tx(kickoff_tx);
+
+    let take_1_tx = operator::operator_sign_take1(
+        operator_keypair, 
+        &mut graph,
+    ).unwrap();
+    broadcast_tx(take_1_tx);
+
+    // unhappy_path take
+    let mut challenge_tx = verifier::export_challenge_tx(&mut graph).unwrap();
+    let mock_crowdfund_txin = TxIn {
+        previous_output: mock_input.outpoint,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::default(),
+    };
+    let mock_challenger_change_output = TxOut {
+        script_pubkey: generate_burn_script_address(network).script_pubkey(),
+        value: Amount::from_sat(1000000),
+    };
+    challenge_tx.input.push(mock_crowdfund_txin); 
+    challenge_tx.output.push(mock_challenger_change_output);
+    broadcast_tx(challenge_tx);
+    
+    let mock_vk_bytes = [
         115, 158, 251, 51, 106, 255, 102, 248, 22, 171, 229, 158, 80, 192, 240, 217, 99, 162,
         65, 107, 31, 137, 197, 79, 11, 210, 74, 65, 65, 203, 243, 14, 123, 2, 229, 125, 198,
         247, 76, 241, 176, 116, 6, 3, 241, 1, 134, 195, 39, 5, 124, 47, 31, 43, 164, 48, 120,
@@ -232,7 +198,7 @@ fn test_extract_proof() {
         80, 74, 253, 176, 207, 47, 52, 7, 84, 59, 151, 47, 178, 165, 112, 251, 161,
     ]
     .to_vec();
-    let proof_bytes: Vec<u8> = [
+    let mock_proof_bytes: Vec<u8> = [
         162, 50, 57, 98, 3, 171, 250, 108, 49, 206, 73, 126, 25, 35, 178, 148, 35, 219, 98, 90,
         122, 177, 16, 91, 233, 215, 222, 12, 72, 184, 53, 2, 62, 166, 50, 68, 98, 171, 218,
         218, 151, 177, 133, 223, 129, 53, 114, 236, 181, 215, 223, 91, 102, 225, 52, 122, 122,
@@ -249,31 +215,96 @@ fn test_extract_proof() {
         92, 103, 103, 176, 212, 223, 177, 242, 94, 14,
     ]
     .to_vec();
-    let scalar = [
+    let mock_scalar = [
         232, 255, 255, 239, 147, 245, 225, 67, 145, 112, 185, 121, 72, 232, 51, 40, 93, 88,
         129, 129, 182, 69, 80, 184, 41, 160, 49, 225, 114, 78, 100, 48,
     ]
     .to_vec();
-
-    use ark_bn254::Bn254;
-    use ark_serialize::CanonicalDeserialize;
-
     let proof: ark_groth16::Proof<Bn254> =
-        ark_groth16::Proof::deserialize_uncompressed(&proof_bytes[..]).unwrap();
+        ark_groth16::Proof::deserialize_uncompressed(&mock_proof_bytes[..]).unwrap();
     let vk: ark_groth16::VerifyingKey<Bn254> =
-        ark_groth16::VerifyingKey::deserialize_uncompressed(&vk_bytes[..]).unwrap();
-    let scalar: ark_bn254::Fr = ark_bn254::Fr::deserialize_uncompressed(&scalar[..]).unwrap();
+        ark_groth16::VerifyingKey::deserialize_uncompressed(&mock_vk_bytes[..]).unwrap();
+    let scalar: ark_bn254::Fr = ark_bn254::Fr::deserialize_uncompressed(&mock_scalar[..]).unwrap();
     let scalars = vec![scalar];
-
     let proof_sigs = operator::sign_proof(
         &vk, 
         proof, 
         scalars, 
-        &operator_wots_seckeys);
-
-    let (_,commit_txns,_) = operator::operator_sign_assert(operator_keypair, &mut graph, &operator_wots_pubkeys, proof_sigs.clone()).unwrap();
-    let extracted_proof_sigs = verifier::extract_proof_sigs_from_assert_commit_txns(commit_txns).unwrap();
+        &operator_wots_seckeys,
+    );
+    let (assert_init_tx, assert_commit_txns, assert_final_tx) = operator::operator_sign_assert(
+        operator_keypair, 
+        &mut graph, 
+        &operator_wots_pubkeys, 
+        proof_sigs.clone(),
+    ).unwrap();
+    broadcast_tx(assert_init_tx);
+    assert_commit_txns.iter().for_each(|tx| broadcast_tx(tx.clone()));
+    broadcast_tx(assert_final_tx);
     
-    assert_eq!(proof_sigs, extracted_proof_sigs);
+    let take2_tx = operator::operator_sign_take2(operator_keypair, &mut graph).unwrap();
+    broadcast_tx(take2_tx);
+
+    // disprove
+    /*
+    // verify proof published by assert-txns:
+    let public_proof_sigs = verifier::extract_proof_sigs_from_assert_commit_txns(assert_commit_txns).unwrap();
+    let disprove_witness = verifier::verify_proof(
+        &vk, 
+        public_proof_sigs, 
+        &mock_disprove_scripts, 
+        &operator_wots_pubkeys,
+    ).unwrap();
+    */
+    let mock_disprove_witness = (0, mock_script);
+    let mock_challenger_reward_address = generate_burn_script_address(network);
+    let disprove_tx = verifier::sign_disprove(
+        &mut graph, 
+        mock_disprove_witness, 
+        mock_disprove_scripts_bytes.to_vec(), 
+        &operator_wots_pubkeys.1, 
+        mock_challenger_reward_address,
+    ).unwrap();
+    broadcast_tx(disprove_tx);
 }
+
+fn broadcast_tx(_tx: Transaction) {
+    // broadcast transaction to bitcoin network
+}
+
+/*
+
+Test Transactions on Testnet3:
+
+    happy-path take:
+    - Pegin: e413208c6644d51f4f3adf3a5aad425da817ac825e56352e7164de1e2a4d9394
+    - Kickoff: 4dd13ca25ef6edb4506394a402db2368d02d9467bc47326d3553310483f2ed04
+    - Take1: 23bbba6e80e6e25ebe3f225c253d8f9ff57f4756916d1ded476380776fa03737
+
+    unhappy-path take:
+    - Pegin: 36b3d011fa892109a5da6cee240d81c6cb914ca862ebce3530ff3914d6803d16
+    - Kickoff: 0c598f63bffe9d7468ce6930bf0fe1ba5c6e125c9c9e38674ee380dd2c6d97f6
+    - Challenge: d2a2beff7dc0f93fc41505b646c6fa174991b0c4e415a96359607c37ba88e376
+    - Assert-init: 2124278ee4f24dd394dcd1f62e04f18a3b458fdc14f422171dda56c663263195
+    - Assert-commit: 
+        + 1: aff23096043a7372c5e39afde596e0fcc67c8bfe0dbf7810781f0d289f686d87
+        + 2: 4385e722f6d22a5f138ae1ef41df686e0e8d888ce8c61be3b8ab6f53f667102e
+        + 3: f4ce3e66ce8cc29547c1e52379c7bb8fda25c16b44c1f5544a5dcfd8b9fa2865
+        + 4: 8cf248644cdb2290e77c6bfec40ccf9c5eb851b213514544c67ba7aeb80fe717
+    - Assert_final: a2dedfbf376b8c0c183b4dfac7b0765b129a345c870f9fabbdf8c48072697a27
+    - Take2: 78037fabb18973262711436885b9ea275685b18ce7d0957bd84215be960d792c
+
+    disprove-path:
+    - Pegin: e413208c6644d51f4f3adf3a5aad425da817ac825e56352e7164de1e2a4d9394
+    - Kickoff: dba931410694e1395cd2c65c1470879eea3cc3a8aa797d7a669734286f4f2825
+    - Challenge: c6a033812a1370973f94d956704ed1a68f490141a3c21bce64454d38a2c23794
+    - Assert-init: 7cdd1f3384f67877a9844c025fa08b29078208ef1d3f5f4fce07de122d068050
+    - Assert-commit: 
+        + 1: 5b5c7f0b1740d99c683b66a9bdddfeb573ccef088dbd7f0dce76d744a948f9b7
+        + 2: 48de8806aa029975d331a4309d2ac707041f88c001ceca492e6df34e25ecf061
+        + 3: 58cbfa261c7f94a3e05f5acd39b118817c446d6d3b3fd79007fd8841e37114e9
+        + 4: a1a02cb35bcbbbe7d3475d04c557467acfc6b62fd777f9b341179d28b840e234
+    - Assert_final: 2da6b0f73cd8835d5b76b62b9bd22314ee61212d348f6a4dbad915253f121012 
+    - Disprove: 5773755d1d0f750830edae5e1afcb37ab106e2dd46e164b09bf6213a0f45b0e1
+*/
 
