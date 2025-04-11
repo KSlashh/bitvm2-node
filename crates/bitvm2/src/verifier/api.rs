@@ -28,7 +28,7 @@ pub fn verify_proof(
     disprove_scripts: &[Script;NUM_TAPS], 
     wots_pubkeys: &WotsPublicKeys,
 ) -> Option<(usize, Script)> {
-    validate_assertions(&ark_vkey, proof_sigs, wots_pubkeys.1, disprove_scripts)
+    validate_assertions(&ark_vkey, proof_sigs, *wots_pubkeys.1, disprove_scripts)
 }
 
 // challenge has a pre-signed SinglePlusAnyoneCanPay input and output
@@ -143,6 +143,9 @@ fn test_extract_proof() {
         committee_pubkeys, 
         committee_agg_pubkey, 
         operator_pubkey, 
+        operator_wots_pubkeys: operator_wots_pubkeys.clone(),
+        user_inputs,
+        operator_inputs,
     };
 
     let mock_script = script!{OP_TRUE};
@@ -150,10 +153,7 @@ fn test_extract_proof() {
     let mock_disprove_scripts_bytes: [Vec<u8>; NUM_TAPS] = std::array::from_fn(|_| mock_script_bytes.clone());
 
     let mut graph = operator::generate_bitvm_graph(
-        user_inputs, 
-        operator_inputs, 
         params, 
-        &operator_wots_pubkeys, 
         mock_disprove_scripts_bytes.to_vec(),
     ).unwrap();
 
