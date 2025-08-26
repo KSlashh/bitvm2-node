@@ -1,24 +1,18 @@
-[workspace]
 [package]
-name = "covenant-guest"
-version = "1.1.0"
-edition = "2021"
-publish = false
+name = "header-chain"
+version.workspace = true
+edition.workspace = true
+#resolver.workspace = true
 
 [dependencies]
-libc = { version = "0.2", features = ["extra_traits"] }
-bincode = "1.3.3"
-# workspace
-guest-executor = { git = "https://github.com/ProjectZKM/reth-processor" }
-# guest-executor = { path = "../../../reth-processor/crates/executor/guest" }
+borsh = {version = "1.5.3", features = ["derive"] }
+sha2 =  { version = "0.10.8", default-features = false }
+bitcoin = { workspace = true, features = ["serde", "rand", "secp-recovery"] }
+serde = { version = "1.0", default-features = false }
+crypto-bigint = { version = "0.5.5", default-features = false }
 
-# Ziren
-zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", package = "zkm-zkvm" }
-#zkm-zkvm = { path = "../../../Ziren/crates/zkvm/entrypoint" }
-
-# Statically turns off logging
-log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
-tracing = { version = "0.1", features = ["max_level_off", "release_max_level_off"] }
+[dev-dependencies]
+hex-literal = "1.0.0"
 
 [patch.crates-io]
 # Precompile patches
@@ -29,3 +23,4 @@ p256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "pat
 alloy-primitives-v1-0-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.0.0" }
 alloy-primitives-v1-1-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.0" }
 alloy-primitives-v1-1-2 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.2" }
+secp256k1 = { git = "https://github.com/ziren-patches/rust-secp256k1", branch = "patch-0.30.0" }
