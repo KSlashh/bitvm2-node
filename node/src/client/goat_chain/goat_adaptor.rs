@@ -5,7 +5,7 @@ use crate::client::goat_chain::chain_adaptor::{
 use crate::client::goat_chain::goat_adaptor::IGateway::IGatewayInstance;
 use crate::client::goat_chain::goat_adaptor::ISequencerSetPublisher::ISequencerSetPublisherInstance;
 use alloy::eips::BlockNumberOrTag;
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash};
 use alloy::providers::Identity;
 use alloy::providers::fillers::{FillProvider, JoinFill, RecommendedFillers};
 use alloy::rpc::types::TransactionReceipt;
@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
+
 sol!(
     #[derive(Debug)]
     #[allow(missing_docs)]
@@ -118,9 +119,7 @@ sol!(
         address public  bitcoinSPV;
         address public  relayer;
         uint256 public responseWindowBlocks;
-        mapping(bytes32 => bool) public peginTxUsed;
         mapping(bytes16 instanceId => PeginData) public peginDataMap;
-        mapping(bytes16 graphId => bool) public operatorWithdrawn;
         mapping(bytes16 graphId => GraphData) public graphDataMap;
         mapping(bytes16 graphId => WithdrawData) public withdrawDataMap;
         bytes16[] public instanceIds;
@@ -142,6 +141,7 @@ sol!(
         function finishWithdrawUnhappyPath(bytes16 graphId, BitcoinTx calldata rawTake2Tx, BitcoinTxProof calldata take2Proof) external;
         function finishWithdrawDisproved(bytes16 graphId, BitcoinTx calldata rawDisproveTx, BitcoinTxProof calldata disproveProof, BitcoinTx calldata rawChallengeTx, BitcoinTxProof calldata ngeCProof) external;
         function verifyMerkleProof(bytes32 root,bytes32[] memory proof, bytes32 leaf,uint256 index) public pure returns (bool);
+        function postPeginRequest(bytes16 instanceId, uint64 peginAmountSats, uint64[3] calldata txnFees, address receiverAddress, Utxo[] calldata userInputs, bytes32 userXonlyPubkey, string calldata userChangeAddress, string calldata userRefundAddress) external payable;
         function answerPeginRequest(bytes16 instanceId, bytes32 committeeXonlyPubkey) onlyCommittee() external;
         function getPeginData(bytes16 instanceId) external view returns (PeginData memory);
         function getGraphData(bytes16 graphId) external view returns (GraphData memory);
@@ -370,6 +370,16 @@ impl From<&IGateway::Utxo> for Utxo {
     }
 }
 
+impl From<&Utxo> for IGateway::Utxo {
+    fn from(value: &Utxo) -> Self {
+        Self {
+            txid: FixedBytes::from_slice(&value.txid),
+            vout: value.vout,
+            amountSats: value.amount_stats,
+        }
+    }
+}
+
 impl From<IGateway::PeginData> for PeginData {
     fn from(value: IGateway::PeginData) -> Self {
         Self {
@@ -481,22 +491,12 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(self.provider.get_transaction_receipt(TxHash::from_str(tx_hash)?).await?)
     }
 
-    async fn pegin_tx_used(&self, tx_id: &[u8; 32]) -> anyhow::Result<bool> {
-        let gateway = self.get_gateway()?;
-        Ok(gateway.peginTxUsed(FixedBytes::<32>::from_slice(tx_id)).call().await?)
-    }
-
-    async fn get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
+    async fn gateway_get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
         let gateway = self.get_gateway()?;
         Ok(gateway.getPeginData(FixedBytes::<16>::from_slice(instance_id)).call().await?.into())
     }
 
-    async fn is_operator_withdraw(&self, graph_id: &[u8; 16]) -> anyhow::Result<bool> {
-        let gateway = self.get_gateway()?;
-        Ok(gateway.operatorWithdrawn(FixedBytes::<16>::from_slice(graph_id)).call().await?)
-    }
-
-    async fn get_withdraw_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<WithdrawData> {
+    async fn gateway_get_withdraw_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<WithdrawData> {
         let gateway = self.get_gateway()?;
         let res = gateway.withdrawDataMap(FixedBytes::<16>::from_slice(graph_id)).call().await?;
         Ok(WithdrawData {
@@ -509,17 +509,48 @@ impl ChainAdaptor for GoatAdaptor {
         })
     }
 
-    async fn get_graph_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<GraphData> {
+    async fn gateway_get_graph_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<GraphData> {
         let gateway = self.get_gateway()?;
         Ok(gateway.getGraphData(FixedBytes::<16>::from_slice(graph_id)).call().await?.into())
     }
 
-    async fn get_response_window_blocks(&self) -> anyhow::Result<u64> {
+    async fn gateway_get_response_window_blocks(&self) -> anyhow::Result<u64> {
         let gateway = self.get_gateway()?;
         Ok(gateway.responseWindowBlocks().call().await?.try_into()?)
     }
 
-    async fn answer_pegin_request(
+    async fn gateway_post_pegin_request(
+        &self,
+        instance_id: &[u8; 16],
+        pegin_amount_sats: u64,
+        tx_fees: &[u64; 3],
+        receiver_addr: &[u8; 20],
+        user_inputs: &[Utxo],
+        user_xonly_pubkey: &[u8; 32],
+        user_change_addr: &str,
+        user_refund_addr: &str,
+    ) -> anyhow::Result<String> {
+        let gateway = self.get_gateway()?;
+        let user_inputs: Vec<IGateway::Utxo> = user_inputs.iter().map(|u| u.into()).collect();
+        let tx_request = gateway
+            .postPeginRequest(
+                FixedBytes::from_slice(instance_id),
+                pegin_amount_sats,
+                tx_fees.clone(),
+                Address::from_slice(receiver_addr),
+                user_inputs,
+                FixedBytes::from_slice(user_xonly_pubkey),
+                user_change_addr.to_string(),
+                user_refund_addr.to_string(),
+            )
+            .from(self.get_default_signer_address())
+            .chain_id(self.chain_id)
+            .into_transaction_request();
+        let res = self.handle_transaction_request(tx_request).await?;
+        Ok(res.to_string())
+    }
+
+    async fn gateway_answer_pegin_request(
         &self,
         instance_id: &[u8; 16],
         committee_xonly_pubkey: &[u8; 32],
@@ -538,7 +569,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(res.to_string())
     }
 
-    async fn post_pegin_data(
+    async fn gateway_post_pegin_data(
         &self,
         instance_id: &[u8; 16],
         raw_pgin_tx: &BitcoinTx,
@@ -558,7 +589,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(res.to_string())
     }
 
-    async fn post_graph_data(
+    async fn gateway_post_graph_data(
         &self,
         instance_id: &[u8; 16],
         graph_id: &[u8; 16],
@@ -581,12 +612,12 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(res.to_string())
     }
 
-    async fn get_btc_block_hash(&self, height: u64) -> anyhow::Result<[u8; 32]> {
+    async fn gateway_get_btc_block_hash(&self, height: u64) -> anyhow::Result<[u8; 32]> {
         let gateway = self.get_gateway()?;
         Ok(gateway.getBlockHash(U256::from(height)).call().await?.0)
     }
 
-    async fn parse_btc_block_header(
+    async fn gateway_parse_btc_block_header(
         &self,
         raw_header: &[u8],
     ) -> anyhow::Result<([u8; 32], [u8; 32])> {
@@ -595,7 +626,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok((res.blockHash.0, res.merkleRoot.0))
     }
 
-    async fn get_initialized_ids(&self) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
+    async fn gateway_get_initialized_ids(&self) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
         let gateway = self.get_gateway()?;
         let ids = gateway.getInitializedInstanceIds().call().await?;
         let instance_ids: Vec<Uuid> =
@@ -605,7 +636,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(instance_ids.into_iter().zip(graph_ids).collect())
     }
 
-    async fn get_instanceids_by_pubkey(
+    async fn gateway_get_instanceids_by_pubkey(
         &self,
         operator_pubkey: &[u8; 32],
     ) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
@@ -621,7 +652,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(instance_ids.into_iter().zip(graph_ids).collect())
     }
 
-    async fn init_withdraw(
+    async fn gateway_init_withdraw(
         &self,
         instance_id: &[u8; 16],
         graph_id: &[u8; 16],
@@ -636,7 +667,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(tx_hash.to_string())
     }
 
-    async fn cancel_withdraw(&self, graph_id: &[u8; 16]) -> anyhow::Result<String> {
+    async fn gateway_cancel_withdraw(&self, graph_id: &[u8; 16]) -> anyhow::Result<String> {
         let gateway = self.get_gateway()?;
         let tx_request = gateway
             .cancelWithdraw(FixedBytes::from_slice(graph_id))
@@ -647,7 +678,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(tx_hash.to_string())
     }
 
-    async fn process_withdraw(
+    async fn gateway_process_withdraw(
         &self,
         graph_id: &[u8; 16],
         raw_kickoff_tx: &BitcoinTx,
@@ -667,7 +698,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(tx_hash.to_string())
     }
 
-    async fn finish_withdraw_happy_path(
+    async fn gateway_finish_withdraw_happy_path(
         &self,
         graph_id: &[u8; 16],
         raw_take1_tx: &BitcoinTx,
@@ -687,7 +718,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(tx_hash.to_string())
     }
 
-    async fn finish_withdraw_unhappy_path(
+    async fn gateway_finish_withdraw_unhappy_path(
         &self,
         graph_id: &[u8; 16],
         raw_take2_tx: &BitcoinTx,
@@ -707,7 +738,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(tx_hash.to_string())
     }
 
-    async fn finish_withdraw_disproved(
+    async fn gateway_finish_withdraw_disproved(
         &self,
         graph_id: &[u8; 16],
         raw_disproved_tx: &BitcoinTx,
@@ -731,7 +762,7 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(tx_hash.to_string())
     }
 
-    async fn verify_merkle_proof(
+    async fn gateway_verify_merkle_proof(
         &self,
         root: &[u8; 32],
         proof: &[[u8; 32]],
@@ -752,12 +783,12 @@ impl ChainAdaptor for GoatAdaptor {
             .await?)
     }
 
-    async fn get_stake_amount_check_info(&self) -> anyhow::Result<(u64, u64)> {
+    async fn gateway_get_stake_amount_check_info(&self) -> anyhow::Result<(u64, u64)> {
         let gateway = self.get_gateway()?;
         Ok((gateway.minStakeAmountSats().call().await?, gateway.stakeRate().call().await?))
     }
 
-    async fn get_pegin_fee_check_info(&self) -> anyhow::Result<(u64, u64)> {
+    async fn gateway_get_pegin_fee_check_info(&self) -> anyhow::Result<(u64, u64)> {
         let gateway = self.get_gateway()?;
         Ok((gateway.minPeginFeeSats().call().await?, gateway.peginFeeRate().call().await?))
     }
