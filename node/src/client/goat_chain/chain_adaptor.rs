@@ -13,6 +13,18 @@ pub trait ChainAdaptor: Send + Sync {
     async fn get_finalized_block_number(&self) -> anyhow::Result<i64>;
     async fn get_latest_block_number(&self) -> anyhow::Result<i64>;
     async fn get_tx_receipt(&self, tx_hash: &str) -> anyhow::Result<Option<TransactionReceipt>>;
+
+    async fn gateway_get_min_challenge_amount_sats(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_pegin_fee_sats(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_pegin_fee_rate(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_operator_reward_sats(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_operator_reward_rate(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_disprover_reward(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_slash_amount(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_committee_management(&self) -> anyhow::Result<[u8; 20]>;
+    async fn gateway_get_stake_management(&self) -> anyhow::Result<[u8; 20]>;
     async fn gateway_get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData>;
     async fn gateway_get_withdraw_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<WithdrawData>;
     async fn gateway_get_graph_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<GraphData>;
@@ -104,8 +116,6 @@ pub trait ChainAdaptor: Send + Sync {
         index: u64,
     ) -> anyhow::Result<bool>;
 
-    async fn gateway_get_stake_amount_check_info(&self) -> anyhow::Result<(u64, u64)>;
-    async fn gateway_get_pegin_fee_check_info(&self) -> anyhow::Result<(u64, u64)>;
     async fn seq_set_pub_get_last_block_height(&self) -> anyhow::Result<u64>;
     async fn seq_set_pub_update_sequencer_set(
         &self,
@@ -119,6 +129,34 @@ pub trait ChainAdaptor: Send + Sync {
         sequencer_set: &SequencerSet,
         sequencer_set_cmt_sigs: &[u8],
     ) -> anyhow::Result<String>;
+    async fn stake_mana_stake_token_address(&self) -> anyhow::Result<[u8; 20]>;
+    async fn stake_mana_pubkey_to_address(&self, pubkey: &[u8; 32]) -> anyhow::Result<[u8; 20]>;
+    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64>;
+    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64>;
+    async fn stake_mana_slash_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String>;
+    async fn stake_mana_lock_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String>;
+    async fn stake_mana_unlock_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String>;
+    async fn committee_mana_is_committee_member(&self, member: &[u8; 20]) -> anyhow::Result<bool>;
+
+    async fn committee_mana_committee_size(&self) -> anyhow::Result<u64>;
+    async fn committee_mana_quorum_size(&self) -> anyhow::Result<u64>;
+    async fn committee_mana_verify_signatures(
+        &self,
+        msg_hash: &[u8; 32],
+        signs: &[Vec<u8>],
+    ) -> anyhow::Result<bool>;
 }
 #[derive(Eq, PartialEq, Clone, Copy)]
 pub enum GoatNetwork {
@@ -211,15 +249,14 @@ pub struct WithdrawData {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphData {
-    pub stake_amount_sats: u64,
     pub operator_pubkey_prefix: u8,
     pub operator_pubkey: [u8; 32],
     pub pegin_txid: [u8; 32],
     pub kickoff_txid: [u8; 32],
     pub take1_txid: [u8; 32],
     pub take2_txid: [u8; 32],
-    pub assert_timeout_txid: [u8; 32],
     pub commit_timout_txid: [u8; 32],
+    pub assert_timeout_txids: Vec<[u8; 32]>,
     pub nack_txids: Vec<[u8; 32]>,
 }
 
@@ -259,12 +296,4 @@ pub fn get_chain_adaptor(
         GoatNetwork::Test => Box::new(GoatAdaptor::new(goat_config)),
         GoatNetwork::Local => Box::new(MockAdaptor::new(mock_adaptor_config)),
     }
-}
-
-#[test]
-fn sdd() {
-    println!(
-        "{}",
-        serde_json::to_string(&Utxo { txid: [1_u8; 32], vout: 0, amount_stats: 110 }).unwrap()
-    );
 }

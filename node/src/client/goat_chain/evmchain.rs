@@ -37,6 +37,49 @@ impl EvmChain {
         self.adaptor.gateway_get_response_window_blocks().await
     }
 
+    pub async fn gateway_get_min_challenge_amount_sats(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_challenge_amount_sats().await
+    }
+
+    pub async fn gateway_get_min_pegin_fee_sats(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_pegin_fee_sats().await
+    }
+
+    pub async fn gateway_get_pegin_fee_rate(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_pegin_fee_rate().await
+    }
+
+    pub async fn gateway_get_min_operator_reward_sats(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_operator_reward_sats().await
+    }
+
+    pub async fn gateway_get_operator_reward_rate(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_operator_reward_rate().await
+    }
+
+    pub async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_stake_amount().await
+    }
+
+    pub async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_challenger_reward().await
+    }
+
+    pub async fn gateway_get_min_disprover_reward(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_disprover_reward().await
+    }
+
+    pub async fn gateway_get_min_slash_amount(&self) -> anyhow::Result<u64> {
+        self.adaptor.gateway_get_min_slash_amount().await
+    }
+
+    pub async fn gateway_get_committee_management(&self) -> anyhow::Result<[u8; 20]> {
+        self.adaptor.gateway_get_committee_management().await
+    }
+
+    pub async fn gateway_get_stake_management(&self) -> anyhow::Result<[u8; 20]> {
+        self.adaptor.gateway_get_stake_management().await
+    }
     pub async fn gateway_get_pegin_data(&self, instance_id: &Uuid) -> anyhow::Result<PeginData> {
         self.adaptor.gateway_get_pegin_data(instance_id.as_bytes()).await
     }
@@ -213,14 +256,6 @@ impl EvmChain {
         self.adaptor.get_tx_receipt(tx_hash).await
     }
 
-    pub async fn gateway_get_stake_amount_check_info(&self) -> anyhow::Result<(u64, u64)> {
-        self.adaptor.gateway_get_stake_amount_check_info().await
-    }
-
-    pub async fn gateway_get_pegin_fee_check_info(&self) -> anyhow::Result<(u64, u64)> {
-        self.adaptor.gateway_get_pegin_fee_check_info().await
-    }
-
     pub async fn seq_set_pub_get_last_block_height(&self) -> anyhow::Result<u64> {
         self.adaptor.seq_set_pub_get_last_block_height().await
     }
@@ -247,5 +282,63 @@ impl EvmChain {
                 sequencer_set_cmt_sigs,
             )
             .await
+    }
+    pub async fn stake_mana_stake_token_address(&self) -> anyhow::Result<[u8; 20]> {
+        self.adaptor.stake_mana_stake_token_address().await
+    }
+    pub async fn stake_mana_pubkey_to_address(
+        &self,
+        pubkey: &[u8; 32],
+    ) -> anyhow::Result<[u8; 20]> {
+        self.adaptor.stake_mana_pubkey_to_address(pubkey).await
+    }
+    pub async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+        self.adaptor.stake_mana_stake_of(operator).await
+    }
+    pub async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+        self.adaptor.stake_mana_lock_stake_of(operator).await
+    }
+    pub async fn stake_mana_slash_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String> {
+        self.adaptor.stake_mana_slash_stake(operator, amount).await
+    }
+
+    pub async fn stake_mana_lock_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String> {
+        self.adaptor.stake_mana_lock_stake(operator, amount).await
+    }
+
+    pub async fn stake_mana_unlock_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String> {
+        self.adaptor.stake_mana_unlock_stake(operator, amount).await
+    }
+    pub async fn committee_mana_is_committee_member(
+        &self,
+        member: &[u8; 20],
+    ) -> anyhow::Result<bool> {
+        self.adaptor.committee_mana_is_committee_member(member).await
+    }
+
+    pub async fn committee_mana_committee_size(&self) -> anyhow::Result<u64> {
+        self.adaptor.committee_mana_committee_size().await
+    }
+    pub async fn committee_mana_quorum_size(&self) -> anyhow::Result<u64> {
+        self.adaptor.committee_mana_quorum_size().await
+    }
+    pub async fn committee_mana_verify_signatures(
+        &self,
+        msg_hash: &[u8; 32],
+        signs: &[Vec<u8>],
+    ) -> anyhow::Result<bool> {
+        self.adaptor.committee_mana_verify_signatures(msg_hash, signs).await
     }
 }

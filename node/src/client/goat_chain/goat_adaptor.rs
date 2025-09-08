@@ -2,8 +2,10 @@ use crate::client::goat_chain::chain_adaptor::{
     BitcoinTx, BitcoinTxProof, ChainAdaptor, GraphData, PeginData, PeginStatus, SequencerSet, Utxo,
     WithdrawData, WithdrawStatus,
 };
+use crate::client::goat_chain::goat_adaptor::ICommitteeManagement::ICommitteeManagementInstance;
 use crate::client::goat_chain::goat_adaptor::IGateway::IGatewayInstance;
 use crate::client::goat_chain::goat_adaptor::ISequencerSetPublisher::ISequencerSetPublisherInstance;
+use crate::client::goat_chain::goat_adaptor::IStakeManagement::IStakeManagementInstance;
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, TxHash};
 use alloy::providers::Identity;
@@ -85,15 +87,14 @@ sol!(
         }
 
         struct GraphData {
-            uint64 stakeAmountSats;
             bytes1 operatorPubkeyPrefix;
             bytes32 operatorPubkey;
             bytes32 peginTxid;
             bytes32 kickoffTxid;
             bytes32 take1Txid;
             bytes32 take2Txid;
-            bytes32 assertTimoutTxid;
             bytes32 commitTimoutTxid;
+            bytes32[] assertTimoutTxids;
             bytes32[] NackTxids;
         }
 
@@ -111,12 +112,23 @@ sol!(
             uint256 index;
         }
 
+        // uint64 constant rateMultiplier = 10000;
+
+        uint64 public minChallengeAmountSats;
         uint64 public minPeginFeeSats;
         uint64 public peginFeeRate;
-        uint64 public minStakeAmountSats;
-        uint64 public stakeRate;
+        uint64 public minOperatorRewardSats;
+        uint64 public operatorRewardRate;
+        uint64 public minStakeAmount;
+        uint64 public minChallengerReward;
+        uint64 public minDisproverReward;
+        uint64 public minSlashAmount;
+
         address public  pegBTC;
         address public  bitcoinSPV;
+        address public  committeeManagement;
+        address public  stakeManagement;
+
         address public  relayer;
         uint256 public responseWindowBlocks;
         mapping(bytes16 instanceId => PeginData) public peginDataMap;
@@ -166,32 +178,64 @@ sol!(
     }
 );
 
+sol!(
+    #[derive(Debug)]
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    interface IStakeManagement {
+        function stakeTokenAddress() external view returns (address);
+        function pubkeyToAddress(bytes32 pubkey) external view returns (address); // XOnlyPubkey
+        function stakeOf(address operator) external view returns (uint256);
+        function lockedStakeOf(address operator) external view returns (uint256);
+        function slashStake(address operator, uint256 amount) external;
+        function lockStake(address operator, uint256 amount) external;
+        function unlockStake(address operator, uint256 amount) external;
+    }
+);
+
+sol!(
+    #[derive(Debug)]
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    interface ICommitteeManagement {
+        function isCommitteeMember(address member) external view returns (bool);
+        function committeeSize() external view returns (uint256);
+        function quorumSize() external view returns (uint256);
+        function verifySignatures(bytes32 msgHash, bytes[] memory signatures) external view returns (bool);
+    }
+);
+
 pub struct GoatInitConfig {
     pub rpc_url: Url,
-    pub gateway_address: Option<EvmAddress>,
-    pub sequencer_set_publisher_address: Option<EvmAddress>,
     pub private_key: Option<String>,
     pub chain_id: u32,
+    pub gateway_address: Option<EvmAddress>,
+    pub sequencer_set_publisher_address: Option<EvmAddress>,
+    pub committee_management_address: Option<EvmAddress>,
+    pub stake_management_address: Option<EvmAddress>,
 }
 
 impl GoatInitConfig {
     pub fn from_env_for_test() -> Self {
         GoatInitConfig {
             rpc_url: "https://rpc.testnet3.goat.network".parse::<Url>().expect("decode url"),
+            chain_id: 48816_u32,
+            private_key: None,
             gateway_address: Some(
                 "0xeD8AeeD334fA446FA03Aa00B28aFf02FA8aC02df"
                     .parse()
                     .expect("parse contract address"),
             ),
             sequencer_set_publisher_address: None,
-            private_key: None,
-            chain_id: 48816_u32,
+            committee_management_address: None,
+            stake_management_address: None,
         }
     }
 }
 
 pub struct GoatAdaptor {
     chain_id: ChainId,
+    signer: EthereumWallet,
     provider: FillProvider<
         JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
         RootProvider,
@@ -212,7 +256,22 @@ pub struct GoatAdaptor {
             >,
         >,
     >,
-    signer: EthereumWallet,
+    committee_management: Option<
+        ICommitteeManagementInstance<
+            FillProvider<
+                JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
+                RootProvider,
+            >,
+        >,
+    >,
+    stake_management: Option<
+        IStakeManagementInstance<
+            FillProvider<
+                JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
+                RootProvider,
+            >,
+        >,
+    >,
 }
 
 impl GoatAdaptor {
@@ -247,6 +306,36 @@ impl GoatAdaptor {
         self.sequencer_set_publisher
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SequencerSetPublisher not initialized"))
+    }
+
+    fn get_committee_management(
+        &self,
+    ) -> anyhow::Result<
+        &ICommitteeManagementInstance<
+            FillProvider<
+                JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
+                RootProvider,
+            >,
+        >,
+    > {
+        self.committee_management
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CommitteeMnagement not initialized"))
+    }
+
+    fn get_stake_management(
+        &self,
+    ) -> anyhow::Result<
+        &IStakeManagementInstance<
+            FillProvider<
+                JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
+                RootProvider,
+            >,
+        >,
+    > {
+        self.stake_management
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("StakeManagement not initialized"))
     }
 
     async fn handle_transaction_request(
@@ -407,15 +496,18 @@ impl From<IGateway::PeginData> for PeginData {
 impl From<GraphData> for IGateway::GraphData {
     fn from(value: GraphData) -> Self {
         Self {
-            stakeAmountSats: value.stake_amount_sats,
             operatorPubkeyPrefix: FixedBytes::from(value.operator_pubkey_prefix),
             operatorPubkey: FixedBytes::from_slice(&value.operator_pubkey),
             peginTxid: FixedBytes::from_slice(&value.pegin_txid),
             kickoffTxid: FixedBytes::from_slice(&value.kickoff_txid),
             take1Txid: FixedBytes::from_slice(&value.take1_txid),
             take2Txid: FixedBytes::from_slice(&value.take2_txid),
-            assertTimoutTxid: FixedBytes::from_slice(&value.assert_timeout_txid),
             commitTimoutTxid: FixedBytes::from_slice(&value.commit_timout_txid),
+            assertTimoutTxids: value
+                .assert_timeout_txids
+                .into_iter()
+                .map(|txid| FixedBytes::from_slice(&txid))
+                .collect::<Vec<_>>(),
             NackTxids: value
                 .nack_txids
                 .into_iter()
@@ -427,15 +519,19 @@ impl From<GraphData> for IGateway::GraphData {
 impl From<IGateway::GraphData> for GraphData {
     fn from(value: IGateway::GraphData) -> Self {
         GraphData {
-            stake_amount_sats: value.stakeAmountSats,
+            // stake_amount_sats: value.stakeAmountSats,
             operator_pubkey_prefix: value.operatorPubkeyPrefix.0[0],
             operator_pubkey: value.operatorPubkey.0,
             pegin_txid: value.peginTxid.0,
             kickoff_txid: value.kickoffTxid.0,
             take1_txid: value.take1Txid.0,
             take2_txid: value.take2Txid.0,
-            assert_timeout_txid: value.assertTimoutTxid.0,
             commit_timout_txid: value.commitTimoutTxid.0,
+            assert_timeout_txids: value
+                .assertTimoutTxids
+                .into_iter()
+                .map(|txid| txid.into())
+                .collect(),
             nack_txids: value.NackTxids.into_iter().map(|txid| txid.into()).collect(),
         }
     }
@@ -489,6 +585,61 @@ impl ChainAdaptor for GoatAdaptor {
 
     async fn get_tx_receipt(&self, tx_hash: &str) -> anyhow::Result<Option<TransactionReceipt>> {
         Ok(self.provider.get_transaction_receipt(TxHash::from_str(tx_hash)?).await?)
+    }
+
+    async fn gateway_get_min_challenge_amount_sats(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minChallengeAmountSats().call().await?)
+    }
+
+    async fn gateway_get_min_pegin_fee_sats(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minPeginFeeSats().call().await?)
+    }
+
+    async fn gateway_get_pegin_fee_rate(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.peginFeeRate().call().await?)
+    }
+
+    async fn gateway_get_min_operator_reward_sats(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minOperatorRewardSats().call().await?)
+    }
+
+    async fn gateway_get_operator_reward_rate(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.operatorRewardRate().call().await?)
+    }
+
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minStakeAmount().call().await?)
+    }
+
+    async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minChallengerReward().call().await?)
+    }
+
+    async fn gateway_get_min_disprover_reward(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minDisproverReward().call().await?)
+    }
+
+    async fn gateway_get_min_slash_amount(&self) -> anyhow::Result<u64> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.minSlashAmount().call().await?)
+    }
+
+    async fn gateway_get_committee_management(&self) -> anyhow::Result<[u8; 20]> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.committeeManagement().call().await?.into_array())
+    }
+
+    async fn gateway_get_stake_management(&self) -> anyhow::Result<[u8; 20]> {
+        let gateway = self.get_gateway()?;
+        Ok(gateway.stakeManagement().call().await?.into_array())
     }
 
     async fn gateway_get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
@@ -783,16 +934,6 @@ impl ChainAdaptor for GoatAdaptor {
             .await?)
     }
 
-    async fn gateway_get_stake_amount_check_info(&self) -> anyhow::Result<(u64, u64)> {
-        let gateway = self.get_gateway()?;
-        Ok((gateway.minStakeAmountSats().call().await?, gateway.stakeRate().call().await?))
-    }
-
-    async fn gateway_get_pegin_fee_check_info(&self) -> anyhow::Result<(u64, u64)> {
-        let gateway = self.get_gateway()?;
-        Ok((gateway.minPeginFeeSats().call().await?, gateway.peginFeeRate().call().await?))
-    }
-
     async fn seq_set_pub_get_last_block_height(&self) -> anyhow::Result<u64> {
         let sequencer_set_publisher = self.get_sequencer_set_publisher()?;
         Ok(sequencer_set_publisher.latest_height().call().await?.try_into()?)
@@ -838,6 +979,125 @@ impl ChainAdaptor for GoatAdaptor {
         let tx_hash = self.handle_transaction_request(tx_request).await?;
         Ok(tx_hash.to_string())
     }
+
+    async fn stake_mana_stake_token_address(&self) -> anyhow::Result<[u8; 20]> {
+        let stake_management = self.get_stake_management()?;
+        Ok(stake_management.stakeTokenAddress().call().await?.into_array())
+    }
+
+    async fn stake_mana_pubkey_to_address(&self, pubkey: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
+        let stake_management = self.get_stake_management()?;
+        Ok(stake_management
+            .pubkeyToAddress(FixedBytes::from_slice(pubkey))
+            .call()
+            .await?
+            .into_array())
+    }
+
+    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+        let stake_management = self.get_stake_management()?;
+        Ok(stake_management
+            .stakeOf(Address::from_slice(operator))
+            .call()
+            .await?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+    }
+
+    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+        let stake_management = self.get_stake_management()?;
+        Ok(stake_management
+            .lockedStakeOf(Address::from_slice(operator))
+            .call()
+            .await?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+    }
+
+    async fn stake_mana_slash_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String> {
+        let stake_management = self.get_stake_management()?;
+        let tx_request = stake_management
+            .slashStake(Address::from_slice(operator), U256::from(amount))
+            .from(self.get_default_signer_address())
+            .chain_id(self.chain_id)
+            .into_transaction_request();
+        let tx_hash = self.handle_transaction_request(tx_request).await?;
+        Ok(tx_hash.to_string())
+    }
+
+    async fn stake_mana_lock_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String> {
+        let stake_management = self.get_stake_management()?;
+        let tx_request = stake_management
+            .lockStake(Address::from_slice(operator), U256::from(amount))
+            .from(self.get_default_signer_address())
+            .chain_id(self.chain_id)
+            .into_transaction_request();
+        let tx_hash = self.handle_transaction_request(tx_request).await?;
+        Ok(tx_hash.to_string())
+    }
+
+    async fn stake_mana_unlock_stake(
+        &self,
+        operator: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<String> {
+        let stake_management = self.get_stake_management()?;
+        let tx_request = stake_management
+            .unlockStake(Address::from_slice(operator), U256::from(amount))
+            .from(self.get_default_signer_address())
+            .chain_id(self.chain_id)
+            .into_transaction_request();
+        let tx_hash = self.handle_transaction_request(tx_request).await?;
+        Ok(tx_hash.to_string())
+    }
+
+    async fn committee_mana_is_committee_member(&self, member: &[u8; 20]) -> anyhow::Result<bool> {
+        let committee_management = self.get_committee_management()?;
+        Ok(committee_management.isCommitteeMember(Address::from_slice(member)).call().await?)
+    }
+
+    async fn committee_mana_committee_size(&self) -> anyhow::Result<u64> {
+        let committee_management = self.get_committee_management()?;
+        Ok(committee_management
+            .committeeSize()
+            .call()
+            .await?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+    }
+
+    async fn committee_mana_quorum_size(&self) -> anyhow::Result<u64> {
+        let committee_management = self.get_committee_management()?;
+        Ok(committee_management
+            .quorumSize()
+            .call()
+            .await?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+    }
+
+    async fn committee_mana_verify_signatures(
+        &self,
+        msg_hash: &[u8; 32],
+        signs: &[Vec<u8>],
+    ) -> anyhow::Result<bool> {
+        let committee_management = self.get_committee_management()?;
+        let signatures: Vec<Bytes> = signs.iter().map(|v| Bytes::copy_from_slice(v)).collect();
+        Ok(committee_management
+            .verifySignatures(FixedBytes::from_slice(msg_hash), signatures)
+            .call()
+            .await?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+    }
 }
 impl GoatAdaptor {
     pub fn new(config: GoatInitConfig) -> Self {
@@ -855,13 +1115,19 @@ impl GoatAdaptor {
         };
         let provider = ProviderBuilder::new().connect_http(config.rpc_url);
         Self {
+            chain_id,
+            signer: EthereumWallet::new(signer),
             provider: provider.clone(),
             gateway: config.gateway_address.map(|addr| IGateway::new(addr, provider.clone())),
             sequencer_set_publisher: config
                 .sequencer_set_publisher_address
-                .map(|addr| ISequencerSetPublisher::new(addr, provider)),
-            signer: EthereumWallet::new(signer),
-            chain_id,
+                .map(|addr| ISequencerSetPublisher::new(addr, provider.clone())),
+            committee_management: config
+                .committee_management_address
+                .map(|addr| ICommitteeManagement::new(addr, provider.clone())),
+            stake_management: config
+                .stake_management_address
+                .map(|addr| IStakeManagement::new(addr, provider.clone())),
         }
     }
 }

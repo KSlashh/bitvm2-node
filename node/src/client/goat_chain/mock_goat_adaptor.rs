@@ -98,6 +98,50 @@ impl ChainAdaptor for MockAdaptor {
         Ok(None)
     }
 
+    async fn gateway_get_min_challenge_amount_sats(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_min_pegin_fee_sats(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_pegin_fee_rate(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_min_operator_reward_sats(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_operator_reward_rate(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_min_disprover_reward(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_min_slash_amount(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn gateway_get_committee_management(&self) -> anyhow::Result<[u8; 20]> {
+        Ok([0_u8; 20])
+    }
+
+    async fn gateway_get_stake_management(&self) -> anyhow::Result<[u8; 20]> {
+        Ok([0_u8; 20])
+    }
+
     async fn gateway_get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
         info!("call get_pegin_data");
         let pegin_data_map = self.load_hash_map::<PeginData>(PEGIN_DATA_MAP, None)?;
@@ -358,14 +402,6 @@ impl ChainAdaptor for MockAdaptor {
         Ok(true)
     }
 
-    async fn gateway_get_stake_amount_check_info(&self) -> anyhow::Result<(u64, u64)> {
-        Ok((0, 0))
-    }
-
-    async fn gateway_get_pegin_fee_check_info(&self) -> anyhow::Result<(u64, u64)> {
-        Ok((0, 0))
-    }
-
     async fn seq_set_pub_get_last_block_height(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
@@ -386,6 +422,65 @@ impl ChainAdaptor for MockAdaptor {
         _sequencer_set_cmt_sigs: &[u8],
     ) -> anyhow::Result<String> {
         Ok("".to_string())
+    }
+
+    async fn stake_mana_stake_token_address(&self) -> anyhow::Result<[u8; 20]> {
+        Ok([0_u8; 20])
+    }
+
+    async fn stake_mana_pubkey_to_address(&self, _pubkey: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
+        Ok([0_u8; 20])
+    }
+
+    async fn stake_mana_stake_of(&self, _operator: &[u8; 20]) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn stake_mana_lock_stake_of(&self, _operator: &[u8; 20]) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn stake_mana_slash_stake(
+        &self,
+        _operator: &[u8; 20],
+        _amount: u64,
+    ) -> anyhow::Result<String> {
+        Ok("".to_string())
+    }
+
+    async fn stake_mana_lock_stake(
+        &self,
+        _operator: &[u8; 20],
+        _amount: u64,
+    ) -> anyhow::Result<String> {
+        Ok("".to_string())
+    }
+
+    async fn stake_mana_unlock_stake(
+        &self,
+        _operator: &[u8; 20],
+        _amount: u64,
+    ) -> anyhow::Result<String> {
+        Ok("".to_string())
+    }
+
+    async fn committee_mana_is_committee_member(&self, _member: &[u8; 20]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn committee_mana_committee_size(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn committee_mana_quorum_size(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn committee_mana_verify_signatures(
+        &self,
+        _msg_hash: &[u8; 32],
+        _signs: &[Vec<u8>],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 }
 
