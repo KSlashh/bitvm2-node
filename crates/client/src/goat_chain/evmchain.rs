@@ -1,8 +1,8 @@
-use crate::client::Utxo;
-use crate::client::goat_chain::chain_adaptor::{
+use crate::Utxo;
+use crate::goat_chain::chain_adaptor::{
     BitcoinTx, BitcoinTxProof, ChainAdaptor, GraphData, PeginData, SequencerSet, WithdrawData,
 };
-use crate::client::goat_chain::mock_goat_adaptor::MockAdaptor;
+use crate::goat_chain::mock_goat_adaptor::MockAdaptor;
 use alloy::primitives::Address;
 use alloy::rpc::types::TransactionReceipt;
 use uuid::Uuid;
@@ -148,14 +148,14 @@ impl EvmChain {
         &self,
         instance_id: &Uuid,
         graph_id: &Uuid,
-        operator_data: &GraphData,
+        graph_data: &GraphData,
         committee_signs: &[Vec<u8>],
     ) -> anyhow::Result<String> {
         self.adaptor
             .gateway_post_graph_data(
                 instance_id.as_bytes(),
                 graph_id.as_bytes(),
-                operator_data,
+                graph_data,
                 committee_signs,
             )
             .await

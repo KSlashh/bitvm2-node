@@ -5,7 +5,6 @@ mod node;
 pub(crate) mod proof;
 pub mod routes;
 
-use crate::client::btc_chain::BTCClient;
 use crate::env::get_network;
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::handler::proof_handler::{
@@ -21,6 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use bitvm2_lib::actors::Actor;
+use client::btc_chain::BTCClient;
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::BodyExt;
 use prometheus_client::registry::Registry;
@@ -213,7 +213,6 @@ async fn print_req_and_resp_detail(
 
 #[cfg(test)]
 mod tests {
-    use crate::client::create_local_db;
     use crate::env::{ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_PROOF_SEVER_URL};
     use crate::rpc_service::{self, Actor, routes};
     use crate::utils::{
@@ -231,6 +230,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use store::create_local_db;
     use store::{GoatTxProcessingStatus, GoatTxRecord, GoatTxType};
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;

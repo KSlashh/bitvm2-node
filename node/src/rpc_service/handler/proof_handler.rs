@@ -450,7 +450,6 @@ async fn get_proof_config(local_db: &LocalDB) -> anyhow::Result<(i64, i64, i64)>
 
 #[cfg(test)]
 mod tests {
-    use crate::client::create_local_db;
     use crate::env::ENV_PROOF_SEVER_URL;
     use crate::rpc_service::handler::proof_handler::{
         calculate_proof_avg_proof_time, get_online_operator_url,
@@ -458,6 +457,7 @@ mod tests {
     use crate::utils::temp_file;
     use bitvm2_lib::actors::Actor;
     use store::Node;
+    use store::create_local_db;
 
     #[tokio::test]
     async fn test_get_online_operator_url_with_env() {
