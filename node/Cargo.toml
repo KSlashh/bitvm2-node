@@ -71,7 +71,6 @@ esplora-client = { workspace = true }
 bitvm = { workspace = true }
 bitcoin = { workspace = true }
 
-header-chain = { workspace = true }
 goat = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
@@ -93,6 +92,7 @@ zkm-verifier = { workspace = true }
 
 stun-client = "0.1.4"
 strum = { version = "0.26", features = ["derive"] }
+borsh = {version = "1.5.3", features = ["derive"] }
 
 # bin
 tempfile = "3.19.1"
