@@ -2,6 +2,7 @@ use crate::client::btc_chain::bitcoin_adaptor::{BitcoinNetwork, get_btc_chain_ad
 use crate::client::btc_chain::bitcoin_chain::BitcoinChain;
 use bitcoin::{Address as BtcAddress, Block, Network, Transaction, TxMerkleNode, Txid};
 use esplora_client::{MerkleProof, Utxo};
+use std::str::FromStr;
 
 pub mod bitcoin_adaptor;
 pub mod bitcoin_chain;
@@ -16,6 +17,15 @@ pub struct BTCClient {
 impl BTCClient {
     pub fn new(network: BitcoinNetwork, esplora_url: Option<&str>) -> Self {
         BTCClient { chain_service: BitcoinChain::new(get_btc_chain_adapter(network, esplora_url)) }
+    }
+
+    pub fn from_str(network: &str, esplora_url: Option<&str>) -> Self {
+        BTCClient {
+            chain_service: BitcoinChain::new(get_btc_chain_adapter(
+                BitcoinNetwork::from_str(network).unwrap_or_default(),
+                esplora_url,
+            )),
+        }
     }
 
     pub fn network(&self) -> Network {
@@ -74,7 +84,7 @@ impl BTCClient {
         self.chain_service.fetch_btc_address_utxos(address).await
     }
 
-    pub async fn get_bitc_merkle_proof(
+    pub async fn get_btc_merkle_proof(
         &self,
         tx_id: &Txid,
     ) -> anyhow::Result<(TxMerkleNode, MerkleProof, Vec<u8>)> {
