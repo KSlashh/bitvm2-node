@@ -2,16 +2,15 @@
 //! Example:
 //!     Genesis:        RUST_LOG=debug cargo run -r -- --start 0 --batch-size 10 --init-input --output-proof "0-10.bin"
 //!     Regular blocks: RUST_LOG=debug cargo run -r -- --start 10 --batch-size 10 --input-proof "0-10.bin" --output-proof "10-20.bin"
-use borsh::{BorshSerialize, BorshDeserialize};
+use bitcoin::{hashes::Hash, Network};
+use borsh::{BorshDeserialize, BorshSerialize};
+use client::btc_chain::BTCClient;
 use header_chain::{
     BlockHeaderCircuitOutput, CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType,
 };
 use zkm_sdk::{
     include_elf, HashableKey, ProverClient, ZKMProof, ZKMProofWithPublicValues, ZKMStdin,
 };
-use bitcoin::{Network};
-use bitvm2_noded::client::btc_chain::BTCClient;
-
 
 /// A program that aggregates the proofs of the simple program.
 const HEADER_CHAIN: &[u8] = include_elf!("guest");
@@ -22,6 +21,9 @@ use std::fs;
 /// The arguments for the cli.
 #[derive(Debug, Clone, Parser)]
 pub struct Args {
+    #[arg(long, default_value = "http://127.0.0.1:3002")]
+    esplora_url: String,
+
     #[clap(long, env, default_value_t = 4)]
     batch_size: usize,
 
@@ -34,6 +36,9 @@ pub struct Args {
     #[clap(long, env, default_value = "block_headers.bin")]
     block_headers: String,
 
+    #[clap(long, env, default_value = "block_hashes.bin")]
+    block_hashes: String,
+
     #[clap(long, env, default_value = "input_proof.bin")]
     input_proof: String,
 
@@ -42,9 +47,10 @@ pub struct Args {
 }
 
 async fn fetch_header_chain(args: &Args) {
-    let network = Network::Testnet;
-    let btc_client = BTCClient::new(network.into(), None);
+    let network = Network::Regtest;
+    let btc_client = BTCClient::new(network.into(), Some(&args.esplora_url));
 
+    let mut block_hashes: Vec<[u8; 32]> = vec![];
     let mut block_headers = vec![];
     let mut writer = std::fs::File::create(&args.block_headers).unwrap();
     for i in args.start..(args.start + args.batch_size) {
@@ -52,8 +58,12 @@ async fn fetch_header_chain(args: &Args) {
         println!("block_id: {}", block.block_hash().to_string());
         let header: header_chain::CircuitBlockHeader = block.header.into();
         block_headers.push(header.clone());
+        block_hashes.push(block.block_hash().to_byte_array());
         header.serialize(&mut writer).unwrap();
     }
+
+    let block_hashes_bytes = bincode::serialize(&block_hashes).unwrap();
+    std::fs::write(&args.block_hashes, &block_hashes_bytes).unwrap();
 }
 
 #[tokio::main]
@@ -73,7 +83,7 @@ async fn main() {
 
     let vk_hash = header_chain_proof_vk.hash_u32();
     let headers = std::fs::read(&args.block_headers).unwrap();
-    let block_headers = headers 
+    let block_headers = headers
         .chunks(80)
         .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
         .collect::<Vec<CircuitBlockHeader>>();
@@ -101,11 +111,8 @@ async fn main() {
         start,
         args.batch_size
     );
-    let input: HeaderChainCircuitInput = HeaderChainCircuitInput {
-        vk_hash,
-        prev_proof,
-        block_headers,
-    };
+    let input: HeaderChainCircuitInput =
+        HeaderChainCircuitInput { vk_hash, prev_proof, block_headers };
 
     // Generate the proofs.
     let proof = tracing::info_span!("generate proof").in_scope(|| {
@@ -113,7 +120,7 @@ async fn main() {
         stdin.write(&input);
         if let Some(proof) = prev_receipt {
             println!("Generate proof from block {}", start);
-            let ZKMProof::Compressed(compressed_proof) = proof.proof else { todo!() };
+            let ZKMProof::Compressed(compressed_proof) = proof.proof else { panic!() };
             stdin.write_proof(*compressed_proof, header_chain_proof_vk.vk.clone());
         } else {
             println!("Generate proof from genesis block");
@@ -122,7 +129,11 @@ async fn main() {
     });
 
     fs::write(&args.output_proof, bincode::serialize(&proof).unwrap()).unwrap();
-    fs::write(&format!("{}.vk", args.output_proof), bincode::serialize(&header_chain_proof_vk).unwrap()).unwrap();
+    fs::write(
+        &format!("{}.vk", args.output_proof),
+        bincode::serialize(&header_chain_proof_vk).unwrap(),
+    )
+    .unwrap();
     fs::write(&format!("{}.in", args.output_proof), bincode::serialize(&input).unwrap()).unwrap();
     println!("Generate proof successfully, proof: {:?}", proof);
 }

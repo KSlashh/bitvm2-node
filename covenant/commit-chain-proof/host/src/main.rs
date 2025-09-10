@@ -3,13 +3,13 @@
 //!     Genesis:       RUST_LOG=debug cargo run -r -- --init-input --output-proof "compressed.bin"
 //!     Regular proof: RUST_LOG=debug cargo run -r -- --input-proof "compressed.bin" --output-proof "compressed2.bin"
 //! Update the commit_info.json for regular proof.
+use bitcoin::{secp256k1::PublicKey, Network, Txid};
 use bitcoin_light_client::*;
+use client::btc_chain::BTCClient;
+use std::str::FromStr;
 use zkm_sdk::{
     include_elf, HashableKey, ProverClient, ZKMProof, ZKMProofWithPublicValues, ZKMStdin,
 };
-use std::str::FromStr;
-use bitvm2_noded::client::btc_chain::BTCClient;
-use bitcoin::{Network, Txid, secp256k1::{PublicKey}};
 
 /// A program that aggregates the proofs of the simple program.
 const COMMIT_CHAIN: &[u8] = include_elf!("guest");
@@ -52,7 +52,7 @@ async fn fetch_commit_chain(args: &Args) {
 
         let op_return_data = bitcoin_light_client::extract_op_return_data(&tx);
         let mut sequencer_set_hash: [u8; 32] = [0u8; 32];
-        sequencer_set_hash.copy_from_slice(&op_return_data[0]);
+        sequencer_set_hash.copy_from_slice(&op_return_data);
 
         let publisher_public_keys = ci
             .publisher_public_keys
@@ -112,7 +112,7 @@ async fn main() {
         let mut stdin = ZKMStdin::new();
         stdin.write(&input);
         if let Some(proof) = prev_receipt {
-            let ZKMProof::Compressed(compressed_proof) = proof.proof else { todo!() };
+            let ZKMProof::Compressed(compressed_proof) = proof.proof else { panic!() };
             stdin.write_proof(*compressed_proof, commit_chain_proof_vk.vk.clone());
         } else {
             println!("Skip writing proof for genesis commit");
@@ -121,7 +121,11 @@ async fn main() {
     });
 
     fs::write(&args.output_proof, bincode::serialize(&proof).unwrap()).unwrap();
-    fs::write(&format!("{}.vk", args.output_proof), bincode::serialize(&commit_chain_proof_vk).unwrap()).unwrap();
+    fs::write(
+        &format!("{}.vk", args.output_proof),
+        bincode::serialize(&commit_chain_proof_vk).unwrap(),
+    )
+    .unwrap();
     fs::write(&format!("{}.in", args.output_proof), bincode::serialize(&input).unwrap()).unwrap();
     println!("Generate proof successfully, proof: {:?}", proof);
 }
