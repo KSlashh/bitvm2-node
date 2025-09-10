@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-// use base64::prelude::*;
+
+use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use std::collections::HashMap;
 use std::str::FromStr;
 use strum::{Display, EnumString};
@@ -9,6 +11,71 @@ use uuid::Uuid;
 pub const NODE_STATUS_ONLINE: &str = "Online";
 pub const NODE_STATUS_OFFLINE: &str = "Offline";
 pub const COMMITTEE_PRE_SIGN_NUM: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SerializableTxid(pub Txid);
+
+impl From<Txid> for SerializableTxid {
+    fn from(txid: Txid) -> Self {
+        SerializableTxid(txid)
+    }
+}
+
+impl From<SerializableTxid> for Txid {
+    fn from(serializable_txid: SerializableTxid) -> Self {
+        serializable_txid.0
+    }
+}
+
+impl Default for SerializableTxid {
+    fn default() -> Self {
+        SerializableTxid(Txid::from_byte_array([0u8; 32]))
+    }
+}
+impl Serialize for SerializableTxid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SerializableTxid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let tx_str = String::deserialize(deserializer)?;
+        Ok(SerializableTxid(Txid::from_str(&tx_str).map_err(serde::de::Error::custom)?))
+    }
+}
+impl sqlx::Type<sqlx::Sqlite> for SerializableTxid {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <String as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Sqlite> for SerializableTxid {
+    fn encode_by_ref(
+        &self,
+        args: &mut Vec<sqlx::sqlite::SqliteArgumentValue<'_>>,
+    ) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync>> {
+        let hex_string = self.0.to_string();
+        <String as sqlx::Encode<sqlx::Sqlite>>::encode_by_ref(&hex_string, args)
+    }
+}
+
+impl sqlx::Decode<'_, sqlx::Sqlite> for SerializableTxid {
+    fn decode(
+        value: sqlx::sqlite::SqliteValueRef<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let hex_string = <String as sqlx::Decode<sqlx::Sqlite>>::decode(value)?;
+        let txid = Txid::from_str(&hex_string)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(SerializableTxid(txid))
+    }
+}
 
 macro_rules! define_numeric_array {
     ($name:ident, $size:expr) => {
@@ -150,35 +217,21 @@ pub struct Instance {
     pub fees: Int64Array3,
     pub input_utxos: String,
     pub status: String,
-    pub pegin_request_txid: String,
+    pub pegin_request_tx_hash: String, // goat tx hash
     pub pegin_request_height: i64,
     pub user_xonly_pubkey: ByteArray32,
     pub user_change_addr: String,
     pub user_refund_addr: String,
-    pub pegin_prepare_txid: Option<String>,
-    pub pegin_confirm_txid: Option<String>,
-    pub pegin_cancel_txid: Option<String>,
+    pub pegin_prepare_txid: Option<SerializableTxid>, // btc txid
+    pub pegin_confirm_txid: Option<SerializableTxid>, // btc txid
+    pub pegin_cancel_txid: Option<SerializableTxid>,  // btc txid
     pub unsign_pegin_confirm_tx: Option<String>,
     #[sqlx(json)]
     pub committees_answers: HashMap<String, CommitteeSignatures>,
-    pub pegin_data_txid: String,
+    pub pegin_data_tx_hash: String,
     pub pegin_prepare_height: i64, // btc lock_time
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-impl Instance {
-    pub fn reverse_btc_txid(&mut self) {
-        if let Some(pegin_prepare_txid) = self.pegin_prepare_txid.clone() {
-            self.pegin_prepare_txid = Some(reversed_btc_txid(&pegin_prepare_txid));
-        }
-        if let Some(pegin_confirm_txid) = self.pegin_confirm_txid.clone() {
-            self.pegin_confirm_txid = Some(reversed_btc_txid(&pegin_confirm_txid));
-        }
-        if let Some(pegin_cancel_txid) = self.pegin_cancel_txid.clone() {
-            self.pegin_cancel_txid = Some(reversed_btc_txid(&pegin_cancel_txid));
-        }
-    }
 }
 
 /// graph status
@@ -225,29 +278,37 @@ pub struct Graph {
     pub graph_id: Uuid,
     pub instance_id: Uuid,
     pub from_addr: String,
-    pub to_addr: String,
+    pub to_addr: String, //operator_receive_address
     pub graph_ipfs_base_url: String,
-    pub pegin_txid: String,
     pub amount: i64,
+    pub challenge_amount: i64,
     pub status: String, // GraphStatus
-    pub pre_kickoff_txid: Option<String>,
-    pub kickoff_txid: Option<String>,
-    pub challenge_txid: Option<String>,
-    pub take1_txid: Option<String>,
-    pub assert_init_txid: Option<String>,
-    pub assert_commit_txids: Option<String>,
-    pub assert_final_txid: Option<String>,
-    pub take2_txid: Option<String>,
-    pub disprove_txid: Option<String>,
-    pub operator: String,
-    pub raw_data: Option<String>,
+    pub operator_pubkey: String,
+    pub pre_kickoff_txid: Option<SerializableTxid>,
+    pub cur_prekickoff_txid: Option<SerializableTxid>,
+    pub force_skip_kickoff_txid: Option<SerializableTxid>,
+    pub quick_challenge_txid: Option<SerializableTxid>,
+    pub challenge_incomplete_kickoff_txid: Option<SerializableTxid>,
+    pub pegin_txid: Option<SerializableTxid>,
+    pub kickoff_txid: Option<SerializableTxid>,
+    pub take1_txid: Option<SerializableTxid>,
+    pub challenge_txid: Option<SerializableTxid>,
+    pub take2_txid: Option<SerializableTxid>,
+    pub watchtower_challenge_init_txid: Option<SerializableTxid>,
+    #[sqlx(json)]
+    pub watchtower_challenge_timeout_txids: Vec<SerializableTxid>,
+    #[sqlx(json)]
+    pub nack_txids: Vec<SerializableTxid>,
+    #[sqlx(json)]
+    pub blockhash_commmit_timeout_txid: Option<SerializableTxid>,
+    pub assert_init_txid: Option<SerializableTxid>,
+    #[sqlx(json)]
+    pub assert_timeout_txids: Vec<SerializableTxid>,
+    pub commit_timeout_txid: Option<SerializableTxid>,
+    pub nack_index: i64,
+    pub assert_timeout_index: i64,
+    pub init_withdraw_tx_hash: Option<String>,
     pub bridge_out_start_at: i64,
-    pub init_withdraw_txid: Option<String>,
-    pub commit_timeout_txid: Option<String>,
-    #[sqlx(json)]
-    pub assert_timeout_txids: Vec<String>,
-    #[sqlx(json)]
-    pub nack_txids: Vec<String>,
     pub zkm_version: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -255,59 +316,17 @@ pub struct Graph {
 
 impl Graph {
     pub fn get_check_tx_param(&self) -> Result<(Option<String>, u32), String> {
+        // todo update
         let status = GraphStatus::from_str(&self.status);
         if status.is_err() {
             return Err("Graph status is wrong".to_string());
         }
         match status.unwrap() {
-            GraphStatus::KickOff => Ok((self.kickoff_txid.clone(), 6)),
-            GraphStatus::Challenge => Ok((self.challenge_txid.clone(), 6)),
-            GraphStatus::Assert => Ok((self.assert_init_txid.clone(), 18)),
-            GraphStatus::Take1 => Ok((self.take1_txid.clone(), 6)),
-            GraphStatus::Take2 => Ok((self.take2_txid.clone(), 6)),
-            GraphStatus::Disprove => Ok((self.disprove_txid.clone(), 6)),
             _ => Err("not check status".to_string()),
         }
     }
 
-    pub fn reverse_btc_txid(&mut self) {
-        self.pegin_txid = reversed_btc_txid(&self.pegin_txid);
-        if let Some(pre_kickoff_txid) = self.pre_kickoff_txid.clone() {
-            self.pre_kickoff_txid = Some(reversed_btc_txid(&pre_kickoff_txid));
-        }
-
-        if let Some(kickoff_txid) = self.kickoff_txid.clone() {
-            self.kickoff_txid = Some(reversed_btc_txid(&kickoff_txid));
-        }
-
-        if let Some(challenge_txid) = self.challenge_txid.clone() {
-            self.challenge_txid = Some(reversed_btc_txid(&challenge_txid));
-        }
-        if let Some(take1_txid) = self.take1_txid.clone() {
-            self.take1_txid = Some(reversed_btc_txid(&take1_txid));
-        }
-        if let Some(assert_init_txid) = self.assert_init_txid.clone() {
-            self.assert_init_txid = Some(reversed_btc_txid(&assert_init_txid));
-        }
-        if let Some(assert_commit_txids) = self.assert_commit_txids.clone()
-            && let Ok(assert_commit_txids) =
-                serde_json::from_str::<Vec<String>>(&assert_commit_txids)
-        {
-            let assert_commit_txids_re: Vec<String> =
-                assert_commit_txids.iter().map(|v| reversed_btc_txid(v)).collect();
-            self.assert_commit_txids = serde_json::to_string(&assert_commit_txids_re).ok()
-        }
-
-        if let Some(assert_final_txid) = self.assert_final_txid.clone() {
-            self.assert_final_txid = Some(reversed_btc_txid(&assert_final_txid));
-        }
-        if let Some(take2_txid) = self.take2_txid.clone() {
-            self.take2_txid = Some(reversed_btc_txid(&take2_txid));
-        }
-        if let Some(disprove_txid) = self.disprove_txid.clone() {
-            self.disprove_txid = Some(reversed_btc_txid(&disprove_txid));
-        }
-    }
+    pub fn reverse_btc_txid(&mut self) {}
 }
 
 pub fn modify_graph_status(ori_status: &str, is_kickoffing: bool) -> String {
@@ -425,13 +444,11 @@ pub struct GraphWithBroadcastInfo {
     pub status: String,
     pub msg_times: i64,
     pub msg_type: String,
-    pub kickoff_txid: Option<String>,
-    pub take1_txid: Option<String>,
-    pub take2_txid: Option<String>,
-    pub assert_init_txid: Option<String>,
-    pub assert_commit_txids: Option<String>,
-    pub assert_final_txid: Option<String>,
-    pub challenge_txid: Option<String>,
+    pub kickoff_txid: Option<SerializableTxid>,
+    pub take1_txid: Option<SerializableTxid>,
+    pub take2_txid: Option<SerializableTxid>,
+    pub assert_init_txid: Option<SerializableTxid>,
+    pub challenge_txid: Option<SerializableTxid>,
     pub last_msg_send_at: i64,
 }
 
@@ -443,15 +460,6 @@ pub struct MessageBroadcast {
     pub msg_times: i64,
     pub updated_at: i64,
     pub created_at: i64,
-}
-
-fn reversed_btc_txid(tx_id: &str) -> String {
-    if let Ok(mut tx_id_vec) = hex::decode(tx_id) {
-        tx_id_vec.reverse();
-        hex::encode(tx_id_vec)
-    } else {
-        tx_id.to_string()
-    }
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
@@ -598,6 +606,14 @@ pub struct GoatTxRecord {
     pub processing_status: String,
     pub extra: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct GraphRawData {
+    pub graph_id: Uuid,
+    pub raw_data: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

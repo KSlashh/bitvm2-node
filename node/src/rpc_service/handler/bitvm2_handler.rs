@@ -16,17 +16,24 @@ use std::default::Default;
 use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::{GraphQuery, InstanceQuery, StorageProcessor};
-use store::{GoatTxType, Graph, GraphStatus, InstanceStatus, modify_graph_status};
+use store::{
+    GoatTxType, Graph, GraphStatus, InstanceStatus, SerializableTxid, modify_graph_status,
+};
 use uuid::Uuid;
 
 /// Get instance settings
 ///
 /// Returns bridge-in amount configuration information for frontend display of available bridge amount options.
+/// This endpoint provides the list of supported bridge-in amounts that users can choose from.
 ///
 /// # Returns
 ///
 /// - `200 OK`: Successfully returns instance settings
-/// - Response body contains available bridge-in amount list
+/// - Response body contains available bridge-in amount list in BTC
+///
+/// # Use Case
+///
+/// Frontend applications use this to display available bridge amount options to users.
 ///
 /// # Example
 ///
@@ -53,6 +60,7 @@ pub async fn instance_settings(
 /// Check graph presign status
 ///
 /// Check the presign status of graphs based on instance ID, returns instance status and all related graph status information.
+/// This endpoint provides a comprehensive view of the bridge instance and its associated graphs' current states.
 ///
 /// # Parameters
 ///
@@ -61,7 +69,13 @@ pub async fn instance_settings(
 /// # Returns
 ///
 /// - `200 OK`: Successfully returns presign check result
-/// - `500 Internal Server Error`: Server internal error
+/// - `500 Internal Server Error`: Server internal error or database operation failed
+///
+/// # Response Includes
+///
+/// - Instance status and transaction details
+/// - Graph status mapping for all related graphs
+/// - Complete instance information
 ///
 /// # Example
 ///
@@ -101,26 +115,24 @@ pub async fn graph_presign_check(
     let async_fn = || async move {
         let instance_id = Uuid::parse_str(&params.instance_id)?;
         let mut storage_process = app_state.local_db.acquire().await?;
-        let instance_op = storage_process.find_instance(&instance_id).await?;
-        if instance_op.is_none() {
+        if let Some(instance) = storage_process.find_instance(&instance_id).await? {
+            resp_clone.instance_status = instance.status.clone();
+            resp_clone.tx = Some(instance);
+            let graphs = storage_process.get_graph_by_instance_id(&instance_id).await?;
+            resp_clone.graph_status = graphs
+                .into_iter()
+                .map(|v| {
+                    (
+                        v.graph_id.to_string(),
+                        modify_graph_status(&v.status, v.init_withdraw_tx_hash.is_some()),
+                    )
+                })
+                .collect();
+            Ok::<GraphPresignCheckResponse, Box<dyn std::error::Error>>(resp_clone)
+        } else {
             tracing::info!("instance_id {} has no record in database", instance_id);
-            return Ok::<GraphPresignCheckResponse, Box<dyn std::error::Error>>(resp_clone);
+            Ok::<GraphPresignCheckResponse, Box<dyn std::error::Error>>(resp_clone)
         }
-        let mut instance = instance_op.unwrap();
-        instance.reverse_btc_txid();
-        resp_clone.instance_status = instance.status.clone();
-        resp_clone.tx = Some(instance);
-        let graphs = storage_process.get_graph_by_instance_id(&instance_id).await?;
-        resp_clone.graph_status = graphs
-            .into_iter()
-            .map(|v| {
-                (
-                    v.graph_id.to_string(),
-                    modify_graph_status(&v.status, v.init_withdraw_txid.is_some()),
-                )
-            })
-            .collect();
-        Ok::<GraphPresignCheckResponse, Box<dyn std::error::Error>>(resp_clone)
     };
     match async_fn().await {
         Ok(resp) => (StatusCode::OK, Json(resp)),
@@ -134,6 +146,7 @@ pub async fn graph_presign_check(
 /// Get specific transaction hex data for a graph
 ///
 /// Get corresponding Bitcoin transaction hex data based on graph ID and transaction name.
+/// This endpoint retrieves the raw transaction hex for a specific transaction type within a graph.
 ///
 /// # Parameters
 ///
@@ -152,6 +165,10 @@ pub async fn graph_presign_check(
 ///
 /// - `200 OK`: Successfully returns transaction hex data
 /// - `500 Internal Server Error`: Server internal error or graph not found
+///
+/// # Use Case
+///
+/// Used by clients to broadcast transactions or verify transaction details.
 ///
 /// # Example
 ///
@@ -173,56 +190,55 @@ pub async fn get_graph_tx(
 ) -> (StatusCode, Json<Option<GraphTxGetResponse>>) {
     let async_fn = || async move {
         let mut storage_process = app_state.local_db.acquire().await?;
-        let graph_op = storage_process.get_graph(&Uuid::parse_str(&graph_id)?).await?;
-        if graph_op.is_none() {
-            tracing::warn!("graph:{} is not record in db", graph_id);
-            return Err(format!("graph:{graph_id} is not record in db").into());
-        };
-        let graph = graph_op.unwrap();
-        if graph.raw_data.is_none() {
-            return Err(format!("grap with graph_id:{graph_id} raw data is none").into());
-        }
-        let bitvm2_graph: Bitvm2Graph = serde_json::from_str(graph.raw_data.unwrap().as_str())?;
-        let tx_name_op = IpfsTxName::from_str(&params.tx_name);
-        if tx_name_op.is_err() {
-            return Err(format!(
-                "grap with graph_id:{graph_id} decode tx_name:{} failed",
-                params.tx_name
-            )
-            .into());
-        }
-        let tx_hex = match tx_name_op.unwrap() {
-            IpfsTxName::AssertCommit0 => {
-                serialize_hex(bitvm2_graph.assert_commit.commit_txns[0].tx())
+        if let Some(graph_raw_data) =
+            storage_process.get_graph_raw_data(&Uuid::parse_str(&graph_id)?).await?
+            && let Some(graph) = storage_process.get_graph(&Uuid::parse_str(&graph_id)?).await?
+        {
+            let bitvm2_graph: Bitvm2Graph = serde_json::from_str(graph_raw_data.raw_data.as_str())?;
+            let tx_name_op = IpfsTxName::from_str(&params.tx_name);
+            if tx_name_op.is_err() {
+                return Err(format!(
+                    "grap with graph_id:{graph_id} decode tx_name:{} failed",
+                    params.tx_name
+                )
+                .into());
             }
-            IpfsTxName::AssertCommit1 => {
-                serialize_hex(bitvm2_graph.assert_commit.commit_txns[1].tx())
-            }
-            IpfsTxName::AssertCommit2 => {
-                serialize_hex(bitvm2_graph.assert_commit.commit_txns[2].tx())
-            }
-            IpfsTxName::AssertCommit3 => {
-                serialize_hex(bitvm2_graph.assert_commit.commit_txns[3].tx())
-            }
-            IpfsTxName::AssertInit => serialize_hex(bitvm2_graph.assert_init.tx()),
-            IpfsTxName::AssertFinal => serialize_hex(bitvm2_graph.assert_final.tx()),
-            IpfsTxName::Challenge => {
-                let mut ori_tx_hex = serialize_hex(bitvm2_graph.challenge.tx());
-                if let Some(challenge_txid) = graph.challenge_txid
-                    && let Ok(tx_hex) =
-                        app_state.btc_client.get_tx_hex_by_serialize_tx_id(&challenge_txid).await
-                {
-                    ori_tx_hex = tx_hex
+            let tx_hex = match tx_name_op.unwrap() {
+                IpfsTxName::AssertCommit0 => {
+                    serialize_hex(bitvm2_graph.assert_commit.commit_txns[0].tx())
                 }
-                ori_tx_hex
-            }
-            IpfsTxName::Disprove => serialize_hex(bitvm2_graph.disprove.tx()),
-            IpfsTxName::Kickoff => serialize_hex(bitvm2_graph.kickoff.tx()),
-            IpfsTxName::Pegin => serialize_hex(bitvm2_graph.pegin.tx()),
-            IpfsTxName::Take1 => serialize_hex(bitvm2_graph.take1.tx()),
-            IpfsTxName::Take2 => serialize_hex(bitvm2_graph.take2.tx()),
-        };
-        Ok::<GraphTxGetResponse, Box<dyn std::error::Error>>(GraphTxGetResponse { tx_hex })
+                IpfsTxName::AssertCommit1 => {
+                    serialize_hex(bitvm2_graph.assert_commit.commit_txns[1].tx())
+                }
+                IpfsTxName::AssertCommit2 => {
+                    serialize_hex(bitvm2_graph.assert_commit.commit_txns[2].tx())
+                }
+                IpfsTxName::AssertCommit3 => {
+                    serialize_hex(bitvm2_graph.assert_commit.commit_txns[3].tx())
+                }
+                IpfsTxName::AssertInit => serialize_hex(bitvm2_graph.assert_init.tx()),
+                IpfsTxName::AssertFinal => serialize_hex(bitvm2_graph.assert_final.tx()),
+                IpfsTxName::Challenge => {
+                    let mut ori_tx_hex = serialize_hex(bitvm2_graph.challenge.tx());
+                    if let Some(challenge_txid) = graph.challenge_txid
+                        && let Ok(tx_hex) =
+                            app_state.btc_client.get_tx_hex_by_tx_id(&challenge_txid.0).await
+                    {
+                        ori_tx_hex = tx_hex
+                    }
+                    ori_tx_hex
+                }
+                IpfsTxName::Disprove => serialize_hex(bitvm2_graph.disprove.tx()),
+                IpfsTxName::Kickoff => serialize_hex(bitvm2_graph.kickoff.tx()),
+                IpfsTxName::Pegin => serialize_hex(bitvm2_graph.pegin.tx()),
+                IpfsTxName::Take1 => serialize_hex(bitvm2_graph.take1.tx()),
+                IpfsTxName::Take2 => serialize_hex(bitvm2_graph.take2.tx()),
+            };
+            Ok::<GraphTxGetResponse, Box<dyn std::error::Error>>(GraphTxGetResponse { tx_hex })
+        } else {
+            tracing::warn!("graph:{} is not record in db", graph_id);
+            Err(format!("graph:{graph_id} is not record in db").into())
+        }
     };
     match async_fn().await {
         Ok(resp) => (StatusCode::OK, Json(Some(resp))),
@@ -236,6 +252,7 @@ pub async fn get_graph_tx(
 /// Get all transaction hex data for a graph
 ///
 /// Get hex data for all transactions in a graph based on graph ID, including all assert, challenge, withdrawal, etc. transactions.
+/// This endpoint provides a complete view of all transaction types within a graph in a single request.
 ///
 /// # Parameters
 ///
@@ -245,6 +262,14 @@ pub async fn get_graph_tx(
 ///
 /// - `200 OK`: Successfully returns all transaction data
 /// - `500 Internal Server Error`: Server internal error or graph not found
+///
+/// # Transaction Types
+///
+/// Returns hex data for all supported transaction types including assert commits, init/final, challenge, withdrawal, etc.
+///
+/// # Use Case
+///
+/// Used by clients to get all transaction data at once for graph analysis or bulk operations.
 ///
 /// # Example
 ///
@@ -276,37 +301,36 @@ pub async fn get_graph_txn(
 ) -> (StatusCode, Json<Option<GraphTxnGetResponse>>) {
     let async_fn = || async move {
         let mut storage_process = app_state.local_db.acquire().await?;
-        let graph_op = storage_process.get_graph(&Uuid::parse_str(&graph_id)?).await?;
-        if graph_op.is_none() {
-            tracing::warn!("graph:{} is not record in db", graph_id);
-            return Err(format!("graph:{graph_id} is not record in db").into());
-        };
-        let graph = graph_op.unwrap();
-        if graph.raw_data.is_none() {
-            return Err(format!("grap with graph_id:{graph_id} raw data is none").into());
-        }
-        let bitvm2_graph: Bitvm2Graph = serde_json::from_str(graph.raw_data.unwrap().as_str())?;
-        let mut resp = GraphTxnGetResponse {
-            assert_commit0: serialize_hex(bitvm2_graph.assert_commit.commit_txns[0].tx()),
-            assert_commit1: serialize_hex(bitvm2_graph.assert_commit.commit_txns[1].tx()),
-            assert_commit2: serialize_hex(bitvm2_graph.assert_commit.commit_txns[2].tx()),
-            assert_commit3: serialize_hex(bitvm2_graph.assert_commit.commit_txns[3].tx()),
-            assert_init: serialize_hex(bitvm2_graph.assert_init.tx()),
-            assert_final: serialize_hex(bitvm2_graph.assert_final.tx()),
-            challenge: serialize_hex(bitvm2_graph.challenge.tx()),
-            disprove: serialize_hex(bitvm2_graph.disprove.tx()),
-            kickoff: serialize_hex(bitvm2_graph.kickoff.tx()),
-            pegin: serialize_hex(bitvm2_graph.pegin.tx()),
-            take1: serialize_hex(bitvm2_graph.take1.tx()),
-            take2: serialize_hex(bitvm2_graph.take2.tx()),
-        };
-        if let Some(challenge_txid) = graph.challenge_txid
-            && let Ok(tx_hex) =
-                app_state.btc_client.get_tx_hex_by_serialize_tx_id(&challenge_txid).await
+        if let Some(graph_raw_data) =
+            storage_process.get_graph_raw_data(&Uuid::parse_str(&graph_id)?).await?
+            && let Some(graph) = storage_process.get_graph(&Uuid::parse_str(&graph_id)?).await?
         {
-            resp.challenge = tx_hex;
+            let bitvm2_graph: Bitvm2Graph = serde_json::from_str(graph_raw_data.raw_data.as_str())?;
+            let mut resp = GraphTxnGetResponse {
+                assert_commit0: serialize_hex(bitvm2_graph.assert_commit.commit_txns[0].tx()),
+                assert_commit1: serialize_hex(bitvm2_graph.assert_commit.commit_txns[1].tx()),
+                assert_commit2: serialize_hex(bitvm2_graph.assert_commit.commit_txns[2].tx()),
+                assert_commit3: serialize_hex(bitvm2_graph.assert_commit.commit_txns[3].tx()),
+                assert_init: serialize_hex(bitvm2_graph.assert_init.tx()),
+                assert_final: serialize_hex(bitvm2_graph.assert_final.tx()),
+                challenge: serialize_hex(bitvm2_graph.challenge.tx()),
+                disprove: serialize_hex(bitvm2_graph.disprove.tx()),
+                kickoff: serialize_hex(bitvm2_graph.kickoff.tx()),
+                pegin: serialize_hex(bitvm2_graph.pegin.tx()),
+                take1: serialize_hex(bitvm2_graph.take1.tx()),
+                take2: serialize_hex(bitvm2_graph.take2.tx()),
+            };
+            if let Some(challenge_txid) = graph.challenge_txid
+                && let Ok(tx_hex) =
+                    app_state.btc_client.get_tx_hex_by_tx_id(&challenge_txid.0).await
+            {
+                resp.challenge = tx_hex;
+            }
+            Ok::<GraphTxnGetResponse, Box<dyn std::error::Error>>(resp)
+        } else {
+            tracing::warn!("graph:{} is not record in db", graph_id);
+            Err(format!("graph:{graph_id} is not record in db").into())
         }
-        Ok::<GraphTxnGetResponse, Box<dyn std::error::Error>>(resp)
     };
     match async_fn().await {
         Ok(resp) => (StatusCode::OK, Json(Some(resp))),
@@ -320,61 +344,17 @@ pub async fn get_graph_txn(
 /// Create new bridge instance
 ///
 /// Create a new bridge instance for managing asset transfers from Bitcoin to GOAT network.
+/// This endpoint initializes a new pegin (bridge-in) process.
 /// The function uses INSERT OR REPLACE, so it can also update existing instances.
 ///
 /// # Request Body
 ///
 /// Contains complete instance information wrapped in an InstanceUpdateRequest.
+/// Required fields include instance_id, network, from_addr, to_addr, amount, and status.
 ///
 /// # Returns
 ///
 /// - `200 OK`: Successfully created/updated instance
-/// - `500 Internal Server Error`: Server internal error
-///
-/// # Example
-///
-/// ```http
-/// POST /v1/instances
-/// Content-Type: application/json
-///
-/// {
-///   "instance": {
-///     "instance_id": "123e4567-e89b-12d3-a456-426614174000",
-///     "network": "testnet",
-///     "from_addr": "tb1q...",
-///     "to_addr": "0x...",
-///     "amount": 20000,
-///     "fee": 1000,
-///     "status": "Committed",
-///     "pegin_request_txid": "0x...",
-///     "pegin_request_height": 123456,
-///     "pegin_prepare_txid": null,
-///     "pegin_confirm_txid": null,
-///     "pegin_cancel_txid": null,
-///     "unsign_pegin_confirm_tx": null,
-///     "committees_sigs": [],
-///     "committees": [],
-///     "pegin_data_txid": "",
-///     "timeout": 3600,
-///     "created_at": 1640995200,
-///     "updated_at": 1640995200
-///   }
-/// }
-/// ```
-///
-/// Create new bridge instance
-///
-/// Create a new bridge instance for handling Bitcoin to Layer 2 asset transfers.
-/// This endpoint is used to initialize a new pegin (bridge-in) process.
-///
-/// # Request Body
-///
-/// Contains complete instance information wrapped in an InstanceUpdateRequest.
-/// The instance should include all required fields for a new bridge operation.
-///
-/// # Returns
-///
-/// - `200 OK`: Successfully created instance
 /// - `500 Internal Server Error`: Server internal error or database operation failed
 ///
 /// # Example
@@ -390,9 +370,10 @@ pub async fn get_graph_txn(
 ///     "from_addr": "tb1q...",
 ///     "to_addr": "0x...",
 ///     "amount": 20000,
-///     "fee": 1000,
+///     "fees": [1000, 0, 0],
+///     "input_utxos": "[{\"txid\":\"...\",\"vout\":0,\"amount\":20000}]",
 ///     "status": "UserInited",
-///     "pegin_request_txid": "0x...",
+///     "pegin_request_tx_hash": "0x...",
 ///     "pegin_request_height": 123456,
 ///     "user_xonly_pubkey": [241,77,222,197,156,70,127,106,169,155,155,10,242,194,183,203,19,29,8,122,11,205,201,232,191,12,70,128,82,184,61,74],
 ///     "user_change_addr": "tb1q...",
@@ -402,8 +383,8 @@ pub async fn get_graph_txn(
 ///     "pegin_cancel_txid": null,
 ///     "unsign_pegin_confirm_tx": null,
 ///     "committees_answers": {},
-///     "pegin_data_txid": "",
-///     "timeout": 3600,
+///     "pegin_data_tx_hash": "",
+///     "pegin_prepare_height": 0,
 ///     "created_at": 1640995200,
 ///     "updated_at": 1640995200
 ///   }
@@ -437,6 +418,7 @@ pub async fn create_instance(
 ///
 /// Update information for a specified bridge instance, including status, transaction IDs, and other fields.
 /// This endpoint is used to update the state of an existing pegin (bridge-in) process.
+/// All fields in the request body will completely replace the existing instance data.
 ///
 /// # Parameters
 ///
@@ -445,7 +427,7 @@ pub async fn create_instance(
 /// # Request Body
 ///
 /// Contains complete instance information wrapped in an InstanceUpdateRequest.
-/// All fields will be updated with the provided values.
+/// All fields will be updated with the provided values. Missing fields will be set to null/empty.
 ///
 /// # Returns
 ///
@@ -466,9 +448,10 @@ pub async fn create_instance(
 ///     "from_addr": "tb1q...",
 ///     "to_addr": "0x...",
 ///     "amount": 20000,
-///     "fee": 1000,
+///     "fees": [1000, 0, 0],
+///     "input_utxos": "[{\"txid\":\"...\",\"vout\":0,\"amount\":20000}]",
 ///     "status": "Presigned",
-///     "pegin_request_txid": "0x...",
+///     "pegin_request_tx_hash": "0x...",
 ///     "pegin_request_height": 123456,
 ///     "user_xonly_pubkey": [241,77,222,197,156,70,127,106,169,155,155,10,242,194,183,203,19,29,8,122,11,205,201,232,191,12,70,128,82,184,61,74],
 ///     "user_change_addr": "tb1q...",
@@ -478,8 +461,8 @@ pub async fn create_instance(
 ///     "pegin_cancel_txid": null,
 ///     "unsign_pegin_confirm_tx": null,
 ///     "committees_answers": {},
-///     "pegin_data_txid": "",
-///     "timeout": 3600,
+///     "pegin_data_tx_hash": "",
+///     "pegin_prepare_height": 123456,
 ///     "created_at": 1640995200,
 ///     "updated_at": 1640995200
 ///   }
@@ -515,6 +498,80 @@ pub async fn update_instance(
     }
 }
 
+/// Get Bitcoin transaction confirmation information
+///
+/// Helper function to retrieve confirmation status for Bitcoin transactions.
+///
+/// # Parameters
+///
+/// - `btc_client`: Bitcoin client instance
+/// - `btc_tx_id`: Optional Bitcoin transaction ID
+/// - `current_height`: Current blockchain height
+/// - `target_confirm_num`: Required number of confirmations
+///
+/// # Returns
+///
+/// - `Ok((blocks_passed, target_confirmations))`: Tuple of blocks passed and target confirmations
+/// - `Err`: Error if transaction lookup fails
+/// Get Bitcoin transaction confirmation information
+///
+/// Helper function to retrieve confirmation status for Bitcoin transactions.
+/// Calculates how many blocks have passed since a transaction was included in a block.
+///
+/// # Parameters
+///
+/// - `btc_client`: Bitcoin client instance for blockchain queries
+/// - `btc_tx_id`: Optional Bitcoin transaction ID (SerializableTxid format)
+/// - `current_height`: Current blockchain height
+/// - `target_confirm_num`: Required number of confirmations
+///
+/// # Returns
+///
+/// - `Ok((blocks_passed, target_confirmations))`: Tuple of blocks passed and target confirmations
+/// - `Err`: Error if transaction lookup fails
+///
+/// # Note
+///
+/// Returns (0, target_confirmations) if no transaction ID is provided.
+async fn get_btc_tx_confirmation_info(
+    btc_client: &BTCClient,
+    btc_tx_id: Option<SerializableTxid>,
+    current_height: u32,
+    target_confirm_num: u32,
+) -> anyhow::Result<(u32, u32)> {
+    if btc_tx_id.is_none() {
+        return Ok((0, target_confirm_num));
+    }
+    let status = btc_client.get_tx_status(&btc_tx_id.unwrap().0).await?;
+    let blocks_pass = if let Some(block_height) = status.block_height {
+        current_height - block_height
+    } else {
+        0
+    };
+    Ok((blocks_pass, target_confirm_num))
+}
+
+/// Get transaction confirmation information (legacy function)
+///
+/// TODO: This function will be removed after graph update.
+/// Helper function to retrieve confirmation status for transactions using string transaction IDs.
+///
+/// # Parameters
+///
+/// - `btc_client`: Bitcoin client instance
+/// - `btc_tx_id`: Optional transaction ID as string
+/// - `current_height`: Current blockchain height
+/// - `target_confirm_num`: Required number of confirmations
+///
+/// # Returns
+///
+/// - `Ok((blocks_passed, target_confirmations))`: Tuple of blocks passed and target confirmations
+/// - `Err`: Error if transaction lookup fails
+///
+/// # Note
+///
+/// Returns (0, target_confirmations) if no transaction ID is provided.
+/// This function will be deprecated in favor of get_btc_tx_confirmation_info.
 async fn get_tx_confirmation_info(
     btc_client: &BTCClient,
     btc_tx_id: Option<String>,
@@ -537,16 +594,18 @@ async fn get_tx_confirmation_info(
 /// Get bridge instance list
 ///
 /// Get bridge instance list based on query parameters, supports filtering by address and pagination.
+/// Each instance includes confirmation status for the pegin confirm transaction.
 ///
 /// # Query Parameters
 ///
-/// - `from_addr`: Source address filter (optional)
-/// - `offset`: Pagination offset (default: 0)
-/// - `limit`: Items per page (default: 10)
+/// - `from_addr`: Source address filter (optional) - filters instances by source Bitcoin address
+/// - `offset`: Pagination offset (default: 0) - number of items to skip
+/// - `limit`: Items per page (default: 10) - maximum number of items to return
 ///
 /// # Returns
 ///
-/// - `200 OK`: Successfully returns instance list
+/// - `200 OK`: Successfully returns instance list with confirmation status
+/// - Response includes total count and paginated instance data
 ///
 /// # Example
 ///
@@ -597,9 +656,8 @@ pub async fn get_instances(
         }
         let current_height = app_state.btc_client.get_height().await?;
         let mut items = vec![];
-        for mut instance in instances {
-            instance.reverse_btc_txid();
-            let (confirmations, target_confirmations) = get_tx_confirmation_info(
+        for instance in instances {
+            let (confirmations, target_confirmations) = get_btc_tx_confirmation_info(
                 &app_state.btc_client,
                 instance.pegin_confirm_txid.clone(),
                 current_height,
@@ -633,6 +691,7 @@ pub async fn get_instances(
 /// Get detailed information for a specific bridge instance
 ///
 /// Get detailed information for a single bridge instance based on instance ID, including confirmation status.
+/// Returns complete instance data with UTXO information and transaction confirmation details.
 ///
 /// # Parameters
 ///
@@ -640,7 +699,8 @@ pub async fn get_instances(
 ///
 /// # Returns
 ///
-/// - `200 OK`: Successfully returns instance details
+/// - `200 OK`: Successfully returns instance details with confirmation status
+/// - Returns empty instance wrap if instance not found
 ///
 /// # Example
 ///
@@ -671,35 +731,32 @@ pub async fn get_instance(
     let async_fn = || async move {
         let instance_id = Uuid::parse_str(&instance_id)?;
         let mut storage_process = app_state.local_db.acquire().await?;
-        let instance_op = storage_process.find_instance(&instance_id).await?;
-        if instance_op.is_none() {
-            tracing::info!("instance_id {} has no record in database", instance_id);
-            return Ok::<InstanceGetResponse, Box<dyn std::error::Error>>(InstanceGetResponse {
-                instance_wrap: InstanceWrap::default(),
-            });
-        }
-        let mut instance = instance_op.unwrap();
-        instance.reverse_btc_txid();
-        let current_height = app_state.btc_client.get_height().await?;
-        // let utxo: Vec<UTXO> = serde_json::from_str(&instance.input_uxtos).unwrap();
-        let (confirmations, target_confirmations) = get_tx_confirmation_info(
-            &app_state.btc_client,
-            instance.pegin_confirm_txid.clone(),
-            current_height,
-            6,
-        )
-        .await?;
+        if let Some(instance) = storage_process.find_instance(&instance_id).await? {
+            let current_height = app_state.btc_client.get_height().await?;
+            let (confirmations, target_confirmations) = get_btc_tx_confirmation_info(
+                &app_state.btc_client,
+                instance.pegin_confirm_txid.clone(),
+                current_height,
+                6,
+            )
+            .await?;
 
-        let utxo: Vec<Utxo> =
-            serde_json::from_str(&instance.input_utxos).map_err(|_| "failed to parse utxos")?;
-        Ok::<InstanceGetResponse, Box<dyn std::error::Error>>(InstanceGetResponse {
-            instance_wrap: InstanceWrap {
-                utxo: Some(utxo),
-                instance: Some(instance),
-                confirmations,
-                target_confirmations,
-            },
-        })
+            let utxo: Vec<Utxo> =
+                serde_json::from_str(&instance.input_utxos).map_err(|_| "failed to parse utxos")?;
+            Ok::<InstanceGetResponse, Box<dyn std::error::Error>>(InstanceGetResponse {
+                instance_wrap: InstanceWrap {
+                    utxo: Some(utxo),
+                    instance: Some(instance),
+                    confirmations,
+                    target_confirmations,
+                },
+            })
+        } else {
+            tracing::info!("instance_id {} has no record in database", instance_id);
+            Ok::<InstanceGetResponse, Box<dyn std::error::Error>>(InstanceGetResponse {
+                instance_wrap: InstanceWrap::default(),
+            })
+        }
     };
     match async_fn().await {
         Ok(res) => (StatusCode::OK, Json(res)),
@@ -713,11 +770,18 @@ pub async fn get_instance(
 /// Get bridge instance overview statistics
 ///
 /// Returns overall statistics for the bridge system, including total amounts, transaction counts, online nodes, etc.
+/// Provides a comprehensive overview of the bridge's operational status and performance metrics.
 ///
 /// # Returns
 ///
-/// - `200 OK`: Successfully returns overview information
-/// - `500 Internal Server Error`: Server internal error
+/// - `200 OK`: Successfully returns overview information with bridge statistics
+/// - `500 Internal Server Error`: Server internal error or database operation failed
+///
+/// # Statistics Included
+///
+/// - Bridge-in amounts and transaction counts
+/// - Bridge-out amounts and transaction counts  
+/// - Node status (online vs total)
 ///
 /// # Example
 ///
@@ -738,6 +802,7 @@ pub async fn get_instance(
 ///   }
 /// }
 /// ```
+#[axum::debug_handler]
 pub async fn get_instances_overview(
     State(app_state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<InstanceOverviewResponse>) {
@@ -780,6 +845,7 @@ pub async fn get_instances_overview(
 /// Get detailed information for a specific graph
 ///
 /// Get detailed information for a single graph based on graph ID, excluding raw data.
+/// Returns graph metadata with confirmation status and proof information.
 ///
 /// # Parameters
 ///
@@ -787,7 +853,13 @@ pub async fn get_instances_overview(
 ///
 /// # Returns
 ///
-/// - `200 OK`: Successfully returns graph details
+/// - `200 OK`: Successfully returns graph details with extended data
+/// - Returns null graph if graph not found or conversion fails
+///
+/// # Note
+///
+/// Raw data is excluded from the response for performance reasons.
+/// Use get_graph_tx or get_graph_txn for transaction hex data.
 ///
 /// # Example
 ///
@@ -815,8 +887,7 @@ pub async fn get_graph(
     let async_fn = || async move {
         let graph_id = Uuid::parse_str(&graph_id).unwrap();
         let mut storage_process = app_state.local_db.acquire().await?;
-        if let Some(mut graph) = storage_process.get_graph(&graph_id).await? {
-            graph.raw_data = None;
+        if let Some(graph) = storage_process.get_graph(&graph_id).await? {
             let graphs =
                 add_extend_data_to_graphs(&mut storage_process, &app_state.btc_client, vec![graph])
                     .await?;
@@ -846,20 +917,22 @@ pub async fn get_graph(
 ///
 /// Update information for a specified graph, including status, transaction IDs, and other fields.
 /// The function uses INSERT OR REPLACE, so it can also create new graphs.
+/// All fields in the request body will completely replace the existing graph data.
 ///
 /// # Parameters
 ///
-/// - `graph_id`: Graph ID (UUID format)
+/// - `graph_id`: Graph ID (UUID format) - must match the graph_id in the request body
 ///
 /// # Request Body
 ///
 /// Contains complete graph information wrapped in a GraphUpdateRequest.
+/// All fields will be updated with the provided values. Missing fields will be set to null/empty.
 ///
 /// # Returns
 ///
 /// - `200 OK`: Successfully updated/created graph
 /// - `400 Bad Request`: Graph ID in path doesn't match the one in request body
-/// - `500 Internal Server Error`: Server internal error
+/// - `500 Internal Server Error`: Server internal error or database operation failed
 ///
 /// # Example
 ///
@@ -929,18 +1002,20 @@ pub async fn update_graph(
 /// Get graph list
 ///
 /// Get graph list based on query parameters, supports various filtering conditions and pagination.
+/// Each graph includes confirmation status and proof information.
 ///
 /// # Query Parameters
 ///
-/// - `from_addr`: Source address filter (optional)
-/// - `status`: Status filter (optional)
-/// - `offset`: Pagination offset (default: 0)
-/// - `limit`: Items per page (default: 10)
+/// - `from_addr`: Source address filter (optional) - filters graphs by source address
+/// - `status`: Status filter (optional) - filters graphs by current status
+/// - `offset`: Pagination offset (default: 0) - number of items to skip
+/// - `limit`: Items per page (default: 10) - maximum number of items to return
 ///
 /// # Returns
 ///
-/// - `200 OK`: Successfully returns graph list
-/// - `500 Internal Server Error`: Server internal error
+/// - `200 OK`: Successfully returns graph list with confirmation status
+/// - `500 Internal Server Error`: Server internal error or database operation failed
+/// - Response includes total count and paginated graph data
 ///
 /// # Example
 ///
@@ -994,6 +1069,55 @@ pub async fn get_graphs(
     }
 }
 
+/// Add extended data to graphs
+///
+/// Helper function to enrich graph data with confirmation status and proof information.
+/// This function processes a list of graphs and adds confirmation counts, target confirmations,
+/// and proof-related metadata.
+///
+/// # Parameters
+///
+/// - `storage_processor`: Database storage processor for querying additional data
+/// - `btc_client`: Bitcoin client for getting current blockchain height
+/// - `graphs`: Vector of graphs to process
+///
+/// # Returns
+///
+/// - `Ok(Vec<GraphExtended>)`: Vector of graphs with extended data
+/// - `Err`: Error if processing fails
+///
+/// # Features
+///
+/// - Calculates transaction confirmation status
+/// - Modifies graph status based on withdrawal transaction presence
+/// - Adds proof height and query URL information
+/// Add extended data to graphs
+///
+/// Helper function to enrich graph data with confirmation status and proof information.
+/// This function processes a list of graphs and adds confirmation counts, target confirmations,
+/// and proof-related metadata.
+///
+/// # Parameters
+///
+/// - `storage_processor`: Database storage processor for querying additional data
+/// - `btc_client`: Bitcoin client for getting current blockchain height
+/// - `graphs`: Vector of graphs to process
+///
+/// # Returns
+///
+/// - `Ok(Vec<GraphExtended>)`: Vector of graphs with extended data
+/// - `Err`: Error if processing fails
+///
+/// # Features
+///
+/// - Calculates transaction confirmation status
+/// - Modifies graph status based on withdrawal transaction presence
+/// - Adds proof height and query URL information
+/// - Reverses Bitcoin transaction IDs for proper display
+///
+/// # Note
+///
+/// This function modifies the input graphs in-place and returns enhanced versions.
 pub async fn add_extend_data_to_graphs<'a>(
     storage_processor: &mut StorageProcessor<'a>,
     btc_client: &BTCClient,
@@ -1011,7 +1135,7 @@ pub async fn add_extend_data_to_graphs<'a>(
             }
             Err(_) => (0, 0),
         };
-        graph.status = modify_graph_status(&graph.status, graph.init_withdraw_txid.is_some());
+        graph.status = modify_graph_status(&graph.status, graph.init_withdraw_tx_hash.is_some());
         graph_ids.push(graph.graph_id);
         graph_vec.push(GraphExtended {
             graph,
