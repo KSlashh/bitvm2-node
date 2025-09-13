@@ -15,7 +15,8 @@ use zkm_sdk::{
 use alloy_primitives::U256;
 use bitcoin::{Network, Txid};
 use bitcoin_light_client::{
-    build_spv, CommitChainCircuitInput, CommitChainCircuitOutput, CommitChainPrevProofType, LightBlock
+    CommitChainCircuitInput, CommitChainCircuitOutput, CommitChainPrevProofType, LightBlock,
+    build_spv,
 };
 use std::str::FromStr;
 
@@ -54,7 +55,12 @@ pub struct Args {
     #[clap(long, env, short)]
     commit_chain_input_proof: String,
 
-    #[clap(long, env, short, default_value = "../../../crates/bitcoin-light-client/samples/light_block_5756785.json")]
+    #[clap(
+        long,
+        env,
+        short,
+        default_value = "../../../crates/bitcoin-light-client/samples/light_block_5756785.json"
+    )]
     consensus_block: String,
 
     #[clap(long, env, short)]
@@ -121,7 +127,7 @@ async fn main() {
         btc_client.get_btc_merkle_proof(&latest_sequencer_commit_txid).await.unwrap();
     let block_pos = tx_merkle_proof.1.block_height;
     println!("block height: {block_pos}");
-    let target_block = btc_client.fetch_btc_block(block_pos).await.unwrap();
+    let target_block = btc_client.get_btc_block(block_pos).await.unwrap();
 
     println!("construct spv");
     let spv = build_spv(&tx, block_pos, target_block, &header_chain_input);
