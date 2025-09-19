@@ -6,14 +6,14 @@ use crate::goat_chain::goat_adaptor::ICommitteeManagement::ICommitteeManagementI
 use crate::goat_chain::goat_adaptor::IGateway::IGatewayInstance;
 use crate::goat_chain::goat_adaptor::ISequencerSetPublisher::ISequencerSetPublisherInstance;
 use crate::goat_chain::goat_adaptor::IStakeManagement::IStakeManagementInstance;
+use crate::goat_chain::goat_adaptor::IMultiSigVerifier::IMultiSigVerifierInstance;
 use alloy::eips::BlockNumberOrTag;
-use alloy::primitives::{Address, TxHash};
 use alloy::providers::Identity;
 use alloy::providers::fillers::{FillProvider, JoinFill, RecommendedFillers};
 use alloy::rpc::types::TransactionReceipt;
 use alloy::{
     network::{Ethereum, EthereumWallet, NetworkWallet, eip2718::Encodable2718},
-    primitives::{Address as EvmAddress, Bytes, ChainId, FixedBytes, U256},
+    primitives::{Address, Bytes, ChainId, FixedBytes, TxHash, U256},
     providers::{Provider, ProviderBuilder, RootProvider},
     rpc::types::TransactionRequest,
     signers::{Signer, local::PrivateKeySigner},
@@ -26,6 +26,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
+use alloy::signers::Signature;
 
 sol!(
     #[derive(Debug)]
@@ -163,17 +164,35 @@ sol!(
     #[derive(Debug)]
     #[allow(missing_docs)]
     #[sol(rpc)]
+    interface IMultiSigVerifier {
+        function getOwners() external view returns (address[] memory);
+        function nonce() external view returns (uint256);
+    }
+);
+
+sol!(
+    #[derive(Debug)]
+    #[allow(missing_docs)]
+    #[sol(rpc)]
     interface ISequencerSetPublisher {
         struct SequencerSet {
-            bytes32 sequencer_set_hash; // validator_hash
-            bytes32 publishers_hash;
-            bytes32 p2wsh_sig_hash;
-            bytes32 next_sequencer_set_hash; // next_validator_hash
-            uint256 goat_block_number;
+            bytes32 sequencerSetHash; // validator_hash
+            bytes32 nextSequencerSetHash; // next_validator_hash
+            bytes32 publishersHash;
+            bytes32 nextPublishersHash;
+            bytes32 p2wshSigHash;
+            uint256 goatBlockNumber;
         }
-        uint256 public latest_height;
+        address public multiSigVerifier;
+        mapping(uint256 height => mapping(address publisher => bytes32 cmt)) public heightSequencerCmt;
+
+        mapping(address publisher => bytes pubkey) public publisherBTCPubkeys;
+        mapping(bytes32 cmt => SequencerSet ss) public cmtSequencerSet;
+        uint256 public latestConfirmedHeight;
+
         function updateSequencerSet(SequencerSet calldata ss,  bytes calldata signature) external;
-        function updatePublisherSet(address[] calldata newOwners, bytes[] calldata changeOwnerSigs, SequencerSet calldata ss, bytes calldata sequencerSetCmtSigs) external;
+        function updatePublisherSet(address[] calldata newPublishers, bytes[] calldata newPublisherBTCPubkeys, bytes[] calldata changeOwnerSigs, uint256 height) external;
+        function calcMajoritySequencerSetCmtAtHeightOrLatest(uint256 height) public view returns (bytes32);
     }
 );
 
@@ -208,10 +227,11 @@ pub struct GoatInitConfig {
     pub rpc_url: Url,
     pub private_key: Option<String>,
     pub chain_id: u32,
-    pub gateway_address: Option<EvmAddress>,
-    pub sequencer_set_publisher_address: Option<EvmAddress>,
-    pub committee_management_address: Option<EvmAddress>,
-    pub stake_management_address: Option<EvmAddress>,
+    pub gateway_address: Option<Address>,
+    pub sequencer_set_publisher_address: Option<Address>,
+    pub committee_management_address: Option<Address>,
+    pub stake_management_address: Option<Address>,
+    pub multi_sig_verifier_address: Option<Address>,
 }
 
 impl GoatInitConfig {
@@ -225,9 +245,18 @@ impl GoatInitConfig {
                     .parse()
                     .expect("parse contract address"),
             ),
-            sequencer_set_publisher_address: None,
+            sequencer_set_publisher_address: Some(
+                "0xEE0fCB8E5cCAD0b4197BAabd633333886f5C364d"
+                    .parse()
+                    .expect("parse contract address"),
+            ),
             committee_management_address: None,
             stake_management_address: None,
+            multi_sig_verifier_address: Some(
+                "0x60Ea774468B9397cCc04a88d8cc72e5dd2Cab7f7"
+                    .parse()
+                    .expect("parse contract address"),
+            ),
         }
     }
 }
@@ -265,6 +294,14 @@ pub struct GoatAdaptor {
     >,
     stake_management: Option<
         IStakeManagementInstance<
+            FillProvider<
+                JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
+                RootProvider,
+            >,
+        >,
+    >,
+    multi_sig_verifier: Option<
+        IMultiSigVerifierInstance<
             FillProvider<
                 JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
                 RootProvider,
@@ -335,6 +372,21 @@ impl GoatAdaptor {
         self.stake_management
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("StakeManagement not initialized"))
+    }
+
+     fn get_multi_sig_verifier(
+        &self,
+    ) -> anyhow::Result<
+        &IMultiSigVerifierInstance<
+            FillProvider<
+                JoinFill<Identity, <Ethereum as RecommendedFillers>::RecommendedFillers>,
+                RootProvider,
+            >,
+        >,
+    > {
+        self.multi_sig_verifier
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SequencerSet.multiSigVerifier not initialized"))
     }
 
     async fn handle_transaction_request(
@@ -564,18 +616,19 @@ impl From<IGateway::WithdrawData> for WithdrawData {
 impl From<&SequencerSet> for ISequencerSetPublisher::SequencerSet {
     fn from(value: &SequencerSet) -> Self {
         Self {
-            sequencer_set_hash: FixedBytes::from_slice(&value.sequencer_set_hash),
-            publishers_hash: FixedBytes::from_slice(&value.publishers_hash),
-            p2wsh_sig_hash: FixedBytes::from_slice(&value.p2wsh_sig_hash),
-            next_sequencer_set_hash: FixedBytes::from_slice(&value.next_sequencer_set_hash),
-            goat_block_number: U256::from(value.goat_block_number),
+            sequencerSetHash: FixedBytes::from_slice(&value.sequencer_set_hash),
+            nextSequencerSetHash: FixedBytes::from_slice(&value.next_sequencer_set_hash),
+            publishersHash: FixedBytes::from_slice(&value.publishers_hash),
+            nextPublishersHash: FixedBytes::from_slice(&value.next_publishers_hash),
+            p2wshSigHash: FixedBytes::from_slice(&value.p2wsh_sig_hash),
+            goatBlockNumber: U256::from(value.goat_block_number),
         }
     }
 }
 
 #[async_trait]
 impl ChainAdaptor for GoatAdaptor {
-    fn get_default_signer_address(&self) -> EvmAddress {
+    fn get_default_signer_address(&self) -> Address {
         <EthereumWallet as NetworkWallet<Ethereum>>::default_signer_address(&self.signer)
     }
 
@@ -956,17 +1009,25 @@ impl ChainAdaptor for GoatAdaptor {
 
     async fn seq_set_pub_get_last_block_height(&self) -> anyhow::Result<u64> {
         let sequencer_set_publisher = self.get_sequencer_set_publisher()?;
-        Ok(sequencer_set_publisher.latest_height().call().await?.try_into()?)
+        Ok(sequencer_set_publisher.latestConfirmedHeight().call().await?.try_into()?)
+    }
+
+    async fn seq_set_pub_get_publisher_public_keys(
+        &self,
+        publisher: Address,
+    ) -> anyhow::Result<Bytes> {
+        let sequencer_set_publisher = self.get_sequencer_set_publisher()?;
+        Ok(sequencer_set_publisher.publisherBTCPubkeys(publisher).call().await?.try_into()?)
     }
 
     async fn seq_set_pub_update_sequencer_set(
         &self,
         sequencer_set: &SequencerSet,
-        signature: &[u8],
+        signature: &Signature,
     ) -> anyhow::Result<String> {
         let sequencer_set_publisher = self.get_sequencer_set_publisher()?;
         let tx_request = sequencer_set_publisher
-            .updateSequencerSet(sequencer_set.into(), Bytes::copy_from_slice(signature))
+            .updateSequencerSet(sequencer_set.into(), Bytes::copy_from_slice(&signature.as_bytes()))
             .from(self.get_default_signer_address())
             .chain_id(self.chain_id)
             .into_transaction_request();
@@ -976,28 +1037,55 @@ impl ChainAdaptor for GoatAdaptor {
 
     async fn seq_set_pub_update_publisher_set(
         &self,
-        new_owners: &[[u8; 20]],
+        new_publishers: Vec<Address>,
+        new_publisher_btc_pubkeys: &[Vec<u8>],
         signatures: &[Vec<u8>],
-        sequencer_set: &SequencerSet,
-        sequencer_set_cmt_sigs: &[u8],
+        height: U256
     ) -> anyhow::Result<String> {
         let sequencer_set_publisher = self.get_sequencer_set_publisher()?;
-        let new_owners: Vec<EvmAddress> =
-            new_owners.iter().map(|v| EvmAddress::from_slice(v)).collect();
+        let new_publisher_btc_pubkeys: Vec<Bytes> =
+            new_publisher_btc_pubkeys.iter().map(|v| Bytes::copy_from_slice(v)).collect();
         let signatures: Vec<Bytes> = signatures.iter().map(|v| Bytes::copy_from_slice(v)).collect();
 
         let tx_request = sequencer_set_publisher
             .updatePublisherSet(
-                new_owners,
+                new_publishers,
+                new_publisher_btc_pubkeys,
                 signatures,
-                sequencer_set.into(),
-                Bytes::copy_from_slice(sequencer_set_cmt_sigs),
+                height,
             )
             .from(self.get_default_signer_address())
             .chain_id(self.chain_id)
             .into_transaction_request();
         let tx_hash = self.handle_transaction_request(tx_request).await?;
         Ok(tx_hash.to_string())
+    }
+
+    async fn seq_set_pub_calc_commitment(&self, height: U256) -> anyhow::Result<FixedBytes<32>> {
+        let sequencer_set_publisher = self.get_sequencer_set_publisher()?;
+        Ok(sequencer_set_publisher
+            .calcMajoritySequencerSetCmtAtHeightOrLatest(height)
+            .call()
+            .await?
+            .try_into()?)
+    }
+
+    async fn seq_set_pub_multi_sig_verifier_get_owners(&self) -> anyhow::Result<Vec<Address>> {
+        let multi_sig_verifier = self.get_multi_sig_verifier()?;
+        Ok(multi_sig_verifier
+            .getOwners()
+            .call()
+            .await?
+            .try_into()?)
+    }
+
+    async fn seq_set_pub_multi_sig_verifier_get_nonce(&self) -> anyhow::Result<U256> {
+        let multi_sig_verifier = self.get_multi_sig_verifier()?;
+        Ok(multi_sig_verifier
+            .nonce()
+            .call()
+            .await?
+            .try_into()?)
     }
 
     async fn stake_mana_stake_token_address(&self) -> anyhow::Result<[u8; 20]> {
@@ -1119,6 +1207,7 @@ impl ChainAdaptor for GoatAdaptor {
             .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
     }
 }
+
 impl GoatAdaptor {
     pub fn new(config: GoatInitConfig) -> Self {
         Self::from_config(config)
@@ -1148,6 +1237,9 @@ impl GoatAdaptor {
             stake_management: config
                 .stake_management_address
                 .map(|addr| IStakeManagement::new(addr, provider.clone())),
+            multi_sig_verifier: config
+                .multi_sig_verifier_address
+                .map(|addr| IMultiSigVerifier::new(addr, provider.clone())),
         }
     }
 }

@@ -4,8 +4,9 @@ use crate::goat_chain::chain_adaptor::{
     BitcoinTx, BitcoinTxProof, ChainAdaptor, GraphData, PeginData, SequencerSet, WithdrawData,
 };
 use crate::goat_chain::mock_goat_adaptor::MockAdaptor;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::rpc::types::TransactionReceipt;
+use alloy::signers::Signature;
 use uuid::Uuid;
 
 pub struct EvmChain {
@@ -273,26 +274,46 @@ impl EvmChain {
         self.adaptor.seq_set_pub_get_last_block_height().await
     }
 
+    pub async fn seq_set_pub_calc_commitment(&self, height: U256) -> anyhow::Result<FixedBytes<32>> {
+        self.adaptor.seq_set_pub_calc_commitment(height).await
+    }
+
+    pub async fn seq_set_pub_multi_sig_verifier_get_owners(&self) -> anyhow::Result<Vec<Address>> {
+        self.adaptor.seq_set_pub_multi_sig_verifier_get_owners().await
+    }
+
+    pub async fn seq_set_pub_multi_sig_verifier_get_nonce(&self) -> anyhow::Result<U256> {
+        self.adaptor.seq_set_pub_multi_sig_verifier_get_nonce().await
+    }
+
+    pub async fn seq_set_pub_get_publisher_public_keys(
+        &self,
+        publisher: Address,
+    ) -> anyhow::Result<Bytes> {
+        self.adaptor.seq_set_pub_get_publisher_public_keys(publisher).await
+    }
+
     pub async fn seq_set_pub_update_sequencer_set(
         &self,
         sequencer_set: &SequencerSet,
-        signature: &[u8],
+        signature: &Signature,
     ) -> anyhow::Result<String> {
         self.adaptor.seq_set_pub_update_sequencer_set(sequencer_set, signature).await
     }
+
     pub async fn seq_set_pub_update_publisher_set(
         &self,
-        new_owners: &[[u8; 20]],
+        new_publishers: Vec<Address>,
+        new_publisher_btc_pubkeys: &[Vec<u8>],
         signatures: &[Vec<u8>],
-        sequencer_set: &SequencerSet,
-        sequencer_set_cmt_sigs: &[u8],
+        height: U256,
     ) -> anyhow::Result<String> {
         self.adaptor
             .seq_set_pub_update_publisher_set(
-                new_owners,
+                new_publishers,
+                new_publisher_btc_pubkeys,
                 signatures,
-                sequencer_set,
-                sequencer_set_cmt_sigs,
+                height,
             )
             .await
     }

@@ -1,6 +1,6 @@
 use crate::goat_chain::chain_adaptor::*;
 use crate::utils::generate_random_bytes;
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use anyhow::bail;
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use tracing::info;
 use uuid::Uuid;
+use alloy::signers::Signature;
 
 const PEGIN_DATA_MAP: &str = "pegin_data_map";
 const OPERATOR_DATA_MAP: &str = "operator_data_map";
@@ -409,20 +410,39 @@ impl ChainAdaptor for MockAdaptor {
         Ok(0)
     }
 
+    async fn seq_set_pub_calc_commitment(&self, _height: U256) -> anyhow::Result<FixedBytes<32>> {
+        Ok(FixedBytes::<32>::new([0u8; 32]))
+    }
+
+    async fn seq_set_pub_get_publisher_public_keys(
+        &self,
+        _publisher: Address,
+    ) -> anyhow::Result<Bytes> {
+        Ok(Bytes::new())
+    }
+
     async fn seq_set_pub_update_sequencer_set(
         &self,
         _sequencer_set: &SequencerSet,
-        _signature: &[u8],
+        _signature: &Signature,
     ) -> anyhow::Result<String> {
         Ok("".to_string())
     }
 
+    async fn seq_set_pub_multi_sig_verifier_get_owners(&self) -> anyhow::Result<Vec<Address>> {
+        Ok(vec![])
+    }
+
+    async fn seq_set_pub_multi_sig_verifier_get_nonce(&self) -> anyhow::Result<U256> {
+        Ok(U256::ZERO)
+    }
+
     async fn seq_set_pub_update_publisher_set(
         &self,
-        _new_owners: &[[u8; 20]],
+        _new_publishers: Vec<Address>,
+        _new_publisher_btc_pubkeys: &[Vec<u8>],
         _signatures: &[Vec<u8>],
-        _sequencer_set: &SequencerSet,
-        _sequencer_set_cmt_sigs: &[u8],
+        _height: U256,
     ) -> anyhow::Result<String> {
         Ok("".to_string())
     }
