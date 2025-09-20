@@ -161,13 +161,13 @@ async fn main() {
     let latest_sequencer_commit_txid = Txid::from_str(&args.latest_sequencer_commit_txid).unwrap();
 
     let operator_latest_sequencer_commit_txn =
-        btc_client.fetch_btc_tx(&latest_sequencer_commit_txid).await.unwrap();
+        btc_client.get_tx(&latest_sequencer_commit_txid).await.unwrap().unwrap();
     println!("operator_latest_seqeuncer_commit_txn: {:?}", operator_latest_sequencer_commit_txn);
 
     // TODO: replace it by `get_raw_transaction_info`
     let tx_merkle_proof =
         btc_client.get_btc_merkle_proof(&latest_sequencer_commit_txid).await.unwrap();
-    let block_pos = tx_merkle_proof.1.block_height;
+    let block_pos = tx_merkle_proof.2.block_height;
     println!("block height: {block_pos}");
     let target_block = btc_client.get_btc_block(block_pos).await.unwrap();
 
@@ -192,10 +192,10 @@ async fn main() {
     let mut watchtower_challenge_txn_pubkey = Vec::new();
     for (id, pk) in &watchtower_challenge_txids {
         let txid = id.parse().unwrap();
-        let txn = btc_client.fetch_btc_tx(&txid).await.unwrap();
+        let txn = btc_client.get_tx(&txid).await.unwrap().unwrap();
         // get prev outs
         // FIXME: update the index
-        let prev_txn = btc_client.fetch_btc_tx(&txn.input[0].previous_output.txid).await.unwrap();
+        let prev_txn = btc_client.get_tx(&txn.input[0].previous_output.txid).await.unwrap().unwrap();
         watchtower_challenge_txn_prev_outs
             .push(prev_txn.output[txn.input[0].previous_output.vout as usize].clone());
         watchtower_challenge_txn_pubkey.push(PublicKey::from_str(pk).unwrap());

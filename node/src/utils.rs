@@ -56,11 +56,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::ipfs::IPFS;
 use store::localdb::LocalDB;
-use store::{
-    ByteArray32, GoatTxProceedWithdrawExtra, GoatTxProcessingStatus, GoatTxRecord, GoatTxType,
-    Graph, GraphStatus, Instance, InstanceStatus, Int64Array3, Message, MessageState, MessageType,
-    Node,
-};
+use store::{ByteArray32, GoatTxProceedWithdrawExtra, GoatTxProcessingStatus, GoatTxRecord, GoatTxType, Graph, GraphStatus, Instance, InstanceStatus, Message, MessageState, MessageType, Node, UInt64Array3};
 use stun_client::{Attribute, Class, Client};
 
 use crate::env;
@@ -463,10 +459,7 @@ pub async fn build_sign_and_broadcast_tx(
 ) -> Result<Txid, Box<dyn std::error::Error>> {
     let txouts = if txouts.is_empty() {
         // bitcoin network does not allow a transaction without outputs
-        vec![TxOut {
-            value: Amount::ZERO,
-            script_pubkey: generate_opreturn_script(vec![]),
-        }]
+        vec![TxOut { value: Amount::ZERO, script_pubkey: generate_opreturn_script(vec![]) }]
     } else {
         txouts
     };
@@ -480,16 +473,17 @@ pub async fn build_sign_and_broadcast_tx(
     let total_output_amount: Amount = tx.output.iter().map(|o| o.value).sum();
     let fee_rate = get_fee_rate(client).await?;
     let node_address = node_p2wsh_address(get_network(), &node_keypair.public_key().into());
-    let shortfall = Amount::from_sat(
-        total_output_amount.to_sat().saturating_sub(total_input_amount.to_sat())
-    );
+    let shortfall =
+        Amount::from_sat(total_output_amount.to_sat().saturating_sub(total_input_amount.to_sat()));
     match get_proper_utxo_set(
         client,
         tx.weight().to_vbytes_ceil(),
         node_address.clone(),
         shortfall,
         fee_rate,
-    ).await? {
+    )
+    .await?
+    {
         Some((inputs, _, change_amount)) => {
             for input in &inputs {
                 tx.input.push(TxIn {
@@ -1595,7 +1589,6 @@ pub async fn generate_instance_from_event(
     btc_client: &BTCClient,
     event: &BridgeInRequestEvent,
 ) -> anyhow::Result<Instance> {
-    // TODO decode event to get from_addr unsign_pegin_confirm_tx pegin_prepare_txid pegin_cancel_txid, timeout
     let user_xonly_pubkey_bytes = hex::decode(strip_hex_prefix_owned(&event.user_xonly_pubkey))?;
     let user_xonly_pubkey_array: [u8; 32] = user_xonly_pubkey_bytes
         .try_into()
@@ -1639,7 +1632,7 @@ pub async fn generate_instance_from_event(
         from_addr,
         to_addr: EvmAddress::from_str(&event.depositor_address)?.to_string(),
         amount: event.pegin_amount_sats.parse()?,
-        fees: Int64Array3(event.txn_fees.clone().map(|v| v.parse::<i64>().unwrap_or_default())),
+        fees: UInt64Array3(event.txn_fees.clone().map(|v| v.parse::<u64>().unwrap_or_default())),
         input_utxos: serde_json::to_string(&input_utxos)?,
         status: InstanceStatus::UserInited.to_string(),
         pegin_request_tx_hash: event.transaction_hash.clone(),
