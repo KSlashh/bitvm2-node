@@ -18,7 +18,7 @@ use header_chain::{
     BlockHeaderCircuitOutput, ChainState, CircuitTransaction, HeaderChainCircuitInput,
     HeaderChainPrevProofType, SPV,
 };
-use revm_database_interface::DatabaseRef;
+use revm::DatabaseRef;
 use zkm_verifier::Groth16Verifier;
 
 use bitcoin::{ScriptBuf, TxOut, Txid, hashes::Hash, secp256k1::PublicKey};
@@ -42,8 +42,7 @@ fn verify_el_withdraw_tx(
     data[64..].copy_from_slice(&mut k);
     let slot_id = B256::from(keccak256(data));
 
-    let sealed_headers: Vec<_> = input.sealed_headers().collect();
-    let triedb = input.witness_db(&sealed_headers).unwrap();
+    let triedb = input.witness_db().unwrap();
     triedb.storage_ref(l2_contract_address, slot_id.into()).unwrap()
 }
 
@@ -97,7 +96,7 @@ pub fn generate_watchtower_proof(
         Txid::from_byte_array(latest_sequencer_commit_txid)
     );
 
-    println!("header chain");
+    println!("header chain: applying: {}", header_chain.block_headers.len());
     // verify header_chain is valid
     let btc_header_chain_output = header_chain_circuit(header_chain);
 
@@ -314,18 +313,17 @@ pub fn build_spv(
     latest_sequencer_commit_txn: &Transaction,
     target_block_pos: u32,
     target_block: Block,
-    header_chain_input: &HeaderChainCircuitInput,
+    block_headers: &Vec<CircuitBlockHeader>,
 ) -> SPV {
     let tx: CircuitTransaction = CircuitTransaction(latest_sequencer_commit_txn.clone());
     let latest_sequencer_commit_txid = tx.0.compute_txid();
 
     let mut mmr_native = MMRHost::new();
-    for j in 0..header_chain_input.block_headers.len() {
-        mmr_native.append(header_chain_input.block_headers[j].compute_block_hash());
+    for j in 0..block_headers.len() {
+        mmr_native.append(block_headers[j].compute_block_hash());
     }
 
-    let target_block_header: CircuitBlockHeader =
-        header_chain_input.block_headers[target_block_pos as usize].clone();
+    let target_block_header: CircuitBlockHeader = block_headers[target_block_pos as usize].clone();
 
     // find the target block
     let tx_pos =

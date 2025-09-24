@@ -2,12 +2,13 @@
 //! Example:
 //! ```
 //! export BITCOIN_NETWORK=regtest
-//! RUST_LOG=debug cargo run -r -- --latest-sequencer-commit-txid 7b5fde8cc49a0afe1bfd6534d63d3549d4b03394dab978642db866b74f6fa62c --header-chain-input-proof ../../header-chain-proof/host/0-10.bin --commit-chain-input-proof ../../commit-chain-proof/host/compressed.bin --output "output.bin"
-//! RUST_LOG=debug cargo run -r -- --latest-sequencer-commit-txid b3634687ec158f4b72608d1021cab3e8789742fbef0cf2f381cdaf1820d13a41 --header-chain-input-proof ../../header-chain-proof/host/0-10.bin --commit-chain-input-proof ../../commit-chain-proof/host/compressed2.bin --output "output.bin"
+//! RUST_LOG=debug cargo run -r -- --latest-sequencer-commit-txid 7b5fde8cc49a0afe1bfd6534d63d3549d4b03394dab978642db866b74f6fa62c --header-chain-input-proof ../../header-chain-proof/host/0-10.bin --commit-chain-input-proof ../../commit-chain-proof/host/commit-proof.bin --output "output.bin"
+//! RUST_LOG=debug cargo run -r -- --latest-sequencer-commit-txid b3634687ec158f4b72608d1021cab3e8789742fbef0cf2f381cdaf1820d13a41 --header-chain-input-proof ../../header-chain-proof/host/0-10.bin --commit-chain-input-proof ../../commit-chain-proof/host/commit-proof2.bin --output "output.bin"
 //! ```
 use ark_serialize::CanonicalSerialize;
+use borsh::BorshDeserialize;
 use client::btc_chain::BTCClient;
-use header_chain::{HeaderChainCircuitInput, HeaderChainPrevProofType};
+use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
 use zkm_sdk::{
     HashableKey, ProverClient, ZKMProof, ZKMProofWithPublicValues, ZKMStdin, include_elf,
 };
@@ -38,8 +39,11 @@ pub struct Args {
     #[clap(long, env, short)]
     commit_chain_input_proof: String,
 
-    #[clap(long, env, default_value = "compressed.bin")]
+    #[clap(long, env, default_value = "commit-proof.bin")]
     output: String,
+
+    #[clap(long, env, default_value = "../../header-chain-proof/host/block_headers.bin")]
+    block_headers: String,
 }
 
 #[tokio::main]
@@ -101,8 +105,17 @@ async fn main() {
     println!("block height: {block_pos}");
     let target_block = btc_client.get_btc_block(block_pos).await.unwrap();
 
+    let bitcoin_block_headers = {
+        let headers: Vec<u8> = std::fs::read(&args.block_headers).unwrap();
+        headers
+            .chunks(80)
+            .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
+            .collect::<Vec<CircuitBlockHeader>>()
+    };
+    println!("block headers: {:?}", bitcoin_block_headers.len());
+
     println!("construct spv");
-    let spv = build_spv(&tx, block_pos, target_block, &header_chain_input);
+    let spv = build_spv(&tx, block_pos, target_block, &bitcoin_block_headers);
 
     // Generate the proofs.
     let mut proof = tracing::info_span!("generate proof").in_scope(|| {
@@ -112,16 +125,16 @@ async fn main() {
         stdin.write(&commit_chain_input);
         stdin.write(&spv);
 
-        if header_chain_input.prev_proof != HeaderChainPrevProofType::GenesisBlock {
-            stdin.write_proof(*header_compressed_proof, header_chain_vk.vk);
-        } else {
-            println!("skip writing header chain proof");
-        }
-
         if commit_chain_input.prev_proof != CommitChainPrevProofType::GenesisBlock {
             stdin.write_proof(*commit_compressed_proof, commit_chain_vk.vk);
         } else {
             println!("skip writing commit chain proof");
+        }
+
+        if header_chain_input.prev_proof != HeaderChainPrevProofType::GenesisBlock {
+            stdin.write_proof(*header_compressed_proof, header_chain_vk.vk);
+        } else {
+            println!("skip writing header chain proof");
         }
 
         client.prove(&watchtower_proof_pk, stdin).groth16().run().expect("proving failed")
