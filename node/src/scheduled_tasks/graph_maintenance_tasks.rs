@@ -2,20 +2,26 @@ use crate::action::{
     ChallengeSent, GOATMessage, GOATMessageContent, KickoffReady, KickoffSent, Take1Ready,
     Take2Ready, send_to_peer,
 };
-use crate::env::{MESSAGE_BROADCAST_MAX_TIMES, MESSAGE_RESEND_INTERVAL_SECOND, get_network};
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
+use crate::scheduled_tasks::{
+    BroadcastMessageDetail, broadcast_message_and_record, fetch_graph_and_broadcast_record_map,
+    gen_broadcast_record_map_key, is_need_to_send_msg,
+};
 use crate::utils::{get_graph, outpoint_spent_txid};
 use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use bitvm2_lib::actors::Actor;
+use bitvm2_lib::constants::{
+    ACK_TIMELOCK, ASSERT_COMMIT_TIMELOCK, CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK,
+    CONNECTOR_F_TIMELOCK, CONNECTOR_G_TIMELOCK, WATCHTOWER_CHALLENGE_TIMELOCK,
+};
 use client::btc_chain::BTCClient;
 use client::goat_chain::{DisproveTxType, GOATClient, WithdrawStatus};
 use indexmap::IndexMap;
 use libp2p::Swarm;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use store::localdb::{GraphQuery, GraphUpdate, LocalDB, StorageProcessor};
+use store::localdb::{GraphUpdate, LocalDB, StorageProcessor};
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, Graph, GraphBtcTxVoutMonitor, GraphStatus,
     MessageBroadcast, MessageType, SerializableTxid,
@@ -24,9 +30,41 @@ use strum::{Display, EnumString};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-const BLOCKHASH_COMMIT_VIN_MARGIN: i64 = 3;
-const _ASSERT_COMMIT_VIN_MARGIN: i64 = 2;
+const CONNECTOR_G_MARGIN: i64 = 3;
+const CONNECTOR_D_MARGIN: u64 = 2;
+const CONNECTOR_F_MARGIN: u64 = 2;
+const CONNECTOR_GUARDIAN_MARGIN: u64 = 2;
 
+pub struct ChallengeTimeLockConfig {
+    pub watchtower_challenge_timelock: i64,
+    pub watchtower_ack_timelock: i64,
+    pub watchtower_blockhash_commit_timelock: i64,
+    pub assert_commit_timelock: i64,
+}
+
+fn get_challenge_timelock_config() -> ChallengeTimeLockConfig {
+    ChallengeTimeLockConfig {
+        watchtower_challenge_timelock: WATCHTOWER_CHALLENGE_TIMELOCK as i64,
+        watchtower_ack_timelock: ACK_TIMELOCK as i64,
+        watchtower_blockhash_commit_timelock: CONNECTOR_G_TIMELOCK as i64,
+        assert_commit_timelock: ASSERT_COMMIT_TIMELOCK as i64,
+    }
+}
+
+fn get_take1_timelock_config() -> i64 {
+    CONNECTOR_A_TIMELOCK as i64
+}
+
+pub struct Take2TimeLockConfig {
+    pub assert_init_out_timelock: i64,
+    pub watchtower_challenge_init_out_timelock: i64,
+}
+fn get_take2_timelock_config() -> Take2TimeLockConfig {
+    Take2TimeLockConfig {
+        assert_init_out_timelock: CONNECTOR_D_TIMELOCK as i64,
+        watchtower_challenge_init_out_timelock: CONNECTOR_F_TIMELOCK as i64,
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Display, EnumString)]
 enum OperatorWithdrawType {
     Take1,
@@ -58,6 +96,8 @@ pub struct ChallengeSubStatus {
     pub watchtower_challenge_status: WatchtowerChallengeStatus,
     pub commit_blockhash_status: CommitBlockHashStatus,
     pub assert_commit_status: AssertCommitStatus,
+    pub disprove_type: Option<DisproveTxType>,
+    pub disprove_index: i32,
 }
 
 impl ChallengeSubStatus {
@@ -78,16 +118,14 @@ impl ChallengeSubStatus {
     }
 
     pub fn is_watchtower_challenge_finished(&self) -> bool {
-        vec![WatchtowerChallengeStatus::OperatorACK, WatchtowerChallengeStatus::OperatorNACK]
+        [WatchtowerChallengeStatus::OperatorACK, WatchtowerChallengeStatus::OperatorNACK]
             .contains(&self.watchtower_challenge_status)
-            && [CommitBlockHashStatus::OperatorCommit, CommitBlockHashStatus::OperatorCommitTimeout]
+            || [CommitBlockHashStatus::OperatorCommit, CommitBlockHashStatus::OperatorCommitTimeout]
                 .contains(&self.commit_blockhash_status)
     }
 
     pub fn is_disproved(&self) -> bool {
-        self.watchtower_challenge_status == WatchtowerChallengeStatus::OperatorNACK
-            || self.commit_blockhash_status == CommitBlockHashStatus::OperatorCommitTimeout
-            || self.assert_commit_status == AssertCommitStatus::OperatorCommitTimeout
+        self.disprove_type.is_some()
     }
 
     pub fn is_normal_finished(&self) -> bool {
@@ -180,27 +218,6 @@ impl WTInitTxVoutMonitorData {
     pub fn is_challenged(&self) -> bool {
         !self.require_disproved_indexes.is_empty()
             || self.commit_blockhash_status == CommitBlockHashStatus::OperatorCommitTimeout
-    }
-
-    #[allow(dead_code)]
-    pub fn get_disprove_type(&self) -> Option<DisproveTxType> {
-        if self.commit_blockhash_status == CommitBlockHashStatus::OperatorCommitTimeout {
-            return Some(DisproveTxType::OperatorCommitTimeout);
-        }
-        if !self.require_disproved_indexes.is_empty() {
-            return Some(DisproveTxType::OperatorNack);
-        }
-        None
-    }
-
-    #[allow(dead_code)]
-    pub fn is_complete_in_time(&self) -> bool {
-        self.is_complete_in_time
-    }
-
-    #[allow(dead_code)]
-    pub fn is_finished(&self) -> bool {
-        self.is_complete_in_time || self.is_challenged()
     }
 }
 
@@ -298,62 +315,6 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to parse monitor data: {}", e))
 }
 
-fn is_need_to_send_msg(pre_send_times: i64, last_send_at: i64) -> bool {
-    // if msg never been sent, last_send_at value is 0
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    (pre_send_times % MESSAGE_BROADCAST_MAX_TIMES != 0)
-        || (current_time - last_send_at) > MESSAGE_RESEND_INTERVAL_SECOND
-}
-
-pub struct BroadcastMessageDetail {
-    pub actor: Actor,
-    pub message_content: GOATMessageContent,
-    pub graph_id: Uuid,
-    pub graph_status: String,
-    pub msg_type: String,
-    pub pre_send_times: i64,
-    pub last_send_at: i64,
-}
-async fn broadcast_message_and_record(
-    swarm: &mut Swarm<AllBehaviours>,
-    storage_processor: &mut StorageProcessor<'_>,
-    msg_detail: BroadcastMessageDetail,
-) -> anyhow::Result<()> {
-    if is_need_to_send_msg(msg_detail.pre_send_times, msg_detail.last_send_at) {
-        send_to_peer(
-            swarm,
-            GOATMessage::from_typed(msg_detail.actor, &msg_detail.message_content)?,
-        )?;
-        storage_processor
-            .add_message_broadcast_times(
-                &msg_detail.graph_id,
-                &msg_detail.graph_status,
-                &msg_detail.msg_type,
-                1,
-            )
-            .await?;
-    }
-    Ok(())
-}
-fn gen_broadcast_record_map_key(graph_id: Uuid, graph_status: &str, msg_type: &str) -> String {
-    format!("{}_{}_{}", graph_id, graph_status, msg_type)
-}
-async fn fetch_graph_and_broadcast_record_map<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    graph_status: &str,
-) -> anyhow::Result<(Vec<Graph>, HashMap<String, MessageBroadcast>)> {
-    let (graphs, _) = storage_processor
-        .find_graphs(GraphQuery::default().with_status(graph_status.to_string()))
-        .await?;
-
-    let broadcasts = storage_processor.find_message_broadcasts(graph_status).await?;
-    let broadcast_record_map: HashMap<String, MessageBroadcast> = broadcasts
-        .into_iter()
-        .map(|v| (gen_broadcast_record_map_key(v.graph_id, &v.graph_status, &v.msg_type), v))
-        .collect();
-    Ok((graphs, broadcast_record_map))
-}
-
 #[allow(dead_code)]
 pub async fn get_initialized_graphs(goat_client: &GOATClient) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
     // call L2 contract : getInitializedInstanceIds
@@ -436,6 +397,7 @@ pub async fn detect_init_withdraw_call(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn process_operator_data_pushed_graph(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
@@ -508,7 +470,7 @@ pub async fn detect_kickoff(
     _swarm: &mut Swarm<AllBehaviours>,
     local_db: &LocalDB,
     btc_client: &BTCClient,
-    goat_client: &GOATClient,
+    _goat_client: &GOATClient,
 ) -> anyhow::Result<()> {
     trace!("start tick action: detect_kickoff");
     let mut storage_processor = local_db.acquire().await?;
@@ -526,24 +488,44 @@ pub async fn detect_kickoff(
                 continue;
             }
         };
-        process_operator_data_pushed_graph(
-            btc_client,
-            goat_client,
-            local_db,
-            &graph.graph_id,
-            &graph.instance_id,
-            &kickoff_txid,
-        )
-        .await?;
+
+        if outpoint_spent_txid(btc_client, &kickoff_txid, 0).await?.is_some() {
+            trace!(
+                "graph_id:{} kickoff: {} output has been spend, no need to send kickoffSent message",
+                graph.graph_id,
+                kickoff_txid.to_string()
+            );
+            continue;
+        }
+        let tx_info = btc_client
+            .get_tx_info(&kickoff_txid)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kickoff {} not found", kickoff_txid.to_string()))?;
+        if !tx_info.status.confirmed {
+            warn!("graph_id:{} kickoff:{kickoff_txid:?} is not onchain", graph.graph_id);
+            continue;
+        }
+
+        // todo p2p message
+
+        // process_operator_data_pushed_graph(
+        //     btc_client,
+        //     goat_client,
+        //     local_db,
+        //     &graph.graph_id,
+        //     &graph.instance_id,
+        //     &kickoff_txid,
+        // )
+        // .await?;
     }
     Ok(())
 }
 
 pub async fn detect_take1_or_challenge(
-    swarm: &mut Swarm<AllBehaviours>,
+    _swarm: &mut Swarm<AllBehaviours>,
     local_db: &LocalDB,
     btc_client: &BTCClient,
-    goat_client: &GOATClient,
+    _goat_client: &GOATClient,
 ) -> anyhow::Result<()> {
     trace!("start tick action: detect_take1_or_challenge");
     let mut storage_processor = local_db.acquire().await?;
@@ -552,13 +534,12 @@ pub async fn detect_take1_or_challenge(
         &GraphStatus::OperatorKickOff.to_string(),
     )
     .await?;
-    let current_height = btc_client.get_height().await?;
+    let current_height = btc_client.get_height().await? as i64;
     info!(
         "start tick action: detect_take1_or_challenge, graphs: {current_height}, current_height: {}",
         graphs.len()
     );
-    // todo Update lock_blocks
-    let lock_blocks = 0;
+    let lock_blocks = get_take1_timelock_config();
     for graph in graphs {
         let take1_ready_record = broadcast_record_map
             .get(&gen_broadcast_record_map_key(
@@ -580,8 +561,7 @@ pub async fn detect_take1_or_challenge(
                 .clone();
             // take1 not ready
             broadcast_message_and_record(
-                swarm,
-                &mut storage_processor,
+                local_db,
                 BroadcastMessageDetail {
                     actor: Actor::All,
                     message_content: GOATMessageContent::KickoffSent(KickoffSent {
@@ -597,22 +577,14 @@ pub async fn detect_take1_or_challenge(
             )
             .await?;
         }
-        match process_kickoff_graph(
-            btc_client,
-            goat_client,
-            local_db,
-            &graph,
-            lock_blocks,
-            current_height,
-        )
-        .await?
+        match process_kickoff_graph(btc_client, local_db, &graph, lock_blocks, current_height)
+            .await?
         {
             Some((actor, message_content)) => {
                 info!("process_kickoff_graph detect take1 ready");
                 // first detected take1 ready
                 broadcast_message_and_record(
-                    swarm,
-                    &mut storage_processor,
+                    local_db,
                     BroadcastMessageDetail {
                         actor,
                         message_content,
@@ -627,15 +599,17 @@ pub async fn detect_take1_or_challenge(
             }
             None => {}
         }
+
+        detect_kickoff_ref_disprove_tx(btc_client, &mut storage_processor, &graph).await?;
     }
     Ok(())
 }
 
 pub async fn process_graph_challenge(
-    swarm: &mut Swarm<AllBehaviours>,
+    _swarm: &mut Swarm<AllBehaviours>,
     local_db: &LocalDB,
     btc_client: &BTCClient,
-    goat_client: &GOATClient,
+    _goat_client: &GOATClient,
 ) -> anyhow::Result<()> {
     info!("start tick action: process_graph_challenge");
     let mut storage_processor = local_db.acquire().await?;
@@ -681,8 +655,7 @@ pub async fn process_graph_challenge(
                     .clone();
                 // broadcast p2p message challengeSent
                 broadcast_message_and_record(
-                    swarm,
-                    &mut storage_processor,
+                    local_db,
                     BroadcastMessageDetail {
                         actor: Actor::Operator,
                         message_content: GOATMessageContent::ChallengeSent(ChallengeSent {
@@ -734,25 +707,27 @@ pub async fn process_graph_challenge(
                     "process_graph_challenge graph:{} is not watchtower challenge and assert commit is finished",
                     graph.graph_id
                 );
-                detect_take2(btc_client, goat_client, local_db, &graph, current_height).await?;
+                if let Some((_actor, _content)) =
+                    detect_take2(btc_client, local_db, &graph, current_height).await?
+                {
+                    //todo send take2 ready
+                }
             }
-        } else {
-            trace!("process_graph_challenge graph:{} is not disproved", graph.graph_id);
-            process_graph_watchtower_assert_disproved(
-                btc_client,
-                goat_client,
-                local_db,
-                &graph,
-                &mut sub_status,
-            )
-            .await?;
         }
+        trace!(
+            "process_graph_challenge graph:{} do checking disprove action until status change to disprove or take2",
+            graph.graph_id
+        );
+        process_graph_watchtower_assert_disproved(btc_client, local_db, &graph, &mut sub_status)
+            .await?;
+        detect_kickoff_ref_disprove_tx(btc_client, &mut storage_processor, &graph).await?;
     }
 
     Ok(())
 }
 
-/// Handle Take1 transaction completion
+// TODO remove me later
+#[allow(dead_code)]
 async fn handle_operator_withdraw_completion(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
@@ -845,11 +820,13 @@ async fn handle_challenge_detected(
     storage_processor
         .update_graph_fields(
             GraphUpdate::new(graph_id)
-                .with_status(GraphStatus::Challenge.to_string())
+                // .with_status(GraphStatus::Challenge.to_string())
                 .with_challenge_txid(challenge_txid.into())
                 .with_sub_status(sub_status),
         )
         .await?;
+
+    // P2P change
 
     info!("successfully updated graph_id: {graph_id} to challenge status");
     Ok(())
@@ -914,11 +891,10 @@ async fn check_operator_withdraw_ready_condition(
 /// Process graph data in KickOff status
 async fn process_kickoff_graph(
     btc_client: &BTCClient,
-    goat_client: &GOATClient,
     local_db: &LocalDB,
     graph: &Graph,
-    lock_blocks: u32,
-    current_height: u32,
+    lock_blocks: i64,
+    current_height: i64,
 ) -> anyhow::Result<Option<(Actor, GOATMessageContent)>> {
     trace!("process_kickoff_graph: {}", graph.graph_id);
     let (kickoff_txid, take1_txid) = match (graph.kickoff_txid.clone(), graph.take1_txid.clone()) {
@@ -943,8 +919,8 @@ async fn process_kickoff_graph(
                 btc_client,
                 &mut tx,
                 graph.graph_id,
-                vec![(kickoff_txid, OperatorWithdrawType::Take1, height, lock_blocks as i64)],
-                current_height as i64,
+                vec![(kickoff_txid, OperatorWithdrawType::Take1, height, lock_blocks)],
+                current_height,
             )
             .await?;
             if data_change {
@@ -970,22 +946,23 @@ async fn process_kickoff_graph(
         }
     };
     let mut tx = local_db.start_transaction().await?;
-    let data_change = if spent_txid == take1_txid {
+    if spent_txid == take1_txid {
         info!(
             "process_kickoff_graph graph_id:{}, take1 is on chain, will try call contract",
             graph.graph_id
         );
+        // todo p2p messag send
         // Take1 was sent
-        handle_operator_withdraw_completion(
-            btc_client,
-            goat_client,
-            &mut tx,
-            graph.instance_id,
-            graph.graph_id,
-            OperatorWithdrawType::Take1,
-            take1_txid,
-        )
-        .await?
+        // handle_operator_withdraw_completion(
+        //     btc_client,
+        //     goat_client,
+        //     &mut tx,
+        //     graph.instance_id,
+        //     graph.graph_id,
+        //     OperatorWithdrawType::Take1,
+        //     take1_txid,
+        // )
+        // .await?
     } else {
         info!(
             "process_kickoff_graph graph_id:{}, challenge txid: {} has been detected.",
@@ -994,12 +971,8 @@ async fn process_kickoff_graph(
         );
         // Challenge was sent
         handle_challenge_detected(&mut tx, graph.graph_id, spent_txid).await?;
-        true
     };
-    if data_change {
-        tx.commit().await?;
-    }
-
+    tx.commit().await?;
     Ok(None)
 }
 
@@ -1051,12 +1024,7 @@ async fn process_watchtower_challenge_monitoring(
     current_height: i64,
 ) -> anyhow::Result<()> {
     trace!("process_watchtower_challenge_monitoring start");
-    let (
-        watchtower_challenge_timelock,
-        ack_timelock,
-        blockhash_commit_timeout_lock,
-        _assert_commit_timeout_lock,
-    ) = get_timelock_configs();
+    let timelock_config = get_challenge_timelock_config();
     let (kickoff_txid, watchtower_challenge_init_txid, blockhash_commit_timeout_txid): (
         Txid,
         Txid,
@@ -1109,10 +1077,12 @@ async fn process_watchtower_challenge_monitoring(
             return Ok(());
         }
         let is_challenge_timeout =
-            out_monitor.height + watchtower_challenge_timelock > current_height;
-        let is_ack_timeout = out_monitor.height + ack_timelock > current_height;
-        let is_blockhash_commit_timeout =
-            out_monitor.height + blockhash_commit_timeout_lock > current_height;
+            out_monitor.height + timelock_config.watchtower_challenge_timelock > current_height;
+        let is_ack_timeout =
+            out_monitor.height + timelock_config.watchtower_ack_timelock > current_height;
+        let is_blockhash_commit_timeout = out_monitor.height
+            + timelock_config.watchtower_blockhash_commit_timelock
+            > current_height;
         let mut data_change = false;
         if !is_ack_timeout {
             if is_challenge_timeout {
@@ -1173,7 +1143,7 @@ async fn process_watchtower_challenge_monitoring(
                     if let Some(spend_txid) = outpoint_spent_txid(
                         btc_client,
                         &watchtower_challenge_init_txid,
-                        (out_monitor.vout_len - BLOCKHASH_COMMIT_VIN_MARGIN) as u64,
+                        (out_monitor.vout_len - CONNECTOR_G_MARGIN) as u64,
                     )
                     .await?
                         && blockhash_commit_timeout_txid != spend_txid
@@ -1195,6 +1165,7 @@ async fn process_watchtower_challenge_monitoring(
                         CommitBlockHashStatus::OperatorCommitTimeout;
                     sub_status.commit_blockhash_status =
                         CommitBlockHashStatus::OperatorCommitTimeout;
+                    sub_status.disprove_type = Some(DisproveTxType::OperatorCommitTimeout);
                     data_change = true;
                 }
             }
@@ -1233,6 +1204,7 @@ async fn process_watchtower_challenge_monitoring(
                     graph.graph_id
                 );
                 sub_status.watchtower_challenge_status = WatchtowerChallengeStatus::OperatorNACK;
+                sub_status.disprove_type = Some(DisproveTxType::OperatorNack);
             }
             data_change = true;
         }
@@ -1311,12 +1283,7 @@ async fn process_assert_commit_monitoring(
     current_height: i64,
 ) -> anyhow::Result<()> {
     trace!("process_assert_commit_monitoring start");
-    let (
-        _watchtower_challenge_timelock,
-        _ack_timelock,
-        _blockhash_commit_timeout_lock,
-        assert_commit_timeout_lock,
-    ) = get_timelock_configs();
+    let timelock_config = get_challenge_timelock_config();
     let (kickoff_txid, assert_init_txid): (Txid, Txid) = match (
         graph.kickoff_txid.clone(),
         graph.assert_init_txid.clone(),
@@ -1348,16 +1315,8 @@ async fn process_assert_commit_monitoring(
                     return Ok(());
                 }
             };
-        if vout_monitor_data.is_challenged() {
-            trace!(
-                "process_assert_commit_monitoring graph id :{} need to send p2p message: assert commit is challenged",
-                graph.graph_id
-            );
-            // TODO send p2p message: assert_commit_finish
-            return Ok(());
-        }
         let is_assert_commit_timeout =
-            out_monitor.height + assert_commit_timeout_lock > current_height;
+            out_monitor.height + timelock_config.assert_commit_timelock > current_height;
         let mut data_change = false;
         if !is_assert_commit_timeout {
             trace!(
@@ -1388,6 +1347,7 @@ async fn process_assert_commit_monitoring(
                     graph.graph_id
                 );
                 sub_status.assert_commit_status = AssertCommitStatus::OperatorCommitTimeout;
+                sub_status.disprove_type = Some(DisproveTxType::AssertTimeout);
                 // TODO send p2p message: assert_commit_timeout
             }
             data_change = true;
@@ -1453,55 +1413,42 @@ async fn process_assert_commit_monitoring(
     Ok(())
 }
 
-/// Get timelock configurations
-fn get_timelock_configs() -> (i64, i64, i64, i64) {
-    let _network = get_network();
-    // TODO: Update lock_blocks - these may need different values based on protocol requirements
-    let base_timelock = 0;
-    let watchtower_challenge_timelock = base_timelock;
-    let ack_timelock = base_timelock;
-    let assert_commit_timeout_lock = base_timelock;
-    let blockhash_commit_timeout_lock = base_timelock;
-    (
-        watchtower_challenge_timelock,
-        ack_timelock,
-        blockhash_commit_timeout_lock,
-        assert_commit_timeout_lock,
-    )
-}
-
 /// Find the spend transaction for a disproved index
-async fn find_spend_tx_for_disproved_index(
+async fn find_challenge_nack_tx(
     btc_client: &BTCClient,
     storage_processor: &mut StorageProcessor<'_>,
     graph_id: &Uuid,
-    txid: &SerializableTxid,
-    index_calculator: impl Fn(i32) -> u64,
+    watchtower_challenge_init_txid: &SerializableTxid,
 ) -> anyhow::Result<Option<(Txid, i32)>> {
-    let out_monitor = storage_processor.get_graph_btc_tx_vout_monitor(graph_id, txid).await?;
+    let out_monitor = storage_processor
+        .get_graph_btc_tx_vout_monitor(graph_id, watchtower_challenge_init_txid)
+        .await?;
 
     let Some(out_monitor) = out_monitor else {
         return Ok(None);
     };
 
-    let vout_monitor_data =
-        parse_monitor_data::<WTInitTxVoutMonitorData>(&out_monitor.monitor_data)
-            .map_err(|e| anyhow::anyhow!("Failed to parse monitor data: {}", e))?;
-
-    for &index in &vout_monitor_data.require_disproved_indexes {
-        let calculated_index = index_calculator(index);
-        if let Some(spend_txid) =
-            outpoint_spent_txid(btc_client, &txid.clone().into(), calculated_index).await?
-        {
-            return Ok(Some((spend_txid, index)));
+    if let Some(spend_txid) = outpoint_spent_txid(
+        btc_client,
+        &watchtower_challenge_init_txid.clone().into(),
+        out_monitor.vout_len as u64 - CONNECTOR_F_MARGIN,
+    )
+    .await?
+        && let Some(tx) = btc_client.get_tx(&spend_txid).await?
+    {
+        let index = tx.input[0].previous_output.vout as i32;
+        if index == out_monitor.vout_len as i32 - 3_i32 {
+            return Ok(None);
         }
+
+        return Ok(Some((spend_txid, index / 2)));
     }
 
     Ok(None)
 }
 
 /// Find the spend transaction for assert timeout
-async fn find_assert_timeout_spend_tx(
+async fn find_assert_timeout_tx(
     btc_client: &BTCClient,
     storage_processor: &mut StorageProcessor<'_>,
     graph_id: &Uuid,
@@ -1514,19 +1461,73 @@ async fn find_assert_timeout_spend_tx(
         return Ok(None);
     };
 
-    let vout_monitor_data =
-        parse_monitor_data::<AssertInitTxVoutMonitorData>(&out_monitor.monitor_data)
-            .map_err(|e| anyhow::anyhow!("Failed to parse assert monitor data: {}", e))?;
-
-    for &index in &vout_monitor_data.require_disproved_indexes {
-        if let Some(spend_txid) =
-            outpoint_spent_txid(btc_client, &assert_init_txid.clone().into(), index as u64).await?
-        {
-            return Ok(Some((spend_txid, index)));
-        }
+    if let Some(spend_txid) = outpoint_spent_txid(
+        btc_client,
+        &assert_init_txid.clone().into(),
+        out_monitor.vout_len as u64 - CONNECTOR_D_MARGIN,
+    )
+    .await?
+        && let Some(tx) = btc_client.get_tx(&spend_txid).await?
+    {
+        return Ok(Some((spend_txid, tx.input[0].previous_output.vout as i32)));
     }
 
     Ok(None)
+}
+
+async fn detect_kickoff_ref_disprove_tx(
+    btc_client: &BTCClient,
+    storage_processor: &mut StorageProcessor<'_>,
+    graph: &Graph,
+) -> anyhow::Result<()> {
+    let (kickoff_txid, take1_txid, take2_txid): (Txid, Txid, Txid) = match (
+        graph.kickoff_txid.clone(),
+        graph.assert_init_txid.clone(),
+        graph.take2_txid.clone(),
+    ) {
+        (Some(kickoff_txid), Some(take1_txid), Some(take2_txid)) => {
+            (kickoff_txid.into(), take1_txid.into(), take2_txid.into())
+        }
+        _ => {
+            warn!("graph:{} kickoff_txid/take1_txid/take2_txid  has none value", graph.graph_id);
+            return Ok(());
+        }
+    };
+    let out_monitor = storage_processor
+        .get_graph_btc_tx_vout_monitor(&graph.graph_id, &kickoff_txid.clone().into())
+        .await?;
+
+    let Some(out_monitor) = out_monitor else {
+        return Ok(());
+    };
+
+    if let Some(spend_txid) = outpoint_spent_txid(
+        btc_client,
+        &kickoff_txid,
+        out_monitor.vout_len as u64 - CONNECTOR_GUARDIAN_MARGIN,
+    )
+    .await?
+        && let Some(tx) = btc_client.get_tx(&spend_txid).await?
+    {
+        if spend_txid == take1_txid || spend_txid == take2_txid || tx.input.len() < 2 {
+            return Ok(());
+        }
+
+        let _diprove_type = if tx.input[1].previous_output.vout == 0 {
+            DisproveTxType::QuickChallenge
+        } else {
+            DisproveTxType::ChallengeIncompeleteKickoff
+        };
+        let _challenge_start_txid: Txid = if let Some(txid) = graph.challenge_txid.clone() {
+            txid.into()
+        } else {
+            Txid::all_zeros()
+        };
+
+        // TODO p2p send
+    }
+
+    Ok(())
 }
 
 async fn detect_disproved_txids(
@@ -1536,16 +1537,33 @@ async fn detect_disproved_txids(
     sub_status: &mut ChallengeSubStatus,
 ) -> anyhow::Result<Option<(DisproveTxType, Txid, Txid, i32)>> {
     trace!("detecting disproved txids graph_id {}", graph.graph_id);
+    let challenge_txid: Txid = match graph.challenge_txid.clone() {
+        Some(challenge_txid) => challenge_txid.into(),
+        None => {
+            warn!("graph:{} challenge_txid is none", graph.graph_id);
+            return Ok(None);
+        }
+    };
+
+    if let Some(disprove_type) = sub_status.disprove_type.clone()
+        && let Some(disprove_txid) = graph.disprove_txid.clone()
+    {
+        return Ok(Some((
+            disprove_type,
+            challenge_txid,
+            disprove_txid.into(),
+            sub_status.disprove_index,
+        )));
+    }
+
     let (
         kickoff_txid,
-        challenge_txid,
         watchtower_challenge_init_txid,
         blockhash_commit_timeout_txid,
         assert_init_txid,
         take2_txid,
-    ): (Txid, Txid, Txid, Txid, Txid, Txid) = match (
+    ): (Txid, Txid, Txid, Txid, Txid) = match (
         graph.kickoff_txid.clone(),
-        graph.challenge_txid.clone(),
         graph.watchtower_challenge_init_txid.clone(),
         graph.blockhash_commit_timeout_txid.clone(),
         graph.assert_init_txid.clone(),
@@ -1553,24 +1571,30 @@ async fn detect_disproved_txids(
     ) {
         (
             Some(kickoff_txid),
-            Some(challenge_txid),
             Some(watchtower_challenge_init_txid),
             Some(blockhash_commit_timeout_txid),
             Some(assert_init_txid),
             Some(take2_txid),
         ) => (
             kickoff_txid.into(),
-            challenge_txid.into(),
             watchtower_challenge_init_txid.into(),
             blockhash_commit_timeout_txid.into(),
             assert_init_txid.into(),
             take2_txid.into(),
         ),
-        _ => return Ok(None),
+        _ => {
+            warn!(
+                "graph:{} kickoff_txid/watchtower_challenge_init_txid/blockhash_commit_timeout_txid/\
+                    assert_init_txid/take2_txid  has none value",
+                graph.graph_id
+            );
+            return Ok(None);
+        }
     };
     if sub_status.assert_commit_status == AssertCommitStatus::OperatorCommitTimeout {
+        sub_status.disprove_type = Some(DisproveTxType::AssertTimeout);
         return Ok(
-            match find_assert_timeout_spend_tx(
+            match find_assert_timeout_tx(
                 btc_client,
                 storage_processor,
                 &graph.graph_id,
@@ -1587,13 +1611,13 @@ async fn detect_disproved_txids(
     }
 
     if sub_status.watchtower_challenge_status == WatchtowerChallengeStatus::OperatorNACK {
+        sub_status.disprove_type = Some(DisproveTxType::OperatorNack);
         return Ok(
-            match find_spend_tx_for_disproved_index(
+            match find_challenge_nack_tx(
                 btc_client,
                 storage_processor,
                 &graph.graph_id,
                 &watchtower_challenge_init_txid.into(),
-                |index| (index * 2 + 1) as u64,
             )
             .await?
             {
@@ -1605,7 +1629,8 @@ async fn detect_disproved_txids(
         );
     }
 
-    if sub_status.watchtower_challenge_status == WatchtowerChallengeStatus::ChallengeTimeout {
+    if sub_status.commit_blockhash_status == CommitBlockHashStatus::OperatorCommitTimeout {
+        sub_status.disprove_type = Some(DisproveTxType::OperatorCommitTimeout);
         return Ok(Some((
             DisproveTxType::OperatorCommitTimeout,
             challenge_txid,
@@ -1617,13 +1642,43 @@ async fn detect_disproved_txids(
     if let Some(spent_txid) = outpoint_spent_txid(btc_client, &kickoff_txid, 3).await?
         && spent_txid == take2_txid
     {
+        sub_status.disprove_type = Some(DisproveTxType::Disprove);
         return Ok(Some((DisproveTxType::Disprove, challenge_txid, spent_txid, 0)));
     }
 
     Ok(None)
 }
-
 async fn process_graph_watchtower_assert_disproved(
+    btc_client: &BTCClient,
+    local_db: &LocalDB,
+    graph: &Graph,
+    sub_status: &mut ChallengeSubStatus,
+) -> anyhow::Result<()> {
+    let mut tx = local_db.start_transaction().await?;
+    match detect_disproved_txids(btc_client, &mut tx, graph, sub_status).await? {
+        Some((_disprove_type, _start_txid, finish_txid, tx_index)) => {
+            if graph.disprove_txid.is_none() {
+                sub_status.disprove_index = tx_index;
+                let mut storage_processor = local_db.acquire().await?;
+                storage_processor
+                    .update_graph_fields(
+                        GraphUpdate::new(graph.graph_id)
+                            .with_disprove_txid(finish_txid.into())
+                            .with_sub_status(serde_json::to_string(sub_status).unwrap()),
+                    )
+                    .await?;
+            }
+        }
+        None => {
+            trace!("process_graph_watchtower_assert_disproved get disproved tx is none");
+        }
+    }
+    Ok(())
+}
+
+// TODO remove me later
+#[allow(dead_code)]
+async fn process_graph_watchtower_assert_disproved_with_contact_call(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     local_db: &LocalDB,
@@ -1634,6 +1689,18 @@ async fn process_graph_watchtower_assert_disproved(
     if let Some((disprove_type, start_txid, finish_txid, tx_index)) =
         detect_disproved_txids(btc_client, &mut tx, graph, sub_status).await?
     {
+        if graph.disprove_txid.is_none() {
+            sub_status.disprove_index = tx_index;
+            let mut storage_processor = local_db.acquire().await?;
+            storage_processor
+                .update_graph_fields(
+                    GraphUpdate::new(graph.graph_id)
+                        .with_disprove_txid(finish_txid.into())
+                        .with_sub_status(serde_json::to_string(sub_status).unwrap()),
+                )
+                .await?;
+        }
+
         info!(
             "process_graph_watchtower_assert_disproved disprove_type: {disprove_type}, challenge start tx: {}, challenge finish tx: {}, tx_index: {tx_index}",
             start_txid.to_string(),
@@ -1692,7 +1759,9 @@ async fn process_graph_watchtower_assert_disproved(
                 .await?;
 
                 tx.update_graph_fields(
-                    GraphUpdate::new(graph.graph_id).with_status(GraphStatus::Disprove.to_string()),
+                    GraphUpdate::new(graph.graph_id)
+                        .with_status(GraphStatus::Disprove.to_string())
+                        .with_sub_status(serde_json::to_string(sub_status).unwrap()),
                 )
                 .await?;
                 tx.commit().await?;
@@ -1711,14 +1780,12 @@ async fn process_graph_watchtower_assert_disproved(
 /// Process graph data in Watchtower Assert Normal status
 async fn detect_take2(
     btc_client: &BTCClient,
-    goat_client: &GOATClient,
     local_db: &LocalDB,
     graph: &Graph,
     current_height: i64,
 ) -> anyhow::Result<Option<(Actor, GOATMessageContent)>> {
     trace!("detecting detect_take2 graph_id {}", graph.graph_id);
-    let watchtower_lock_blocks = 0;
-    let assert_lock_blocks = 0;
+    let timelock_config = get_take2_timelock_config();
     let (kickoff_txid, watchtower_challenge_init_txid, assert_init_txid, take2_txid): (
         Txid,
         Txid,
@@ -1781,13 +1848,13 @@ async fn detect_take2(
                         watchtower_challenge_init_txid,
                         OperatorWithdrawType::Take2,
                         watchtower_init_height,
-                        watchtower_lock_blocks as i64,
+                        timelock_config.watchtower_challenge_init_out_timelock,
                     ),
                     (
                         assert_init_txid,
                         OperatorWithdrawType::Take2,
                         assert_init_height,
-                        assert_lock_blocks as i64,
+                        timelock_config.assert_init_out_timelock,
                     ),
                 ],
                 current_height,
@@ -1813,29 +1880,25 @@ async fn detect_take2(
             return Ok(None);
         }
     };
-    let mut tx = local_db.start_transaction().await?;
-    let data_change = if spent_txid == take2_txid {
+
+    if spent_txid == take2_txid {
         info!(
             "detecting detect_take2 graph_id {} take2:{} is on btc chain",
             graph.graph_id,
             spent_txid.to_string()
         );
-        // Take1 was sent
-        handle_operator_withdraw_completion(
-            btc_client,
-            goat_client,
-            &mut tx,
-            graph.instance_id,
-            graph.graph_id,
-            OperatorWithdrawType::Take2,
-            take2_txid,
-        )
-        .await?
-    } else {
-        false
-    };
-    if data_change {
-        tx.commit().await?;
+        // TODO p2p message
+        // Take2 was sent
+        // handle_operator_withdraw_completion(
+        //     btc_client,
+        //     goat_client,
+        //     &mut tx,
+        //     graph.instance_id,
+        //     graph.graph_id,
+        //     OperatorWithdrawType::Take2,
+        //     take2_txid,
+        // )
+        // .await?
     }
     Ok(None)
 }

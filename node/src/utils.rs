@@ -39,15 +39,17 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::ipfs::IPFS;
-use store::localdb::LocalDB;
+use store::localdb::{InstanceUpdate, LocalDB, StorageProcessor};
 use store::{
     ByteArray32, GoatTxProceedWithdrawExtra, GoatTxProcessingStatus, GoatTxRecord, GoatTxType,
-    Graph, GraphStatus, Instance, InstanceStatus, Message, MessageState, MessageType, Node,
+    Graph, GraphRawData, GraphStatus, Instance, InstanceStatus, Message, MessageState, Node,
     UInt64Array3,
 };
 use stun_client::{Attribute, Class, Client};
 
 use crate::env;
+use crate::scheduled_tasks::get_goat_message_content_type;
+use bitvm2_lib::transactions::base::BaseTransaction;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -612,48 +614,133 @@ pub async fn update_graph_fields(
 }
 
 pub async fn save_unhandle_message(
-    local_db: &LocalDB,
-    from_peer_id: &str,
-    actor: &str,
-    msy_type: &str,
-    content: Vec<u8>,
+    storage_processor: &mut StorageProcessor<'_>,
+    from_peer: String,
+    actor: Actor,
+    message_content: GOATMessageContent,
+    weight: i64,
+    lock_time: i64,
 ) -> Result<()> {
-    let mut storage_process = local_db.acquire().await?;
-    storage_process
-        .create_message(
-            Message {
-                id: 0,
-                actor: actor.to_string(),
-                from_peer: from_peer_id.to_string(),
-                msg_type: msy_type.to_string(),
-                content,
-                state: MessageState::Pending.to_string(),
-            },
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-        )
+    let message = GOATMessage::from_typed(actor.clone(), &message_content)?;
+    storage_processor
+        .create_message(Message {
+            id: 0,
+            actor: actor.to_string(),
+            from_peer,
+            msg_type: get_goat_message_content_type(&message_content).to_string(),
+            content: serde_json::to_vec(&message)?,
+            weight,
+            lock_time_until: current_time_secs() + lock_time,
+            state: MessageState::Pending.to_string(),
+        })
         .await?;
     Ok(())
 }
 
+/// store new graph, graph_raw_data, and update instance_id
 pub async fn store_graph(
-    _local_db: &LocalDB,
-    _instance_id: Uuid,
-    _graph_id: Uuid,
-    _graph: &Bitvm2Graph,
-    _status: Option<String>,
-) -> Result<()> {
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    bitvm2_graph: &Bitvm2Graph,
+    status: &str,
+) -> anyhow::Result<()> {
+    let mut tx = local_db.start_transaction().await?;
+    let kickoff_index_current = tx
+        .get_operator_max_kickoff_index(&bitvm2_graph.parameters.operator_pubkey.to_string())
+        .await?;
+    let current_time = current_time_secs();
+    let mut graph = Graph {
+        graph_id,
+        instance_id,
+        kickoff_index: kickoff_index_current + 1,
+        from_addr: "".to_string(),
+        to_addr: "".to_string(),
+        graph_ipfs_base_url: "".to_string(),
+        amount: bitvm2_graph.parameters.instance_parameters.pegin_amount.to_sat() as i64,
+        challenge_amount: bitvm2_graph.parameters.challenge_amount.to_sat() as i64,
+        status: status.to_string(),
+        sub_status: "".to_string(),
+        operator_pubkey: bitvm2_graph.parameters.operator_pubkey.to_string(),
+        cur_prekickoff_txid: Some(bitvm2_graph.cur_prekickoff.finalize().compute_txid().into()),
+        next_prekickoff: Some(bitvm2_graph.next_prekickoff.finalize().compute_txid().into()),
+        force_skip_kickoff_txid: Some(
+            bitvm2_graph.force_skip_kickoff.finalize().compute_txid().into(),
+        ),
+        quick_challenge_txid: Some(bitvm2_graph.quick_challenge.finalize().compute_txid().into()),
+        challenge_incomplete_kickoff_txid: Some(
+            bitvm2_graph.challenge_incomplete_kickoff.finalize().compute_txid().into(),
+        ),
+        pegin_txid: Some(bitvm2_graph.pegin.finalize().compute_txid().into()),
+        kickoff_txid: Some(bitvm2_graph.kickoff.finalize().compute_txid().into()),
+        take1_txid: Some(bitvm2_graph.take1.finalize().compute_txid().into()),
+        challenge_txid: None,
+        take2_txid: Some(bitvm2_graph.take2.finalize().compute_txid().into()),
+        disprove_txid: None,
+        watchtower_challenge_init_txid: Some(
+            bitvm2_graph.watchtower_challenge_init.finalize().compute_txid().into(),
+        ),
+        watchtower_challenge_timeout_txids: bitvm2_graph
+            .watchtower_challenge_timeout_txns
+            .iter()
+            .map(|tx| tx.finalize().compute_txid().into())
+            .collect(),
+        nack_txids: bitvm2_graph
+            .nack_txns
+            .iter()
+            .map(|tx| tx.finalize().compute_txid().into())
+            .collect(),
+        blockhash_commit_timeout_txid: Some(
+            bitvm2_graph.blockhash_commit_timeout.finalize().compute_txid().into(),
+        ),
+        assert_init_txid: Some(bitvm2_graph.assert_init.finalize().compute_txid().into()),
+        assert_commit_timeout_txids: bitvm2_graph
+            .assert_commit_timeout_txns
+            .iter()
+            .map(|tx| tx.finalize().compute_txid().into())
+            .collect(),
+        init_withdraw_tx_hash: None,
+        bridge_out_start_at: 0,
+        zkm_version: groth16::get_zkm_version(),
+        created_at: current_time,
+        updated_at: current_time,
+    };
+
+    if let Some(node_info) =
+        tx.get_node_by_btc_pub_key(&bitvm2_graph.parameters.operator_pubkey.to_string()).await?
+    {
+        graph.from_addr = node_info.goat_addr.clone();
+        graph.to_addr =
+            node_p2wsh_address(get_network(), &bitvm2_graph.parameters.operator_pubkey).to_string();
+    }
+
+    tx.upsert_graph(graph).await?;
+    tx.update_instance(
+        &InstanceUpdate::new(instance_id).with_status(InstanceStatus::Presigned.to_string()),
+    )
+    .await?;
+    tx.upsert_graph_raw_data(GraphRawData {
+        graph_id,
+        raw_data: serde_json::to_string(&bitvm2_graph).unwrap_or_default(),
+        created_at: current_time,
+        updated_at: current_time,
+    })
+    .await?;
+
+    tx.commit().await?;
     Ok(())
 }
 
 #[allow(dead_code)]
 pub async fn update_graph(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &Bitvm2Graph,
-    status: Option<String>,
-) -> Result<()> {
-    store_graph(local_db, instance_id, graph_id, graph, status).await
+    _local_db: &LocalDB,
+    _instance_id: Uuid,
+    _graph_id: Uuid,
+    _graph: &Bitvm2Graph,
+    _status: Option<String>,
+) -> anyhow::Result<()> {
+    // store_graph(local_db, instance_id, graph_id, graph, status).await
+    Ok(())
 }
 pub async fn get_graph(
     local_db: &LocalDB,
@@ -993,9 +1080,16 @@ pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
     (false, None)
 }
 
-pub async fn pop_local_unhandle_msg(local_db: &LocalDB, actor: Actor) -> Result<Option<Vec<u8>>> {
+pub async fn pop_batch_local_unhandle_msg(
+    local_db: &LocalDB,
+    actor: Actor,
+    lock_time_until: i64,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<Vec<u8>>> {
+    // todo not do special for
     // 1. create  groth16 proof for operator
-    if actor == Actor::Operator
+    let (limit, mut messages_res) = if actor == Actor::Operator
         && let Some(content) = operator_scan_ready_proof(
             local_db,
             get_proof_server_url(),
@@ -1003,31 +1097,30 @@ pub async fn pop_local_unhandle_msg(local_db: &LocalDB, actor: Actor) -> Result<
         )
         .await?
     {
-        return Ok(Some(content));
-    }
+        (limit - 1, vec![content])
+    } else {
+        (limit, vec![])
+    };
 
     // 2. check unhandle msg from message table
-    let mut storage_process = local_db.acquire().await?;
+    let mut tx = local_db.start_transaction().await?;
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    storage_process.set_messages_expired(current_time - MESSAGE_EXPIRE_TIME).await?;
-    let messages = storage_process
-        .filter_messages(MessageState::Pending.to_string(), current_time - MESSAGE_EXPIRE_TIME)
+    tx.set_messages_expired(current_time - MESSAGE_EXPIRE_TIME).await?;
+    tx.delete_old_messages(current_time - MESSAGE_EXPIRE_TIME).await?;
+    let messages = tx
+        .filter_messages(
+            MessageState::Pending.to_string(),
+            0,
+            lock_time_until,
+            current_time - MESSAGE_EXPIRE_TIME,
+            limit,
+            offset,
+        )
         .await?;
 
-    for message in messages {
-        if message.msg_type != MessageType::BridgeInData.to_string() {
-            storage_process
-                .update_messages_state(
-                    &[message.id],
-                    MessageState::Processed.to_string(),
-                    current_time,
-                )
-                .await?;
-            return Ok(Some(message.content));
-        }
-    }
-
-    Ok(None)
+    messages_res.extend(messages.into_iter().map(|v| v.content));
+    tx.commit().await?;
+    Ok(messages_res)
 }
 
 pub async fn operator_scan_ready_proof(
@@ -1148,6 +1241,7 @@ pub fn temp_file() -> String {
     tmp_db.path().as_os_str().to_str().unwrap().to_string()
 }
 
+#[allow(dead_code)]
 pub async fn generate_instance_from_event(
     btc_client: &BTCClient,
     event: &BridgeInRequestEvent,

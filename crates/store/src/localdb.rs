@@ -278,6 +278,7 @@ pub struct GraphUpdate {
     pub sub_status: Option<String>,
     pub ipfs_base_url: Option<String>,
     pub challenge_txid: Option<SerializableTxid>,
+    pub disprove_txid: Option<SerializableTxid>,
     pub bridge_out_start_at: Option<i64>,
     pub init_withdraw_txid: Option<String>,
 }
@@ -291,6 +292,7 @@ impl GraphUpdate {
             sub_status: None,
             ipfs_base_url: None,
             challenge_txid: None,
+            disprove_txid: None,
             bridge_out_start_at: None,
             init_withdraw_txid: None,
         }
@@ -319,6 +321,12 @@ impl GraphUpdate {
         self
     }
 
+    /// Set disprove transaction ID
+    pub fn with_disprove_txid(mut self, disprove_txid: SerializableTxid) -> Self {
+        self.disprove_txid = Some(disprove_txid);
+        self
+    }
+
     /// Set bridge out start time
     pub fn with_bridge_out_start_at(mut self, bridge_out_start_at: i64) -> Self {
         self.bridge_out_start_at = Some(bridge_out_start_at);
@@ -339,6 +347,7 @@ impl GraphUpdate {
             || self.challenge_txid.is_some()
             || self.bridge_out_start_at.is_some()
             || self.init_withdraw_txid.is_some()
+            || self.disprove_txid.is_some()
     }
 }
 
@@ -880,12 +889,12 @@ impl<'a> StorageProcessor<'a> {
         let res = sqlx::query!(
             r#"INSERT OR
              REPLACE INTO graph (graph_id, instance_id, kickoff_index, from_addr, to_addr, graph_ipfs_base_url, amount, challenge_amount,
-                    status, sub_status, operator_pubkey, pre_kickoff_txid, cur_prekickoff_txid, force_skip_kickoff_txid,
+                    status, sub_status, operator_pubkey, cur_prekickoff_txid, next_prekickoff, force_skip_kickoff_txid,
                     quick_challenge_txid, challenge_incomplete_kickoff_txid, pegin_txid, kickoff_txid, take1_txid,
-                    challenge_txid, take2_txid, watchtower_challenge_init_txid, watchtower_challenge_timeout_txids, nack_txids,
+                    challenge_txid, take2_txid, disprove_txid,  watchtower_challenge_init_txid, watchtower_challenge_timeout_txids, nack_txids,
                     blockhash_commit_timeout_txid, assert_init_txid, assert_commit_timeout_txids, init_withdraw_tx_hash,
                     bridge_out_start_at, zkm_version,created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             graph.graph_id,
             graph.instance_id,
             graph.kickoff_index,
@@ -897,8 +906,8 @@ impl<'a> StorageProcessor<'a> {
             graph.status,
             graph.sub_status,
             graph.operator_pubkey,
-            graph.pre_kickoff_txid,
             graph.cur_prekickoff_txid,
+            graph.next_prekickoff,
             graph.force_skip_kickoff_txid,
             graph.quick_challenge_txid,
             graph.challenge_incomplete_kickoff_txid,
@@ -907,6 +916,7 @@ impl<'a> StorageProcessor<'a> {
             graph.take1_txid,
             graph.challenge_txid,
             graph.take2_txid,
+            graph.disprove_txid,
             graph.watchtower_challenge_init_txid,
             watchtower_challenge_timeout_txids_json,
             nack_txids_json,
@@ -939,6 +949,9 @@ impl<'a> StorageProcessor<'a> {
         }
         if let Some(challenge_txid) = params.challenge_txid {
             query_builder.set_field("challenge_txid", QueryParam::BTCTxid(challenge_txid));
+        }
+        if let Some(disprove_txid) = params.disprove_txid {
+            query_builder.set_field("disprove_txid", QueryParam::BTCTxid(disprove_txid));
         }
         if let Some(bridge_out_start_at) = params.bridge_out_start_at {
             query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
@@ -988,38 +1001,7 @@ impl<'a> StorageProcessor<'a> {
 
     pub async fn find_graph(&mut self, graph_id: &Uuid) -> anyhow::Result<Option<Graph>> {
         let row = sqlx::query_as::<_, Graph>(
-            "SELECT graph_id,
-                    instance_id,
-                    kickoff_index,
-                    from_addr,
-                    to_addr,
-                    graph_ipfs_base_url,
-                    amount,
-                    challenge_amount,
-                    status,
-                    sub_status,
-                    operator_pubkey,
-                    pre_kickoff_txid,
-                    cur_prekickoff_txid,
-                    force_skip_kickoff_txid,
-                    quick_challenge_txid,
-                    challenge_incomplete_kickoff_txid,
-                    pegin_txid,
-                    kickoff_txid,
-                    take1_txid,
-                    challenge_txid,
-                    take2_txid,
-                    watchtower_challenge_init_txid,
-                    watchtower_challenge_timeout_txids,
-                    nack_txids,
-                    blockhash_commit_timeout_txid,
-                    assert_init_txid,
-                    assert_commit_timeout_txids,
-                    init_withdraw_tx_hash,
-                    bridge_out_start_at,
-                    zkm_version,
-                    created_at,
-                    updated_at
+            "SELECT *
              FROM graph
              WHERE graph_id = ?",
         )
@@ -1062,8 +1044,8 @@ impl<'a> StorageProcessor<'a> {
                     status,
                     sub_status,
                     operator_pubkey,
-                    pre_kickoff_txid,
                     cur_prekickoff_txid,
+                    next_prekickoff,
                     force_skip_kickoff_txid,
                     quick_challenge_txid,
                     challenge_incomplete_kickoff_txid,
@@ -1072,6 +1054,7 @@ impl<'a> StorageProcessor<'a> {
                     take1_txid,
                     challenge_txid,
                     take2_txid,
+                    disprove_txid,
                     watchtower_challenge_init_txid,
                     watchtower_challenge_timeout_txids,
                     nack_txids,
@@ -1184,6 +1167,21 @@ impl<'a> StorageProcessor<'a> {
         Ok((graphs, total_graphs))
     }
 
+    pub async fn find_graphs_by_status_group_by_operator(
+        &mut self,
+        status: &str,
+    ) -> anyhow::Result<Vec<Graph>> {
+        let row = sqlx::query_as::<_, Graph>(
+            "SELECT * 
+             FROM graph
+             WHERE status = ? ORDER BY  operator_pubkey,  kickoff_index",
+        )
+        .bind(status)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(row)
+    }
+
     pub async fn get_graph_by_instance_id(
         &mut self,
         instance_id: &Uuid,
@@ -1200,8 +1198,8 @@ impl<'a> StorageProcessor<'a> {
                     status,
                     sub_status,
                     operator_pubkey,
-                    pre_kickoff_txid,
                     cur_prekickoff_txid,
+                    next_prekickoff,
                     force_skip_kickoff_txid,
                     quick_challenge_txid,
                     challenge_incomplete_kickoff_txid,
@@ -1210,6 +1208,7 @@ impl<'a> StorageProcessor<'a> {
                     take1_txid,
                     challenge_txid,
                     take2_txid,
+                    disprove_txid,
                     watchtower_challenge_init_txid,
                     watchtower_challenge_timeout_txids,
                     nack_txids,
@@ -1275,6 +1274,19 @@ impl<'a> StorageProcessor<'a> {
         }
         let graph_ids = update_query.fetch_all(self.conn()).await?;
         Ok(graph_ids.into_iter().map(|v| (v.graph_id, v.instance_id, v.operator)).collect())
+    }
+
+    pub async fn get_operator_max_kickoff_index(
+        &mut self,
+        operator_pubkey: &str,
+    ) -> anyhow::Result<i64> {
+        let record = sqlx::query!(
+            "SELECT  MAX(kickoff_index) AS max_kickoff_index  FROM graph  WHERE operator_pubkey = ?",
+            operator_pubkey
+        )
+        .fetch_one(self.conn())
+        .await?;
+        Ok(record.max_kickoff_index.unwrap_or(0))
     }
 
     pub async fn update_node_timestamp(
@@ -1596,7 +1608,7 @@ impl<'a> StorageProcessor<'a> {
             .await?
             .total;
         let time_pri =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - time_threshold;
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64 - time_threshold;
         tracing::info!("{time_pri}");
         let alive = sqlx::query!(
             r#"SELECT COUNT(peer_id) AS alive FROM node WHERE updated_at >= ?"#,
@@ -1640,59 +1652,54 @@ impl<'a> StorageProcessor<'a> {
         Ok(())
     }
 
-    pub async fn filter_type_messages(
-        &mut self,
-        msg_type: String,
-        state: String,
-        expired: i64,
-    ) -> anyhow::Result<Vec<Message>> {
-        let res = sqlx::query_as!(
-            Message,
-            r#"SELECT id, from_peer, actor, msg_type, content, state
-            FROM message
-            WHERE msg_type = ?
-              AND state = ?
-              AND updated_at >= ?"#,
-            msg_type,
-            state,
-            expired
-        )
-        .fetch_all(self.conn())
-        .await?;
-        Ok(res)
+    pub async fn delete_old_messages(&mut self, expired: i64) -> anyhow::Result<()> {
+        sqlx::query!(r#"DELETE FROM message WHERE  updated_at < ?"#, expired)
+            .execute(self.conn())
+            .await?;
+        Ok(())
     }
+
     pub async fn filter_messages(
         &mut self,
         state: String,
+        weight: i64,
+        lock_time_until: i64,
         expired: i64,
+        limit: i64,
+        offset: i64,
     ) -> anyhow::Result<Vec<Message>> {
         let res = sqlx::query_as!(
             Message,
-            r#"SELECT id, from_peer, actor, msg_type, content, state
+            r#"SELECT id, from_peer, actor, msg_type, content, state, weight, lock_time_until
             FROM message
             WHERE state = ?
-              AND updated_at >= ? ORDER BY id ASC"#,
+              AND weight >= ?
+              AND lock_time_until <= ?
+              AND updated_at >= ? ORDER BY id ASC LIMIT ? OFFSET ?"#,
             state,
-            expired
+            weight,
+            lock_time_until,
+            expired,
+            limit,
+            offset
         )
         .fetch_all(self.conn())
         .await?;
         Ok(res)
     }
 
-    pub async fn create_message(
-        &mut self,
-        msg: Message,
-        current_time: i64,
-    ) -> anyhow::Result<bool> {
+    pub async fn create_message(&mut self, msg: Message) -> anyhow::Result<bool> {
+        let current_time = get_current_timestamp_secs();
         let res = sqlx::query!(
-            r#"INSERT INTO message (from_peer, actor, msg_type, content, state, updated_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO message (from_peer, actor, msg_type, content, state, lock_time_until, weight, updated_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             msg.from_peer,
             msg.actor,
             msg.msg_type,
             msg.content,
             msg.state,
+            msg.lock_time_until,
+            msg.weight,
             current_time,
             current_time
 
