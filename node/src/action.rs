@@ -1,6 +1,5 @@
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
-use crate::scheduled_tasks::{committee_scheduled_tasks, relayer_scheduled_tasks};
 use crate::utils::*;
 use anyhow::Result;
 use bitcoin::PublicKey;
@@ -14,9 +13,9 @@ use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
 use serde::{Deserialize, Serialize};
-use store::GraphStatus;
 use store::ipfs::IPFS;
 use store::localdb::LocalDB;
+use store::{GraphStatus, MessageState};
 use tracing::log::warn;
 use uuid::Uuid;
 
@@ -305,14 +304,6 @@ pub async fn handle_self_p2p_msg(
         from_peer_id
     );
 
-    tracing::debug!("Get the running task, and broadcast the task status or result");
-    if actor == Actor::Relayer {
-        relayer_scheduled_tasks(swarm, local_db, btc_client, goat_client).await?;
-    }
-    if actor == Actor::Committee {
-        committee_scheduled_tasks(swarm, local_db, btc_client, goat_client).await?;
-    }
-
     let messages =
         pop_batch_local_unhandle_msg(local_db, actor.clone(), current_time_secs(), 0, 50).await?;
     for message in messages {
@@ -325,9 +316,13 @@ pub async fn handle_self_p2p_msg(
             actor.clone(),
             from_peer_id,
             id.clone(),
-            &message,
+            &message.content,
         )
         .await?;
+        let mut storage_processor = local_db.acquire().await?;
+        storage_processor
+            .update_messages_state(&[message.message_id], MessageState::Processed.to_string())
+            .await?;
     }
     Ok(())
 }

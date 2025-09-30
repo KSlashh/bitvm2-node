@@ -433,7 +433,7 @@ async fn fetch_publishers(
 
 fn init_clients(args: &Args) -> Result<(BTCClient, GOATClient), anyhow::Error> {
     let network = Network::Regtest;
-    let btc_client = BTCClient::new(network.into(), Some(&args.esplora_url));
+    let btc_client = BTCClient::new(network, Some(&args.esplora_url));
 
     let mut config = GoatInitConfig::from_env_for_test();
     config.sequencer_set_publisher_address =

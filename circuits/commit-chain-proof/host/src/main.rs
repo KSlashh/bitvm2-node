@@ -40,7 +40,7 @@ pub struct Args {
 
 async fn fetch_commit_chain(args: &Args) {
     let network = Network::Regtest;
-    let btc_client = BTCClient::new(network.into(), Some(&args.esplora_url));
+    let btc_client = BTCClient::new(network, Some(&args.esplora_url));
 
     let mut commits: Vec<CircuitCommit> = vec![];
 

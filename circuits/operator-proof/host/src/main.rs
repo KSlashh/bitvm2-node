@@ -174,7 +174,7 @@ async fn main() {
 
     // --- spv --- //
     let network = Network::Regtest;
-    let btc_client = BTCClient::new(network.into(), Some(&args.esplora_url));
+    let btc_client = BTCClient::new(network, Some(&args.esplora_url));
     let latest_sequencer_commit_txid = Txid::from_str(&args.latest_sequencer_commit_txid).unwrap();
 
     let operator_latest_sequencer_commit_txn =
@@ -183,10 +183,10 @@ async fn main() {
 
     // TODO: replace it by `get_raw_transaction_info`
     let tx_merkle_proof =
-        btc_client.get_btc_merkle_proof(&latest_sequencer_commit_txid).await.unwrap();
-    let block_pos = tx_merkle_proof.2.block_height;
+        btc_client.get_merkle_proof(&latest_sequencer_commit_txid).await.unwrap().unwrap();
+    let block_pos = tx_merkle_proof.block_height;
     println!("block height: {block_pos}");
-    let target_block = btc_client.get_btc_block(block_pos).await.unwrap();
+    let target_block = btc_client.get_block_by_height(block_pos).await.unwrap();
 
     let bitcoin_block_headers = {
         let headers: Vec<u8> = std::fs::read(&args.block_headers).unwrap();
