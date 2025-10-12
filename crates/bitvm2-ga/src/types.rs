@@ -44,6 +44,7 @@ use crate::operator::{generate_bitvm_graph_inner, push_operator_pre_signature};
 pub type VerifyingKey = ark_groth16::VerifyingKey<ark_bn254::Bn254>;
 pub type Groth16Proof = ark_groth16::Proof<ark_bn254::Bn254>;
 pub type PublicInputs = Vec<ark_bn254::Fr>;
+pub type GuestInputs = [[u8; 32]; NUM_GUEST_PUBS_ASSERT];
 
 pub type OperatorWotsSignatures = (GuestPubinSignatures, Groth16ProofSignatures);
 
@@ -261,6 +262,7 @@ pub struct SimplifiedBitvm2Graph {
     pub(crate) committee_pre_signed: bool,
     pub parameters: Bitvm2GraphParameters,
     pub connector_e: ConnectorE,
+    pub assert_commit_num: usize,
     pub operator_pre_sigs: Option<Vec<Witness>>,
     pub committee_pre_sigs: Option<CommitteeSignatures>,
 }
@@ -339,6 +341,7 @@ impl Bitvm2Graph {
             committee_pre_signed: self.committee_pre_signed,
             parameters: self.parameters.clone(),
             connector_e: self.connector_e.clone(),
+            assert_commit_num: self.assert_commit_timeout_txns.len(),
             operator_pre_sigs,
             committee_pre_sigs,
         })

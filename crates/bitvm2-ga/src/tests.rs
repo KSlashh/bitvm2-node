@@ -4,7 +4,7 @@
 mod tests {
     use crate::{challenger::*, committee::*, keys::*, operator::*, types::*, watchtower::*};
     use bitcoin::{
-        Address, Amount, CompressedPublicKey, EcdsaSighashType, Network, OutPoint, PrivateKey,
+        Address, Amount, EcdsaSighashType, Network, OutPoint,
         PublicKey, ScriptBuf, TapSighashType, Transaction, TxIn, TxOut, Txid, XOnlyPublicKey,
         hashes::Hash, key::Keypair,
     };
@@ -35,7 +35,7 @@ mod tests {
         utils::num_blocks_per_network,
     };
     use musig2::PubNonce;
-    use secp256k1::{SECP256K1, SecretKey};
+    use secp256k1::SECP256K1;
     use sha2::{Digest, Sha256};
     use std::time::Duration;
     use tokio::time::sleep;
@@ -384,7 +384,7 @@ mod tests {
             .iter()
             .map(|k| k.nonces_for_graph(instance_id, graph_id, watchtower_num, assert_commit_num).0)
             .collect();
-        let agg_nonces = nonces_aggregation(&commitee_pub_nonces);
+        let agg_nonces = nonces_aggregation(&commitee_pub_nonces).unwrap();
         let committee_partial_sigs = commitee_master_keys
             .iter()
             .map(|k| {
@@ -741,12 +741,7 @@ mod tests {
 
         // watchtower[0] challenge
         let watchtower_0_keypair = watchtower_master_key()[0].master_keypair();
-        println!("watchtower0 pubkey: {}", watchtower_0_keypair.public_key());
-        let challenge_connector_0_input = Input {
-            outpoint: OutPoint { txid: watchtower_challenge_init_txid, vout: 0 },
-            amount: watchtower_challenge_init.output[0].value,
-        };
-        let watchtower_challenge_payer_amount = Amount::from_sat(5000);
+        let watchtower_challenge_payer_amount = Amount::from_sat(3000);
         let watchtower_0_challenge_payer_input = Input {
             outpoint: fund_address(
                 &esplora,
@@ -781,7 +776,6 @@ mod tests {
             &watchtower_0_keypair,
             0,
             &comm,
-            challenge_connector_0_input,
             vec![watchtower_0_challenge_payer_input],
             &bank_address,
             default_fee_amount,
