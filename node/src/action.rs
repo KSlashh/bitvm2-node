@@ -479,7 +479,7 @@ pub async fn recv_and_dispatch(
                 );
             }
             // 2. save the instance data to local db
-            todo_funcs::store_instance_parameters(local_db, &instance_params).await?;
+            store_instance_parameters(local_db, &instance_params).await?;
             // 3. create & presign graph
             let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
             let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
@@ -542,7 +542,7 @@ pub async fn recv_and_dispatch(
                 return Ok(());
             }
             // 2. save the instance data to local db
-            todo_funcs::store_instance_parameters(local_db, &instance_params).await?;
+            store_instance_parameters(local_db, &instance_params).await?;
         }
         (
             GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph, .. }),
@@ -568,7 +568,7 @@ pub async fn recv_and_dispatch(
                 bail!(e)
             };
             // 2. save the graph data to local db
-            todo_funcs::store_graph(local_db, &graph).await?;
+            store_graph(local_db, &graph).await?;
             // 3. generate Musig2 nonces & broadcast NonceGeneration
             let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
             let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph(
@@ -603,7 +603,7 @@ pub async fn recv_and_dispatch(
             let pub_nonces_unchecked =
                 get_committee_pub_nonces_for_graph(local_db, instance_id, graph_id).await?;
             if pub_nonces_unchecked.len() == committee_pubkeys.len() {
-                let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+                let graph = get_graph(local_db, instance_id, graph_id)
                     .await?
                     .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
                 let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -715,7 +715,7 @@ pub async fn recv_and_dispatch(
                     .keypair_for_instance(instance_id)
                     .public_key()
                     .into();
-                let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+                let graph = get_graph(local_db, instance_id, graph_id)
                     .await?
                     .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
                 let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -834,7 +834,7 @@ pub async fn recv_and_dispatch(
                 );
                 return Ok(());
             }
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let watchtower_num = graph.parameters.watchtower_pubkeys.len();
@@ -927,7 +927,7 @@ pub async fn recv_and_dispatch(
                     .map(|(_, ps)| ps)
                     .collect::<Vec<_>>();
             if committee_partial_sigs.len() == committee_pubkeys.len() {
-                let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+                let graph = get_graph(local_db, instance_id, graph_id)
                     .await?
                     .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
                 let graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1039,7 +1039,7 @@ pub async fn recv_and_dispatch(
                 received_committee_pubkey.to_string()
             );
             // 1. check endorsement signature
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let full_graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1111,7 +1111,7 @@ pub async fn recv_and_dispatch(
                 from_peer_id.to_string()
             );
             // 2. save the graph data to local db
-            todo_funcs::store_graph(local_db, &graph).await?;
+            store_graph(local_db, &graph).await?;
             store_committee_endorsements_for_graph(local_db, instance_id, graph_id, endorse_sigs)
                 .await?;
             // 3. if endorsed graph count >= threshold, generate & broadcast PeginConfirmNonce
@@ -1187,7 +1187,7 @@ pub async fn recv_and_dispatch(
                 from_peer_id.to_string()
             );
             // 2. save the graph data to local db
-            todo_funcs::store_graph(local_db, &graph).await?;
+            store_graph(local_db, &graph).await?;
         }
         (
             GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
@@ -1257,7 +1257,7 @@ pub async fn recv_and_dispatch(
                 let agg_nonce = nonce_aggregation(
                     &pub_nonces.iter().map(|(_, pn)| pn.clone()).collect::<Vec<_>>(),
                 );
-                let instance_params = todo_funcs::get_instance_parameters(local_db, instance_id)
+                let instance_params = get_instance_parameters(local_db, instance_id)
                     .await?
                     .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
                 let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
@@ -1367,11 +1367,9 @@ pub async fn recv_and_dispatch(
                     && pub_nonces.len() == committee_pubkeys.len()
                 {
                     let instance_params =
-                        todo_funcs::get_instance_parameters(local_db, instance_id)
-                            .await?
-                            .ok_or_else(|| {
-                                anyhow!("Instance parameters not found for {instance_id}")
-                            })?;
+                        get_instance_parameters(local_db, instance_id).await?.ok_or_else(|| {
+                            anyhow!("Instance parameters not found for {instance_id}")
+                        })?;
                     let context = instance_params.get_base_context();
                     let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
                     let agg_nonce = nonce_aggregation(
@@ -1404,7 +1402,7 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // triggered by InitWithdraw event from GoatChain
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1428,29 +1426,26 @@ pub async fn recv_and_dispatch(
             tracing::info!("Handle KickoffReady for {instance_id}:{graph_id}");
             // 2. check prekickoff nonce & broadcast previous pre-kickoff if needed
             let start_nonce =
-                match todo_funcs::get_latest_pegout_finalized_graph(local_db, &operator_pubkey)
-                    .await?
-                {
+                match get_latest_pegout_finalized_graph(local_db, &operator_pubkey).await? {
                     Some((n, _)) => n + 1,
                     None => 0,
                 };
             for current_nonce in start_nonce..graph.parameters.graph_nonce {
-                let (current_instance_id, current_graph_id) =
-                    match todo_funcs::get_graph_id_by_nonce(
-                        local_db,
-                        current_nonce,
-                        &operator_pubkey,
-                    )
-                    .await?
-                    {
-                        Some(gid) => gid,
-                        None => {
-                            tracing::warn!(
-                                "Ignore KickoffReady for {instance_id}:{graph_id}: missing graph for Operator {operator_pubkey}: nonce {current_nonce}"
-                            );
-                            continue;
-                        }
-                    };
+                let (current_instance_id, current_graph_id) = match get_graph_id_by_nonce(
+                    local_db,
+                    current_nonce,
+                    &operator_pubkey,
+                )
+                .await?
+                {
+                    Some(gid) => gid,
+                    None => {
+                        tracing::warn!(
+                            "Ignore KickoffReady for {instance_id}:{graph_id}: missing graph for Operator {operator_pubkey}: nonce {current_nonce}"
+                        );
+                        continue;
+                    }
+                };
                 todo_funcs::refresh_graph(
                     local_db,
                     btc_client,
@@ -1476,14 +1471,11 @@ pub async fn recv_and_dispatch(
                     );
                     return Ok(());
                 } else if current_graph_status.is_obsoleted() {
-                    let current_graph =
-                        todo_funcs::get_graph(local_db, current_instance_id, current_graph_id)
-                            .await?
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "Graph not found for {current_instance_id}:{current_graph_id}"
-                                )
-                            })?;
+                    let current_graph = get_graph(local_db, current_instance_id, current_graph_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("Graph not found for {current_instance_id}:{current_graph_id}")
+                        })?;
                     let mut current_graph = Bitvm2Graph::from_simplified(&current_graph)?;
                     operator_skip_graph(btc_client, &mut current_graph).await?;
                     tracing::info!(
@@ -1509,7 +1501,7 @@ pub async fn recv_and_dispatch(
             // triggered by Kickoff tx
             tracing::info!("Handle KickoffSent for {instance_id}:{graph_id}");
             // 1. check kickoff tx status on Bitcoin chain
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1572,7 +1564,7 @@ pub async fn recv_and_dispatch(
         ) => {
             // triggered by PreKickoff tx
             tracing::info!("Handle PreKickoffSent for {instance_id}:{graph_id}");
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let graph_nonce = graph.parameters.graph_nonce;
@@ -1593,19 +1585,16 @@ pub async fn recv_and_dispatch(
             }
             tracing::info!("Handle PreKickoffSent for {instance_id}:{graph_id}");
             // 1. check the previous graph status
-            let (prev_instance_id, prev_graph_id) = todo_funcs::get_graph_id_by_nonce(
-                local_db,
-                graph_nonce - 1,
-                &graph.parameters.operator_pubkey,
-            )
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Previous graph not found for Operator {}: nonce {}",
-                    graph.parameters.operator_pubkey,
-                    graph_nonce - 1
-                )
-            })?;
+            let (prev_instance_id, prev_graph_id) =
+                get_graph_id_by_nonce(local_db, graph_nonce - 1, &graph.parameters.operator_pubkey)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Previous graph not found for Operator {}: nonce {}",
+                            graph.parameters.operator_pubkey,
+                            graph_nonce - 1
+                        )
+                    })?;
             todo_funcs::refresh_graph(
                 local_db,
                 btc_client,
@@ -1618,7 +1607,7 @@ pub async fn recv_and_dispatch(
                 get_graph_status(local_db, prev_instance_id, prev_graph_id).await?.ok_or_else(
                     || anyhow!("Graph status not found for {prev_instance_id}:{prev_graph_id}"),
                 )?;
-            let prev_graph = todo_funcs::get_graph(local_db, prev_instance_id, prev_graph_id)
+            let prev_graph = get_graph(local_db, prev_instance_id, prev_graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {prev_instance_id}:{prev_graph_id}"))?;
             let prev_graph = Bitvm2Graph::from_simplified(&prev_graph)?;
@@ -1641,7 +1630,7 @@ pub async fn recv_and_dispatch(
             // triggered by Challenge tx
             tracing::info!("Handle ChallengeSent for {instance_id}:{graph_id}");
             // 1. check the challenge tx status on Bitcoin chain
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1689,7 +1678,7 @@ pub async fn recv_and_dispatch(
         ) => {
             // triggered by WatchtowerChallengeInit tx
             tracing::info!("Handle WatchtowerChallengeInitSent for {instance_id}:{graph_id}");
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let watchtower_keypair = WatchtowerMasterKey::new(get_bitvm_key()?).master_keypair();
@@ -1751,7 +1740,7 @@ pub async fn recv_and_dispatch(
         ) => {
             // triggered by WatchtowerChallenge tx
             // 1. check the watchtower-challenge tx status on Bitcoin chain, if watchtower challenge tx is confirmed, sign & broadcast operator-ack txn
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1815,7 +1804,7 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1882,7 +1871,7 @@ pub async fn recv_and_dispatch(
             Actor::Challenger,
         ) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -1960,7 +1949,7 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2016,7 +2005,7 @@ pub async fn recv_and_dispatch(
             Actor::Challenger,
         ) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2079,7 +2068,7 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2164,7 +2153,7 @@ pub async fn recv_and_dispatch(
             Actor::Challenger,
         ) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2233,7 +2222,7 @@ pub async fn recv_and_dispatch(
             Actor::Challenger,
         ) => {
             // triggered by AssertCommit tx or OperatorCommitBlockHash tx
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2359,7 +2348,7 @@ pub async fn recv_and_dispatch(
         }
         (GOATMessageContent::Take1Ready(Take1Ready { instance_id, graph_id }), Actor::Operator) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2409,7 +2398,7 @@ pub async fn recv_and_dispatch(
         }
         (GOATMessageContent::Take2Ready(Take2Ready { instance_id, graph_id }), Actor::Operator) => {
             // triggered by timeout task
-            let graph = todo_funcs::get_graph(local_db, instance_id, graph_id)
+            let graph = get_graph(local_db, instance_id, graph_id)
                 .await?
                 .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
             let mut graph = Bitvm2Graph::from_simplified(&graph)?;
@@ -2525,7 +2514,7 @@ pub async fn try_finalize_graph(
         let mut graph = match graph {
             Some(g) => Bitvm2Graph::from_simplified(g)?,
             None => {
-                let g = todo_funcs::get_graph(local_db, instance_id, graph_id)
+                let g = get_graph(local_db, instance_id, graph_id)
                     .await?
                     .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
                 Bitvm2Graph::from_simplified(&g)?
@@ -2536,7 +2525,7 @@ pub async fn try_finalize_graph(
         let partial_sigs = partial_sigs.into_iter().map(|(_, ps)| ps).collect::<Vec<_>>();
         let committee_sig_for_graph = signature_aggregation(&partial_sigs, &agg_nonces, &graph)?;
         let simplified_graph = graph.to_simplified()?;
-        todo_funcs::store_graph(local_db, &simplified_graph).await?;
+        store_graph(local_db, &simplified_graph).await?;
         push_committee_pre_signatures(&mut graph, &committee_sig_for_graph)?;
         if broadcast_graph_finalize {
             let message_content = GOATMessageContent::GraphFinalize(GraphFinalize {
