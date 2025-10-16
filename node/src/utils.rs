@@ -4,8 +4,10 @@ use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::proof::Groth16ProofValue;
 use crate::rpc_service::{current_time_secs, routes};
-use alloy::primitives::Address as EvmAddress;
+use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::key::Keypair;
 use bitcoin::{
@@ -19,12 +21,10 @@ use bitvm2_lib::committee::*;
 use bitvm2_lib::keys::{ChallengerMasterKey, OperatorMasterKey, WatchtowerMasterKey};
 use bitvm2_lib::operator::*;
 use bitvm2_lib::types::{
-    Bitvm2Graph, Bitvm2InstanceParameters, Groth16Proof, PublicInputs, SimplifiedBitvm2Graph,
-    UserInfo, VerifyingKey,
+    Bitvm2Graph, Bitvm2GraphParameters, Bitvm2InstanceParameters, Groth16Proof, PublicInputs, UserInfo, VerifyingKey,
 };
 use bitvm2_lib::watchtower::*;
 use client::Utxo as ClientUtxo;
-use client::goat_chain::WithdrawStatus;
 use client::goat_chain::utils::{validate_committee, validate_operator, validate_relayer};
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use esplora_client::Utxo;
@@ -61,7 +61,7 @@ use stun_client::{Attribute, Class, Client};
 use crate::env;
 use crate::scheduled_tasks::get_goat_message_content_type;
 use bitvm2_lib::transactions::base::BaseTransaction;
-use client::goat_chain::{PeginData, PeginStatus, WithdrawData};
+use client::goat_chain::{PeginData, PeginStatus, WithdrawData, GraphData};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -78,6 +78,9 @@ pub mod todo_funcs {
     // contract calls
     pub async fn get_pegin_data(goat_client: &GOATClient, instance_id: Uuid) -> Result<PeginData> {
         todo!("call Gateway.getPeginData(instance_id) on goat chain")
+    }
+    pub async fn get_graph_data_on_goat(goat_client: &GOATClient, graph_id: Uuid) -> Result<GraphData> {
+        todo!("call Gateway.graphDataMap(graph_id) on goat chain")
     }
     pub async fn get_withdraw_data(
         goat_client: &GOATClient,
@@ -103,13 +106,62 @@ pub mod todo_funcs {
         todo!("call Gateway.answerPeginRequest on goat chain")
     }
     pub async fn get_graph_digest(
-        local_db: &LocalDB,
         goat_client: &GOATClient,
-        instance_id: Uuid,
-        graph_id: Uuid,
+        graph: &Bitvm2Graph,
     ) -> Result<[u8; 32]> {
         todo!("call Gateway.getPostGraphDigest(instance_id, graph_id, graphData) on goat chain")
     }
+    pub async fn get_graph_ids_by_instance_id(
+        goat_client: &GOATClient,
+        instance_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        todo!("call Gateway.getGraphIdsByInstanceId(instance_id) on goat chain")
+    }
+
+    // db operations
+    pub async fn store_instance_parameters(
+        local_db: &LocalDB,
+        instance_params: &Bitvm2InstanceParameters,
+    ) -> Result<()> {
+        todo!("store instance params to local db")
+    }
+    pub async fn get_instance_parameters(
+        local_db: &LocalDB,
+        instance_id: Uuid,
+    ) -> Result<Option<Bitvm2InstanceParameters>> {
+        todo!("get instance params from local db")
+    }
+    pub async fn store_graph(local_db: &LocalDB, graph: &SimplifiedBitvm2Graph) -> Result<()> {
+        todo!("store graph to local db")
+    }
+    pub async fn get_graph(
+        local_db: &LocalDB,
+        instance_id: Uuid,
+        graph_id: Uuid,
+    ) -> Result<Option<SimplifiedBitvm2Graph>> {
+        todo!("get graph from local db")
+    }
+    pub async fn get_latest_pegout_finalized_graph(
+        local_db: &LocalDB,
+        operator_pubkey: &PublicKey,
+    ) -> Result<Option<(u64, Uuid)>> {
+        todo!("get latest pegout finalized graph nonce & id from local db")
+    }
+    pub async fn get_graph_id_by_nonce(
+        local_db: &LocalDB,
+        graph_nonce: u64,
+        operator_pubkey: &PublicKey,
+    ) -> Result<Option<(Uuid, Uuid)>> {
+        todo!("get instance_id & graph_id by graph_nonce and operator_pubkey from local db")
+    }
+    pub async fn graph_exists(
+        local_db: &LocalDB,
+        instance_id: Uuid,
+        graph_id: Uuid,
+    ) -> Result<bool> {
+        todo!("check if graph exists in local db")
+    }
+
     // proof network
     pub async fn get_watchtower_proof(instance_id: Uuid, graph_id: Uuid) -> Result<Vec<u8>> {
         todo!("get watchtower proof from proof network")
@@ -179,15 +231,8 @@ pub mod todo_funcs {
     pub fn get_node_evm_address() -> Result<EvmAddress> {
         todo!("get node's evm address")
     }
-    pub fn endorse_graph(graph: &Bitvm2Graph) -> Result<Vec<u8>> {
-        todo!("sign graph digest with node's evm key")
-    }
-    pub fn verify_graph_endorsement(
-        evm_address: &EvmAddress,
-        graph: &Bitvm2Graph,
-        signature: &[u8],
-    ) -> Result<bool> {
-        todo!("check endorse signature")
+    pub fn get_node_evm_private_key() -> Result<String> {
+        todo!("get node's evm private key")
     }
     pub async fn build_genesis_prekickoff_tx(
         btc_client: &BTCClient,
@@ -207,18 +252,11 @@ pub mod todo_funcs {
     ) -> Result<Bitvm2GraphParameters> {
         todo!("build graph params")
     }
-    pub async fn generate_disprove_scripts(
-        instance_id: Uuid,
-        graph_id: Uuid,
-        graph_params: &Bitvm2GraphParameters,
-    ) -> Result<Vec<ScriptBuf>> {
-        todo!("generate disprove scripts for the graph")
-    }
     pub async fn build_cpfp_txns(
         btc_client: &BTCClient,
-        parent_tx: Transaction,
+        parent_tx: &Transaction,
         anchor_vout: u64,
-    ) -> Result<Vec<Transaction>> {
+    ) -> Result<Transaction> {
         todo!("build child txns to cpfp the parent tx")
     }
     pub async fn get_preimage(
@@ -238,7 +276,18 @@ pub mod todo_funcs {
         goat_client: &GOATClient,
         instance_id: Uuid,
         graph_id: Uuid,
-    ) -> Result<(Bitvm2Graph, GraphStatus)> {
+        graph: Option<&Bitvm2Graph>,
+    ) -> Result<GraphStatus> {
+        let graph = match graph {
+            Some(g) => g,
+            None => {
+                let g = todo_funcs::get_graph(local_db, instance_id, graph_id).await?;
+                match g {
+                    Some(g) => &Bitvm2Graph::from_simplified(&g)?,
+                    None => bail!("Graph {graph_id} not found in local db"),
+                }
+            }
+        };
         todo!("refresh graph's status, return updated graph & status")
     }
     pub async fn refresh_insatnce(
@@ -249,6 +298,22 @@ pub mod todo_funcs {
     ) -> Result<()> {
         todo!("refresh instance's status & all its graphs' status")
     }
+}
+
+pub async fn validate_graph_id_on_goat(
+    goat_client: &GOATClient,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<()> {
+    let graph_data_on_goat = todo_funcs::get_graph_data_on_goat(goat_client, graph_id).await?;
+    if graph_data_on_goat.operator_pubkey == [0u8; 32] {
+        bail!("Graph {graph_id} not found on GoatChain")
+    }
+    let all_instance_graph_ids = todo_funcs::get_graph_ids_by_instance_id(goat_client, instance_id).await?;
+    if !all_instance_graph_ids.contains(&graph_id) {
+        bail!("graph_id: {graph_id} and instance_id {instance_id} mismatch")
+    }
+    Ok(())
 }
 
 pub async fn read_pegin_request(
@@ -372,29 +437,6 @@ pub async fn read_instance_info_from_goat(
     })
 }
 
-pub async fn is_valid_withdraw(
-    client: &GOATClient,
-    _instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<bool> {
-    let withdraw_status = client.gateway_get_withdraw_data(&graph_id).await?.status;
-    Ok([WithdrawStatus::Initialized, WithdrawStatus::Processing].contains(&withdraw_status))
-    // TODO: Only WithdrawStatus::Processing should be considered valid,
-    // here WithdrawStatus::Initialized is also treated as valid to facilitate test
-    // Ok(withdraw_status == WithdrawStatus::Processing)
-}
-
-/// Checks whether the status of the graph (identified by instance ID and graph ID)
-/// on the Layer 2 contract is currently `Initialized`.
-pub async fn is_withdraw_initialized_on_l2(
-    client: &GOATClient,
-    _instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<bool> {
-    let withdraw_status = client.gateway_get_withdraw_data(&graph_id).await?.status;
-    Ok(withdraw_status == WithdrawStatus::Initialized)
-}
-
 pub async fn is_take1_timelock_expired(client: &BTCClient, kickoff_height: u32) -> Result<bool> {
     let lock_blocks = take1_timelock(get_network());
     let current_height = client.get_height().await?;
@@ -410,14 +452,6 @@ pub async fn is_take2_timelock_expired(
     let current_height = client.get_height().await?;
     Ok(current_height >= watchtower_challenge_init_height + lock_blocks.0
         || current_height >= assert_init_height + lock_blocks.1)
-}
-
-/// Calculates the required challenge amount, which is based on the stake amount.
-///
-/// Formula:
-/// challenge_amount = fixed_min_challenge_amount + (pegin_amount * challenge_rate)
-pub fn get_challenge_amount(pegin_amount: u64) -> Amount {
-    Amount::from_sat(MIN_CHALLENGE_AMOUNT + pegin_amount * CHALLENGE_RATE / RATE_MULTIPLIER)
 }
 
 /// Loads partial scripts from a local cache file.
@@ -439,6 +473,21 @@ pub async fn get_partial_scripts(local_db: &LocalDB) -> Result<Vec<ScriptBuf>> {
         bincode::serialize_into(writer, &partial_scripts)?;
         Ok(partial_scripts)
     }
+}
+
+pub async fn get_disprove_scripts(
+    local_db: &LocalDB,
+    graph_params: &Bitvm2GraphParameters,
+) -> Result<Vec<ScriptBuf>> {
+    let partial_scripts = get_partial_scripts(local_db).await?;
+    let (mut disprove_scripts, disprove_scripts_1) = generate_disprove_scripts(
+        &partial_scripts, 
+        graph_params.operator_wots_pubkeys.clone(), 
+        &graph_params.guest_constant_value, 
+        &graph_params.hashlocks
+    );
+    disprove_scripts.extend(disprove_scripts_1);
+    Ok(disprove_scripts)
 }
 
 pub async fn get_fee_rate(client: &BTCClient) -> Result<f64> {
@@ -469,31 +518,6 @@ pub async fn broadcast_package(client: &BTCClient, txns: &[Transaction]) -> Resu
     Ok(())
 }
 
-/// Completes and broadcasts a challenge transaction.
-///
-/// This involves:
-/// - Selecting UTXOs with sufficient amount (may include change),
-/// - Signing the transaction,
-/// - Broadcasting it to the network.
-///
-/// Notes:
-/// - The challenge node must have pre-funded a P2WSH address during startup.
-pub async fn complete_and_broadcast_challenge_tx(
-    client: &BTCClient,
-    node_keypair: Keypair,
-    challenge_tx: Transaction,
-    challenge_input0_amount: Amount,
-) -> Result<Txid> {
-    build_sign_and_broadcast_tx(
-        client,
-        node_keypair,
-        challenge_tx.input,
-        challenge_input0_amount,
-        challenge_tx.output,
-    )
-    .await
-}
-
 pub async fn challenger_force_skip_kickoff(
     client: &BTCClient,
     graph: &Bitvm2Graph,
@@ -507,9 +531,9 @@ pub async fn challenger_force_skip_kickoff(
         build_force_skip_kickoff_tx(graph, challenger_receive_address, fee_rate)?;
     if anchor_added {
         let anchor_vout = force_skip_kickoff_tx.output.len() as u64 - 1;
-        let cpfp_package =
-            todo_funcs::build_cpfp_txns(client, force_skip_kickoff_tx.clone(), anchor_vout).await?;
-        broadcast_package(client, &cpfp_package).await?;
+        let child_tx =
+            todo_funcs::build_cpfp_txns(client, &force_skip_kickoff_tx, anchor_vout).await?;
+        broadcast_package(client, &[force_skip_kickoff_tx.clone(), child_tx]).await?;
     } else {
         broadcast_tx(client, &force_skip_kickoff_tx).await?;
     }
@@ -526,9 +550,9 @@ pub async fn challenger_quick_challenge(client: &BTCClient, graph: &Bitvm2Graph)
         build_quick_challenge_tx(graph, challenger_receive_address, fee_rate)?;
     if anchor_added {
         let anchor_vout = quick_challenge_tx.output.len() as u64 - 1;
-        let cpfp_package =
-            todo_funcs::build_cpfp_txns(client, quick_challenge_tx.clone(), anchor_vout).await?;
-        broadcast_package(client, &cpfp_package).await?;
+        let child_tx =
+            todo_funcs::build_cpfp_txns(client, &quick_challenge_tx, anchor_vout).await?;
+        broadcast_package(client, &[quick_challenge_tx.clone(), child_tx]).await?;
     } else {
         broadcast_tx(client, &quick_challenge_tx).await?;
     }
@@ -715,8 +739,8 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut Bitvm2Graph
         }
     }
     let anchor_vout = prekickoff_tx.output.len() as u64 - 1;
-    let mut tx_package =
-        todo_funcs::build_cpfp_txns(btc_client, prekickoff_tx, anchor_vout).await?;
+    let child_tx =
+        todo_funcs::build_cpfp_txns(btc_client, &prekickoff_tx, anchor_vout).await?;
     match operator_sign_skip_kickoff(
         operator_graph_keypair,
         graph,
@@ -724,11 +748,17 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut Bitvm2Graph
         get_fee_rate(btc_client).await?,
     )? {
         Some(skip_kickoff_tx) => {
-            tx_package.push(skip_kickoff_tx);
+            let prekickoff_txid = prekickoff_tx.compute_txid();
+            broadcast_package(btc_client, &[prekickoff_tx, skip_kickoff_tx]).await?;
+            if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+                bail!("prekickoff tx not on chain after broadcasting");
+            }
+            broadcast_tx(btc_client, &child_tx).await?;
         }
-        None => {}
+        None => {
+            broadcast_package(btc_client, &[prekickoff_tx, child_tx]).await?;
+        }
     };
-    broadcast_package(btc_client, &tx_package).await?;
     Ok(())
 }
 
@@ -751,16 +781,26 @@ pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut Bitvm2Graph) -
             )?;
         }
     }
+    let prekickoff_txid = prekickoff_tx.compute_txid();
     let anchor_vout = prekickoff_tx.output.len() as u64 - 1;
-    let mut tx_package =
-        todo_funcs::build_cpfp_txns(btc_client, prekickoff_tx, anchor_vout).await?;
+    let prekickoff_child_tx =
+        todo_funcs::build_cpfp_txns(btc_client, &prekickoff_tx, anchor_vout).await?;
 
     let kickoff_tx = operator_sign_kickoff(operator_graph_keypair, graph)?;
+    let kickoff_txid = kickoff_tx.compute_txid();
     let anchor_vout = kickoff_tx.output.len() as u64 - 1;
-    let kickoff_cpfp_package =
-        todo_funcs::build_cpfp_txns(btc_client, kickoff_tx, anchor_vout).await?;
-    tx_package.extend(kickoff_cpfp_package);
-    broadcast_package(btc_client, &tx_package).await?;
+    let kickoff_child_tx =
+        todo_funcs::build_cpfp_txns(btc_client, &kickoff_tx, anchor_vout).await?;
+    
+    broadcast_package(btc_client, &[prekickoff_tx, kickoff_tx]).await?;
+    if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+        bail!("prekickoff tx not on chain after broadcasting");
+    }
+    broadcast_tx(btc_client, &prekickoff_child_tx).await?;
+    if !tx_on_chain(btc_client, &kickoff_txid).await? {
+        bail!("kickoff tx not on chain after broadcasting");
+    }
+    broadcast_tx(btc_client, &kickoff_child_tx).await?;
     Ok(())
 }
 
@@ -837,6 +877,26 @@ pub async fn send_watchtower_challenge_tx(
             )));
         }
     }
+}
+
+pub async fn endorse_graph(goat_client: &GOATClient, graph: &Bitvm2Graph) -> Result<EvmSignature> {
+    let signer = PrivateKeySigner::from_str(&todo_funcs::get_node_evm_private_key()?)?;
+    let graph_digest = todo_funcs::get_graph_digest(goat_client, graph).await?;
+    let sig = signer.sign_hash(&graph_digest.into()).await?;
+    Ok(sig)
+}
+
+pub async fn verify_graph_endorsement(
+    goat_client: &GOATClient,
+    evm_address: &EvmAddress,
+    graph: &Bitvm2Graph,
+    signature: &[u8],
+) -> Result<bool> {
+    let graph_digest = todo_funcs::get_graph_digest(goat_client, graph).await?;
+    let sig = EvmSignature::try_from(signature)?;
+    sig.recover_address_from_prehash(&graph_digest.into())
+        .map(|addr| &addr == evm_address)
+        .map_err(|e| e.into())
 }
 
 /// Validates whether the given kickoff transaction has been confirmed on Layer 1.
