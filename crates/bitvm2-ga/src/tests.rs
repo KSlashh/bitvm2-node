@@ -74,7 +74,12 @@ mod tests {
         gen_keypair("seed:faucet")
     }
 
-    async fn fund_address(client: &EsploraClient, network: Network, address: Address, amount: Amount) -> OutPoint {
+    async fn fund_address(
+        client: &EsploraClient,
+        network: Network,
+        address: Address,
+        amount: Amount,
+    ) -> OutPoint {
         fn estimate_fee(num_inputs: usize, fee_rate: f64) -> Amount {
             let tx_size = (num_inputs * 148 + 2 * 34 + 10) as f64;
             let fee = (tx_size * fee_rate).ceil() as u64;
@@ -153,7 +158,9 @@ mod tests {
         let output_num = receivers.len();
         let total_output_amount: Amount = receivers.iter().map(|(_, amt)| *amt).sum();
         for (address, amount) in receivers {
-            fund_tx.output.push(bitcoin::TxOut { value: amount, script_pubkey: address.script_pubkey() });
+            fund_tx
+                .output
+                .push(bitcoin::TxOut { value: amount, script_pubkey: address.script_pubkey() });
         }
         let bank_pubkey = bank_keypair().public_key().into();
         let bank_address = node_p2wsh_address(network, &bank_pubkey);
@@ -172,12 +179,16 @@ mod tests {
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::default(),
             });
-            if total_value >= total_output_amount + estimate_fee(fund_tx.input.len(), output_num, fee_rate()) {
+            if total_value
+                >= total_output_amount + estimate_fee(fund_tx.input.len(), output_num, fee_rate())
+            {
                 break;
             }
         }
 
-        let change = total_value - total_output_amount - estimate_fee(fund_tx.input.len(), output_num, fee_rate());
+        let change = total_value
+            - total_output_amount
+            - estimate_fee(fund_tx.input.len(), output_num, fee_rate());
         if change.to_sat() > DUST_AMOUNT {
             fund_tx.output.push(bitcoin::TxOut {
                 value: change,
@@ -201,9 +212,7 @@ mod tests {
         client.broadcast(&fund_tx).await.unwrap();
         wait_tx_confirm(client, fund_tx.compute_txid()).await;
         let fund_txid = fund_tx.compute_txid();
-        (0..output_num)
-            .map(|i| OutPoint { txid: fund_txid, vout: i as u32 })
-            .collect()
+        (0..output_num).map(|i| OutPoint { txid: fund_txid, vout: i as u32 }).collect()
     }
 
     async fn find_utxo(
@@ -326,7 +335,13 @@ mod tests {
         let user_address = node_p2wsh_address(network(), &user_master_key().public_key().into());
         let pegin_deposit_input_amount = pegin_amount + default_fee_amount;
         let pegin_deposit_inputs = vec![Input {
-            outpoint: fund_address(esplora, network(), user_address.clone(), pegin_deposit_input_amount).await,
+            outpoint: fund_address(
+                esplora,
+                network(),
+                user_address.clone(),
+                pegin_deposit_input_amount,
+            )
+            .await,
             amount: pegin_deposit_input_amount,
         }];
         let user_info = UserInfo {
@@ -650,7 +665,8 @@ mod tests {
                 .saturating_sub(total_input_amount.to_sat() + DUST_AMOUNT)
                 + DUST_AMOUNT,
         );
-        let payer_outpoint = fund_address(esplora, network(), node_address.clone(), shortfall).await;
+        let payer_outpoint =
+            fund_address(esplora, network(), node_address.clone(), shortfall).await;
         wait_tx_confirm(esplora, payer_outpoint.txid).await;
         tx.input.push(bitcoin::TxIn {
             previous_output: payer_outpoint,
@@ -1116,7 +1132,7 @@ mod tests {
         println!("blockhash-commit timeout tx confirmed");
     }
 
-    #[ignore = "debug"] 
+    #[ignore = "debug"]
     #[tokio::test]
     async fn test_broadcast_cpfp_package() {
         use client::btc_chain::BTCClient;
@@ -1130,7 +1146,9 @@ mod tests {
         // let bank_address = node_p2wsh_address(network, &bank_keypair.public_key().into());
         let test_address = node_p2wsh_address(network, &test_keypair.public_key().into());
         let default_input_amount = Amount::from_sat(2000);
-        let receivers = std::iter::repeat((test_address.clone(), default_input_amount)).take(3).collect::<Vec<_>>();
+        let receivers = std::iter::repeat((test_address.clone(), default_input_amount))
+            .take(3)
+            .collect::<Vec<_>>();
         let utxos = fund_address_batch(&esplora, network, receivers).await;
         let [utxo0, utxo1, utxo2]: [OutPoint; 3] = utxos.try_into().unwrap();
         let mut txn0 = Transaction {
@@ -1142,106 +1160,133 @@ mod tests {
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::default(),
             }],
-            output: vec![TxOut {
-                value: Amount::ZERO,
-                script_pubkey: test_address.script_pubkey(),
-            },
-            p2a_output()],
+            output: vec![
+                TxOut { value: Amount::ZERO, script_pubkey: test_address.script_pubkey() },
+                p2a_output(),
+            ],
         };
-        node_sign(&mut txn0, 0, default_input_amount, bitcoin::EcdsaSighashType::All, &test_keypair).unwrap();
-        let output0_amount = default_input_amount - Amount::from_sat(txn0.weight().to_vbytes_ceil()) - p2a_amount();
+        node_sign(
+            &mut txn0,
+            0,
+            default_input_amount,
+            bitcoin::EcdsaSighashType::All,
+            &test_keypair,
+        )
+        .unwrap();
+        let output0_amount =
+            default_input_amount - Amount::from_sat(txn0.weight().to_vbytes_ceil()) - p2a_amount();
         txn0.output[0].value = output0_amount;
         txn0.input[0].witness.clear();
-        node_sign(&mut txn0, 0, default_input_amount, bitcoin::EcdsaSighashType::All, &test_keypair).unwrap();
+        node_sign(
+            &mut txn0,
+            0,
+            default_input_amount,
+            bitcoin::EcdsaSighashType::All,
+            &test_keypair,
+        )
+        .unwrap();
         let txn0_txid = txn0.compute_txid();
 
         let mut cpfp_txn0 = Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint { 
-                    txid: txn0_txid, 
-                    vout: 1
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: txn0_txid, vout: 1 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::default(),
                 },
-                script_sig: ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::default(),
-            },
-            TxIn {
-                previous_output: utxo1,
-                script_sig: ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::default(),
-            }],
+                TxIn {
+                    previous_output: utxo1,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::default(),
+                },
+            ],
             output: vec![p2a_output()],
         };
-        node_sign(&mut cpfp_txn0, 1, default_input_amount, bitcoin::EcdsaSighashType::All, &test_keypair).unwrap();
+        node_sign(
+            &mut cpfp_txn0,
+            1,
+            default_input_amount,
+            bitcoin::EcdsaSighashType::All,
+            &test_keypair,
+        )
+        .unwrap();
 
         let mut txn1 = Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint { 
-                    txid: txn0_txid, 
-                    vout: 0
-                },
+                previous_output: OutPoint { txid: txn0_txid, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::default(),
             }],
-            output: vec![TxOut {
-                value: Amount::ZERO,
-                script_pubkey: test_address.script_pubkey(),
-            },
-            p2a_output()],
+            output: vec![
+                TxOut { value: Amount::ZERO, script_pubkey: test_address.script_pubkey() },
+                p2a_output(),
+            ],
         };
         let input0_amount = txn0.output[0].value;
-        node_sign(&mut txn1, 0, input0_amount, bitcoin::EcdsaSighashType::All, &test_keypair).unwrap();
-        let output0_amount = input0_amount - Amount::from_sat(txn1.weight().to_vbytes_ceil()) - p2a_amount();
+        node_sign(&mut txn1, 0, input0_amount, bitcoin::EcdsaSighashType::All, &test_keypair)
+            .unwrap();
+        let output0_amount =
+            input0_amount - Amount::from_sat(txn1.weight().to_vbytes_ceil()) - p2a_amount();
         txn1.output[0].value = output0_amount;
         txn1.input[0].witness.clear();
-        node_sign(&mut txn1, 0, input0_amount, bitcoin::EcdsaSighashType::All, &test_keypair).unwrap();
+        node_sign(&mut txn1, 0, input0_amount, bitcoin::EcdsaSighashType::All, &test_keypair)
+            .unwrap();
         let txn1_txid = txn1.compute_txid();
-        
+
         let mut cpfp_txn1 = Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint { 
-                    txid: txn1_txid, 
-                    vout: 1
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: txn1_txid, vout: 1 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::default(),
                 },
-                script_sig: ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::default(),
-            },
-            TxIn {
-                previous_output: utxo2,
-                script_sig: ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::default(),
-            }],
+                TxIn {
+                    previous_output: utxo2,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::default(),
+                },
+            ],
             output: vec![p2a_output()],
         };
-        node_sign(&mut cpfp_txn1, 1, default_input_amount, bitcoin::EcdsaSighashType::All, &test_keypair).unwrap();
+        node_sign(
+            &mut cpfp_txn1,
+            1,
+            default_input_amount,
+            bitcoin::EcdsaSighashType::All,
+            &test_keypair,
+        )
+        .unwrap();
 
         let tx_package_1 = vec![txn0, cpfp_txn0];
         let tx_package_2 = vec![txn1, cpfp_txn1];
-        println!("txids in the package: \ntxn0 {}, \ncpfp_txn0 {}, \ntxn1 {}, \ncpfp_txn1 {}", 
-            tx_package_1[0].compute_txid(), 
-            tx_package_1[1].compute_txid(), 
-            tx_package_2[0].compute_txid(), 
-            tx_package_2[1].compute_txid());
+        println!(
+            "txids in the package: \ntxn0 {}, \ncpfp_txn0 {}, \ntxn1 {}, \ncpfp_txn1 {}",
+            tx_package_1[0].compute_txid(),
+            tx_package_1[1].compute_txid(),
+            tx_package_2[0].compute_txid(),
+            tx_package_2[1].compute_txid()
+        );
         client.broadcast_package(&tx_package_1).await.unwrap();
         client.broadcast_package(&tx_package_2).await.unwrap();
 
         // this will fail because cpfp_txn0 and cpfp_txn1 not parent & child, only 1c1p is allowed in a package
         // let tx_package_1 = vec![txn0, txn1];
         // let tx_package_2 = vec![cpfp_txn0, cpfp_txn1];
-        // println!("txids in the package: \ntxn0 {}, \ncpfp_txn0 {}, \ntxn1 {}, \ncpfp_txn1 {}", 
-        //     tx_package_1[0].compute_txid(), 
-        //     tx_package_2[0].compute_txid(), 
-        //     tx_package_1[1].compute_txid(),     
+        // println!("txids in the package: \ntxn0 {}, \ncpfp_txn0 {}, \ntxn1 {}, \ncpfp_txn1 {}",
+        //     tx_package_1[0].compute_txid(),
+        //     tx_package_2[0].compute_txid(),
+        //     tx_package_1[1].compute_txid(),
         //     tx_package_2[1].compute_txid());
         // client.broadcast_package(&tx_package_1).await.unwrap();
         // client.broadcast_package(&tx_package_2).await.unwrap();

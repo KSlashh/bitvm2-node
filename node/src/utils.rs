@@ -6,8 +6,8 @@ use crate::rpc_service::proof::Groth16ProofValue;
 use crate::rpc_service::{current_time_secs, routes};
 use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use alloy::signers::local::PrivateKeySigner;
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::key::Keypair;
 use bitcoin::{
@@ -21,7 +21,8 @@ use bitvm2_lib::committee::*;
 use bitvm2_lib::keys::{ChallengerMasterKey, OperatorMasterKey, WatchtowerMasterKey};
 use bitvm2_lib::operator::*;
 use bitvm2_lib::types::{
-    Bitvm2Graph, Bitvm2GraphParameters, Bitvm2InstanceParameters, Groth16Proof, PublicInputs, UserInfo, VerifyingKey,
+    Bitvm2Graph, Bitvm2GraphParameters, Bitvm2InstanceParameters, Groth16Proof, PublicInputs,
+    SimplifiedBitvm2Graph, UserInfo, VerifyingKey,
 };
 use bitvm2_lib::watchtower::*;
 use client::Utxo as ClientUtxo;
@@ -61,7 +62,7 @@ use stun_client::{Attribute, Class, Client};
 use crate::env;
 use crate::scheduled_tasks::get_goat_message_content_type;
 use bitvm2_lib::transactions::base::BaseTransaction;
-use client::goat_chain::{PeginData, PeginStatus, WithdrawData, GraphData};
+use client::goat_chain::{GraphData, PeginData, PeginStatus, WithdrawData};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -79,7 +80,10 @@ pub mod todo_funcs {
     pub async fn get_pegin_data(goat_client: &GOATClient, instance_id: Uuid) -> Result<PeginData> {
         todo!("call Gateway.getPeginData(instance_id) on goat chain")
     }
-    pub async fn get_graph_data_on_goat(goat_client: &GOATClient, graph_id: Uuid) -> Result<GraphData> {
+    pub async fn get_graph_data_on_goat(
+        goat_client: &GOATClient,
+        graph_id: Uuid,
+    ) -> Result<GraphData> {
         todo!("call Gateway.graphDataMap(graph_id) on goat chain")
     }
     pub async fn get_withdraw_data(
@@ -119,41 +123,6 @@ pub mod todo_funcs {
     }
 
     // db operations
-    pub async fn store_instance_parameters(
-        local_db: &LocalDB,
-        instance_params: &Bitvm2InstanceParameters,
-    ) -> Result<()> {
-        todo!("store instance params to local db")
-    }
-    pub async fn get_instance_parameters(
-        local_db: &LocalDB,
-        instance_id: Uuid,
-    ) -> Result<Option<Bitvm2InstanceParameters>> {
-        todo!("get instance params from local db")
-    }
-    pub async fn store_graph(local_db: &LocalDB, graph: &SimplifiedBitvm2Graph) -> Result<()> {
-        todo!("store graph to local db")
-    }
-    pub async fn get_graph(
-        local_db: &LocalDB,
-        instance_id: Uuid,
-        graph_id: Uuid,
-    ) -> Result<Option<SimplifiedBitvm2Graph>> {
-        todo!("get graph from local db")
-    }
-    pub async fn get_latest_pegout_finalized_graph(
-        local_db: &LocalDB,
-        operator_pubkey: &PublicKey,
-    ) -> Result<Option<(u64, Uuid)>> {
-        todo!("get latest pegout finalized graph nonce & id from local db")
-    }
-    pub async fn get_graph_id_by_nonce(
-        local_db: &LocalDB,
-        graph_nonce: u64,
-        operator_pubkey: &PublicKey,
-    ) -> Result<Option<(Uuid, Uuid)>> {
-        todo!("get instance_id & graph_id by graph_nonce and operator_pubkey from local db")
-    }
     pub async fn graph_exists(
         local_db: &LocalDB,
         instance_id: Uuid,
@@ -309,7 +278,8 @@ pub async fn validate_graph_id_on_goat(
     if graph_data_on_goat.operator_pubkey == [0u8; 32] {
         bail!("Graph {graph_id} not found on GoatChain")
     }
-    let all_instance_graph_ids = todo_funcs::get_graph_ids_by_instance_id(goat_client, instance_id).await?;
+    let all_instance_graph_ids =
+        todo_funcs::get_graph_ids_by_instance_id(goat_client, instance_id).await?;
     if !all_instance_graph_ids.contains(&graph_id) {
         bail!("graph_id: {graph_id} and instance_id {instance_id} mismatch")
     }
@@ -481,10 +451,10 @@ pub async fn get_disprove_scripts(
 ) -> Result<Vec<ScriptBuf>> {
     let partial_scripts = get_partial_scripts(local_db).await?;
     let (mut disprove_scripts, disprove_scripts_1) = generate_disprove_scripts(
-        &partial_scripts, 
-        graph_params.operator_wots_pubkeys.clone(), 
-        &graph_params.guest_constant_value, 
-        &graph_params.hashlocks
+        &partial_scripts,
+        graph_params.operator_wots_pubkeys.clone(),
+        &graph_params.guest_constant_value,
+        &graph_params.hashlocks,
     );
     disprove_scripts.extend(disprove_scripts_1);
     Ok(disprove_scripts)
@@ -739,8 +709,7 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut Bitvm2Graph
         }
     }
     let anchor_vout = prekickoff_tx.output.len() as u64 - 1;
-    let child_tx =
-        todo_funcs::build_cpfp_txns(btc_client, &prekickoff_tx, anchor_vout).await?;
+    let child_tx = todo_funcs::build_cpfp_txns(btc_client, &prekickoff_tx, anchor_vout).await?;
     match operator_sign_skip_kickoff(
         operator_graph_keypair,
         graph,
@@ -791,7 +760,7 @@ pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut Bitvm2Graph) -
     let anchor_vout = kickoff_tx.output.len() as u64 - 1;
     let kickoff_child_tx =
         todo_funcs::build_cpfp_txns(btc_client, &kickoff_tx, anchor_vout).await?;
-    
+
     broadcast_package(btc_client, &[prekickoff_tx, kickoff_tx]).await?;
     if !tx_on_chain(btc_client, &prekickoff_txid).await? {
         bail!("prekickoff tx not on chain after broadcasting");

@@ -24,9 +24,9 @@ use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use serde::{Deserialize, Serialize};
+use store::MessageState;
 use store::ipfs::IPFS;
 use store::localdb::LocalDB;
-use store::MessageState;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -609,7 +609,8 @@ pub async fn recv_and_dispatch(
                     graph_id,
                     &message,
                 )
-                .await? {
+                .await?
+                {
                     Some(g) => g,
                     None => return Ok(()),
                 };
@@ -730,7 +731,8 @@ pub async fn recv_and_dispatch(
                     graph_id,
                     &message,
                 )
-                .await? {
+                .await?
+                {
                     Some(g) => g,
                     None => return Ok(()),
                 };
@@ -858,7 +860,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -960,7 +963,8 @@ pub async fn recv_and_dispatch(
                     graph_id,
                     &message,
                 )
-                .await? {
+                .await?
+                {
                     Some(g) => g,
                     None => return Ok(()),
                 };
@@ -1081,7 +1085,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1091,7 +1096,9 @@ pub async fn recv_and_dispatch(
                 &committee_evm_address,
                 &full_graph,
                 &committee_sig_for_graph,
-            ).await {
+            )
+            .await
+            {
                 tracing::warn!(
                     "Ignore EndorseGraph for {instance_id}:{graph_id} from {}: invalid endorsement signature: {e}",
                     received_committee_pubkey.to_string()
@@ -1454,7 +1461,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1484,22 +1492,21 @@ pub async fn recv_and_dispatch(
                     None => 0,
                 };
             for current_nonce in start_nonce..graph.parameters.graph_nonce {
-                let (current_instance_id, current_graph_id) =
-                    match todo_funcs::get_graph_id_by_nonce(
-                        local_db,
-                        current_nonce,
-                        &operator_pubkey,
-                    )
-                    .await?
-                    {
-                        Some(gid) => gid,
-                        None => {
-                            tracing::warn!(
-                                "Ignore KickoffReady for {instance_id}:{graph_id}: missing graph for Operator {operator_pubkey}: nonce {current_nonce}"
-                            );
-                            continue;
-                        }
-                    };
+                let (current_instance_id, current_graph_id) = match get_graph_id_by_nonce(
+                    local_db,
+                    current_nonce,
+                    &operator_pubkey,
+                )
+                .await?
+                {
+                    Some(gid) => gid,
+                    None => {
+                        tracing::warn!(
+                            "Ignore KickoffReady for {instance_id}:{graph_id}: missing graph for Operator {operator_pubkey}: nonce {current_nonce}"
+                        );
+                        continue;
+                    }
+                };
                 let current_graph = match get_graph_or_defer(
                     swarm,
                     local_db,
@@ -1508,7 +1515,8 @@ pub async fn recv_and_dispatch(
                     current_graph_id,
                     &message,
                 )
-                .await? {
+                .await?
+                {
                     Some(g) => g,
                     None => return Ok(()),
                 };
@@ -1562,7 +1570,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1634,7 +1643,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1656,19 +1666,16 @@ pub async fn recv_and_dispatch(
             }
             tracing::info!("Handle PreKickoffSent for {instance_id}:{graph_id}");
             // 1. check the previous graph status
-            let (prev_instance_id, prev_graph_id) = todo_funcs::get_graph_id_by_nonce(
-                local_db,
-                graph_nonce - 1,
-                &graph.parameters.operator_pubkey,
-            )
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Previous graph not found for Operator {}: nonce {}",
-                    graph.parameters.operator_pubkey,
-                    graph_nonce - 1
-                )
-            })?;
+            let (prev_instance_id, prev_graph_id) =
+                get_graph_id_by_nonce(local_db, graph_nonce - 1, &graph.parameters.operator_pubkey)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Previous graph not found for Operator {}: nonce {}",
+                            graph.parameters.operator_pubkey,
+                            graph_nonce - 1
+                        )
+                    })?;
             let prev_graph = match get_graph_or_defer(
                 swarm,
                 local_db,
@@ -1677,7 +1684,8 @@ pub async fn recv_and_dispatch(
                 prev_graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1718,7 +1726,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1775,7 +1784,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1846,7 +1856,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1919,7 +1930,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -1995,7 +2007,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2062,8 +2075,7 @@ pub async fn recv_and_dispatch(
                 })?
                 .finalize();
             let anchor_vout = nack_tx.output.len() as u64 - 1;
-            let child_tx =
-                todo_funcs::build_cpfp_txns(btc_client, &nack_tx, anchor_vout).await?;
+            let child_tx = todo_funcs::build_cpfp_txns(btc_client, &nack_tx, anchor_vout).await?;
             broadcast_package(btc_client, &[nack_tx, child_tx]).await?;
         }
         (
@@ -2082,7 +2094,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2147,7 +2160,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2219,7 +2233,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2313,7 +2328,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2391,7 +2407,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2524,7 +2541,8 @@ pub async fn recv_and_dispatch(
                 graph_id,
                 &message,
             )
-            .await? {
+            .await?
+            {
                 Some(g) => g,
                 None => return Ok(()),
             };
@@ -2563,8 +2581,7 @@ pub async fn recv_and_dispatch(
             let operator_graph_keypair = operator_master_key.keypair_for_graph(graph_id);
             let take1_tx = operator_sign_take1(operator_graph_keypair, &mut graph)?;
             let anchor_vout = take1_tx.output.len() as u64 - 1;
-            let child_tx =
-                todo_funcs::build_cpfp_txns(btc_client, &take1_tx, anchor_vout).await?;
+            let child_tx = todo_funcs::build_cpfp_txns(btc_client, &take1_tx, anchor_vout).await?;
             broadcast_package(btc_client, &[take1_tx, child_tx]).await?;
         }
         (GOATMessageContent::Take1Sent(Take1Sent { .. }), Actor::Committee) => {
@@ -2634,7 +2651,13 @@ pub async fn recv_and_dispatch(
                     return Ok(());
                 }
             };
-            if is_take2_timelock_expired(btc_client, watchtower_challenge_init_height, assert_init_height).await? {
+            if is_take2_timelock_expired(
+                btc_client,
+                watchtower_challenge_init_height,
+                assert_init_height,
+            )
+            .await?
+            {
                 tracing::warn!(
                     "Ignore Take2Ready for {instance_id}:{graph_id}: take2 timelock not expired yet"
                 );
@@ -2646,8 +2669,7 @@ pub async fn recv_and_dispatch(
             let operator_graph_keypair = operator_master_key.keypair_for_graph(graph_id);
             let take2_tx = operator_sign_take2(operator_graph_keypair, &mut graph)?;
             let anchor_vout = take2_tx.output.len() as u64 - 1;
-            let child_tx =
-                todo_funcs::build_cpfp_txns(btc_client, &take2_tx, anchor_vout).await?;
+            let child_tx = todo_funcs::build_cpfp_txns(btc_client, &take2_tx, anchor_vout).await?;
             broadcast_package(btc_client, &[take2_tx, child_tx]).await?;
         }
         (GOATMessageContent::Take2Sent(Take2Sent { .. }), Actor::Committee) => {
@@ -2655,20 +2677,22 @@ pub async fn recv_and_dispatch(
             // 1. (Relayer) call finalizeWithdrawHappyPath on GoatChain
             todo!("Handle Take2Sent");
         }
-        (GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id }), Actor::Committee) => {
+        (
+            GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id }),
+            Actor::Committee,
+        ) => {
             // sent by other nodes when they find a graph is missing locally
             // 1. (Relayer) send SyncGraph response if have the graph
             if !todo_funcs::is_relayer() {
-                tracing::warn!("Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node");
+                tracing::warn!(
+                    "Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node"
+                );
                 return Ok(());
             }
             tracing::info!("Handle SyncGraphRequest for {instance_id}:{graph_id}");
-            if let Some(graph) = todo_funcs::get_graph(local_db, instance_id, graph_id).await? {
-                let message_content = GOATMessageContent::SyncGraph(SyncGraph {
-                    instance_id,
-                    graph_id,
-                    graph,
-                });
+            if let Some(graph) = get_graph(local_db, instance_id, graph_id).await? {
+                let message_content =
+                    GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph });
                 let message = GOATMessage::from_typed(Actor::All, &message_content)?;
                 send_to_peer(swarm, message)?;
             } else {
@@ -2679,16 +2703,26 @@ pub async fn recv_and_dispatch(
         (GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph }), _) => {
             // sent by relayer nodes in response to SyncGraphRequest
             if todo_funcs::graph_exists(local_db, instance_id, graph_id).await? {
-                tracing::warn!("Ignore SyncGraph for {instance_id}:{graph_id}: graph already exists locally");
+                tracing::warn!(
+                    "Ignore SyncGraph for {instance_id}:{graph_id}: graph already exists locally"
+                );
                 return Ok(());
             }
             validate_graph_id_on_goat(goat_client, instance_id, graph_id).await.map_err(|e| {
                 anyhow!("Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}: {e}")
             })?;
             tracing::info!("Handle SyncGraph for {instance_id}:{graph_id}");
-            todo_funcs::store_graph(local_db, &graph).await?;
+            store_graph(local_db, &graph).await?;
             let graph = Bitvm2Graph::from_simplified(&graph)?;
-            todo_funcs::refresh_graph(local_db, btc_client, goat_client, instance_id, graph_id, Some(&graph)).await?;
+            todo_funcs::refresh_graph(
+                local_db,
+                btc_client,
+                goat_client,
+                instance_id,
+                graph_id,
+                Some(&graph),
+            )
+            .await?;
         }
         _ => {}
     }
@@ -2768,14 +2802,14 @@ async fn get_graph_or_defer(
     graph_id: Uuid,
     message: &GOATMessage,
 ) -> Result<Option<SimplifiedBitvm2Graph>> {
-    match crate::utils::todo_funcs::get_graph(local_db, instance_id, graph_id).await? {
+    match get_graph(local_db, instance_id, graph_id).await? {
         Some(g) => Ok(Some(g)),
         None => {
             // Ask for sync and push to local queue with a short retry delay
-            if let Err(e) = try_send_sync_graph_request(swarm, goat_client, instance_id, graph_id).await {
-                tracing::warn!(
-                    "Failed to send SyncGraphRequest for {instance_id}:{graph_id}: {e}"
-                );
+            if let Err(e) =
+                try_send_sync_graph_request(swarm, goat_client, instance_id, graph_id).await
+            {
+                tracing::warn!("Failed to send SyncGraphRequest for {instance_id}:{graph_id}: {e}");
             }
             let delay_secs: usize = 60; // 1 min default retry
             if let Err(e) = push_local_unhandled_messages(local_db, message, delay_secs).await {
@@ -2798,7 +2832,8 @@ pub async fn try_send_sync_graph_request(
     graph_id: Uuid,
 ) -> Result<()> {
     validate_graph_id_on_goat(goat_client, instance_id, graph_id).await?;
-    let message_content = GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id });
+    let message_content =
+        GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id });
     let message = GOATMessage::from_typed(Actor::All, &message_content)?;
     send_to_peer(swarm, message)?;
     Ok(())
