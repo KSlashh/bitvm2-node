@@ -226,7 +226,7 @@ pub fn verify_el_block_from_consensus(
 ) {
     if let Some(payload) = parse_cosmos_payload(&txs[0]) {
         assert_eq!(payload.block_number, goat_block_number);
-    } 
+    }
 
     // check data hash
     let excepted_data_hash = light_block.signed_header.header.data_hash.unwrap();
