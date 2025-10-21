@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use store::MessageState;
 use store::ipfs::IPFS;
 use store::localdb::LocalDB;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -315,7 +316,7 @@ pub async fn handle_self_p2p_msg(
     let messages =
         pop_batch_local_unhandle_msg(local_db, actor.clone(), current_time_secs(), 0, 50).await?;
     for message in messages {
-        recv_and_dispatch(
+        match recv_and_dispatch(
             swarm,
             local_db,
             btc_client,
@@ -326,11 +327,21 @@ pub async fn handle_self_p2p_msg(
             id.clone(),
             &message.content,
         )
-        .await?;
-        let mut storage_processor = local_db.acquire().await?;
-        storage_processor
-            .update_messages_state(&[message.message_id], MessageState::Processed.to_string())
-            .await?;
+        .await
+        {
+            Ok(_) => {
+                let mut storage_processor = local_db.acquire().await?;
+                storage_processor
+                    .update_messages_state(
+                        &[message.message_id],
+                        MessageState::Processed.to_string(),
+                    )
+                    .await?;
+            }
+            Err(err) => {
+                warn!("fail to process message:{}: {}", message.message_id, err);
+            }
+        }
     }
     Ok(())
 }
@@ -1588,7 +1599,8 @@ pub async fn recv_and_dispatch(
                         "Operator {operator_pubkey} skipped obsoleted graph {current_instance_id}:{current_graph_id}"
                     );
                     let delay_secs = 20 * 60; // 20 minutes
-                    push_local_unhandled_messages(local_db, &message, delay_secs).await?;
+                    push_local_unhandled_messages(local_db, current_graph_id, &message, delay_secs)
+                        .await?;
                     return Ok(());
                 } else {
                     tracing::warn!(
@@ -1653,7 +1665,13 @@ pub async fn recv_and_dispatch(
             if [WithdrawStatus::None, WithdrawStatus::Canceled].contains(&withdraw_status) {
                 if kickoff_height >= goat_confirmed_btc_height {
                     let delay_secs = (kickoff_height + 1 - goat_confirmed_btc_height) * 600; // blocks * 10 minutes
-                    push_local_unhandled_messages(local_db, &message, delay_secs as usize).await?;
+                    push_local_unhandled_messages(
+                        local_db,
+                        graph_id,
+                        &message,
+                        delay_secs as usize,
+                    )
+                    .await?;
                 } else {
                     if let Err(e) = send_challenge_tx(btc_client, &graph).await {
                         if let Some(msg) = e.downcast_ref::<SpecialError>() {
@@ -2321,14 +2339,14 @@ pub async fn recv_and_dispatch(
                 broadcast_package(btc_client, &[assert_init_tx, child_tx]).await?;
                 // assert-commit should be broadcasted after assert-init is confirmed (wait 20 minutes here)
                 let delay_secs = 20 * 60; // 20 minutes
-                push_local_unhandled_messages(local_db, &message, delay_secs).await?;
+                push_local_unhandled_messages(local_db, graph_id, &message, delay_secs).await?;
                 return Ok(());
             }
             // 2. sign & broadcast assert-commit txns
             if !tx_confirmed(btc_client, &assert_init_txid).await? {
                 // assert-commit should be broadcasted after assert-init is confirmed (wait 20 minutes here)
                 let delay_secs = 20 * 60; // 20 minutes
-                push_local_unhandled_messages(local_db, &message, delay_secs).await?;
+                push_local_unhandled_messages(local_db, graph_id, &message, delay_secs).await?;
                 return Ok(());
             } else {
                 let wots_secret_keys =
@@ -2832,11 +2850,25 @@ pub fn send_to_peer(swarm: &mut Swarm<AllBehaviours>, message: GOATMessage) -> R
 }
 
 pub async fn push_local_unhandled_messages(
-    _local_db: &LocalDB,
-    _message: &GOATMessage,
-    _delay_secs: usize,
+    local_db: &LocalDB,
+    business_id: Uuid,
+    message: &GOATMessage,
+    delay_secs: usize,
 ) -> Result<()> {
-    todo!("Push message to local unhandled queue with delay");
+    let mut storage_processor = local_db.acquire().await?;
+    let actor = message.actor.clone();
+    let content: GOATMessageContent = message.to_typed()?;
+    create_message(
+        &mut storage_processor,
+        business_id,
+        None,
+        "Self".to_string(),
+        actor,
+        content,
+        0,
+        delay_secs as i64,
+    )
+    .await
 }
 
 /// Helper: try to get graph. If missing, send SyncGraphRequest and defer current handling.
@@ -2858,7 +2890,9 @@ async fn get_graph_or_defer(
                 tracing::warn!("Failed to send SyncGraphRequest for {instance_id}:{graph_id}: {e}");
             }
             let delay_secs: usize = 60; // 1 min default retry
-            if let Err(e) = push_local_unhandled_messages(local_db, message, delay_secs).await {
+            if let Err(e) =
+                push_local_unhandled_messages(local_db, graph_id, message, delay_secs).await
+            {
                 tracing::warn!(
                     "Failed to enqueue deferred message for {instance_id}:{graph_id}: {e}"
                 );
