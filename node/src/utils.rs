@@ -86,12 +86,6 @@ pub mod todo_funcs {
     use super::*;
 
     // contract calls
-    pub async fn get_graph_ids_by_instance_id(
-        goat_client: &GOATClient,
-        instance_id: Uuid,
-    ) -> Result<Vec<Uuid>> {
-        todo!("call Gateway.getGraphIdsByInstanceId(instance_id) on goat chain")
-    }
     pub async fn get_post_pegin_digest(
         goat_client: &GOATClient,
         instance_id: Uuid,
@@ -695,7 +689,7 @@ pub async fn validate_graph_id_on_goat(
         bail!("Graph {graph_id} not found on GoatChain")
     }
     let all_instance_graph_ids =
-        todo_funcs::get_graph_ids_by_instance_id(goat_client, instance_id).await?;
+        goat_client.gateway_get_graph_ids_by_instance_id(&instance_id).await?;
     if !all_instance_graph_ids.contains(&graph_id) {
         bail!("graph_id: {graph_id} and instance_id {instance_id} mismatch")
     }
@@ -1162,7 +1156,7 @@ pub async fn get_proper_utxo_set(
             })
             .collect()
     }
-    println!("get utxos from: {address}");
+    tracing::debug!("get utxos from: {address}");
 
     let utxos = client.get_address_utxo(address).await?;
     let mut sorted_utxos = utxos;
@@ -1937,7 +1931,7 @@ pub fn get_rand_btc_address_p2wpkh(network: Network) -> String {
     Address::p2wpkh(
         &CompressedPublicKey::try_from(PrivateKey::generate(network).public_key(&secp))
             .expect("Could not compress public key"),
-        Network::Testnet,
+        network,
     )
     .to_string()
 }
@@ -1947,7 +1941,7 @@ pub fn get_rand_btc_address_p2pkh(network: Network) -> String {
     Address::p2pkh(
         CompressedPublicKey::try_from(PrivateKey::generate(network).public_key(&secp))
             .expect("Could not compress public key"),
-        Network::Testnet,
+        network,
     )
     .to_string()
 }

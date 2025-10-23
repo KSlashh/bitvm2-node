@@ -2974,7 +2974,7 @@ pub async fn recv_and_dispatch(
                     return Ok(());
                 }
             };
-            if is_take1_timelock_expired(btc_client, kickoff_height).await? {
+            if !is_take1_timelock_expired(btc_client, kickoff_height).await? {
                 tracing::warn!(
                     "Ignore Take1Ready for {instance_id}:{graph_id}: kickoff tx timelock not expired yet"
                 );
@@ -3098,7 +3098,7 @@ pub async fn recv_and_dispatch(
                     return Ok(());
                 }
             };
-            if is_take2_timelock_expired(
+            if !is_take2_timelock_expired(
                 btc_client,
                 watchtower_challenge_init_height,
                 assert_init_height,
