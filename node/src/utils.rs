@@ -1077,7 +1077,7 @@ pub async fn get_proper_utxo_set(
             })
             .collect()
     }
-    println!("get utxos from: {address}");
+    tracing::debug!("get utxos from: {address}");
 
     let utxos = client.get_address_utxo(address).await?;
     let mut sorted_utxos = utxos;
@@ -1852,7 +1852,7 @@ pub fn get_rand_btc_address_p2wpkh(network: Network) -> String {
     Address::p2wpkh(
         &CompressedPublicKey::try_from(PrivateKey::generate(network).public_key(&secp))
             .expect("Could not compress public key"),
-        Network::Testnet,
+        network,
     )
     .to_string()
 }
@@ -1862,7 +1862,7 @@ pub fn get_rand_btc_address_p2pkh(network: Network) -> String {
     Address::p2pkh(
         CompressedPublicKey::try_from(PrivateKey::generate(network).public_key(&secp))
             .expect("Could not compress public key"),
-        Network::Testnet,
+        network,
     )
     .to_string()
 }

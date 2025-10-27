@@ -41,7 +41,31 @@ mod tests {
     use uuid::Uuid;
 
     fn network() -> Network {
-        Network::Testnet
+        const ENV_KEY: &str = "BITVM_NETWORK";
+        match std::env::var(ENV_KEY) {
+            Ok(v) => match v.to_lowercase().as_str() {
+                "regtest" => Network::Regtest,
+                "testnet" => Network::Testnet,
+                "signet" => Network::Signet,
+                "bitcoin" | "mainnet" => Network::Bitcoin,
+                _ => Network::Regtest,
+            },
+            Err(_) => Network::Regtest,
+        }
+    }
+
+    fn set_network(n: Network) {
+        const ENV_KEY: &str = "BITVM_NETWORK";
+        let v = match n {
+            Network::Regtest => "regtest",
+            Network::Testnet => "testnet",
+            Network::Signet => "signet",
+            Network::Bitcoin => "bitcoin",
+            _ => "regtest",
+        };
+        unsafe {
+            std::env::set_var(ENV_KEY, v);
+        }
     }
 
     fn fee_rate() -> f64 {
@@ -49,10 +73,19 @@ mod tests {
     }
 
     async fn get_esplora_client() -> EsploraClient {
-        Builder::new("http://127.0.0.1:3002").build_async().unwrap()
+        match network() {
+            Network::Regtest => Builder::new("http://127.0.0.1:3002").build_async().unwrap(),
+            Network::Testnet => {
+                Builder::new("https://mempool.space/testnet/api").build_async().unwrap()
+            }
+            _ => panic!("Mainnet is not supported in tests"),
+        }
     }
 
     fn get_btcd_client() -> BtcdClient {
+        if network() != Network::Regtest {
+            panic!("get_btcd_client only supports Regtest");
+        }
         BtcdClient::new(
             "http://127.0.0.1:18443",
             Auth::UserPass("111111".to_string(), "111111".to_string()),
@@ -465,7 +498,7 @@ mod tests {
         let watchtower_num = graph.parameters.watchtower_pubkeys.len();
         let assert_commit_num = assert_commit_num();
         let commitee_master_keys = committee_member_master_key();
-        let commitee_pub_nonces = commitee_master_keys
+        let commitee_pub_nonces: Vec<CommitteePubNonces> = commitee_master_keys
             .iter()
             .map(|k| k.nonces_for_graph(instance_id, graph_id, watchtower_num, assert_commit_num).0)
             .collect();
@@ -748,6 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take1() {
+        set_network(Network::Regtest);
         let esplora = get_esplora_client().await;
         let disprove_scripts = vec![script! {OP_TRUE}.compile()]; // No disprove, use empty vector to simplify
 
@@ -777,6 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take2() {
+        set_network(Network::Regtest);
         let esplora = get_esplora_client().await;
         let disprove_scripts = vec![script! {OP_TRUE}.compile()]; // No disprove, use empty vector to simplify
 
@@ -840,11 +875,12 @@ mod tests {
         };
 
         const PROOF: &[u8] =
-            include_bytes!("../../bitcoin-light-client/samples/output.bin.proof.bin");
-        const PUBLIC_INPUTS: &[u8] =
-            include_bytes!("../../bitcoin-light-client/samples/output.bin.public_inputs.bin");
+            include_bytes!("../../bitcoin-light-client-circuit/samples/output.bin.proof.bin");
+        const PUBLIC_INPUTS: &[u8] = include_bytes!(
+            "../../bitcoin-light-client-circuit/samples/output.bin.public_inputs.bin"
+        );
         const VK_HASH: &str =
-            include_str!("../../bitcoin-light-client/samples/output.bin.vk_hash.bin");
+            include_str!("../../bitcoin-light-client-circuit/samples/output.bin.vk_hash.bin");
 
         let graph_id = graph.parameters.graph_id.to_bytes_le();
         let total_work = 100;
@@ -986,6 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_nack() {
+        set_network(Network::Regtest);
         let esplora = get_esplora_client().await;
         let disprove_scripts = vec![script! {OP_TRUE}.compile()]; // No disprove, use empty vector to simplify
 
@@ -1043,6 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_timeout() {
+        set_network(Network::Regtest);
         let esplora = get_esplora_client().await;
         let disprove_scripts = vec![script! {OP_TRUE}.compile()]; // No disprove, use empty vector to simplify
 
@@ -1135,11 +1173,10 @@ mod tests {
         use goat::scripts::*;
 
         let network = Network::Testnet;
+        set_network(network);
+        let esplora = get_esplora_client().await;
         let client = BTCClient::new(network, None);
-        let esplora = Builder::new("https://mempool.space/testnet/api").build_async().unwrap();
-        // let bank_keypair = bank_keypair();
         let test_keypair = gen_keypair("seed:test");
-        // let bank_address = node_p2wsh_address(network, &bank_keypair.public_key().into());
         let test_address = node_p2wsh_address(network, &test_keypair.public_key().into());
         let default_input_amount = Amount::from_sat(2000);
         let receivers = std::iter::repeat((test_address.clone(), default_input_amount))
@@ -1290,5 +1327,57 @@ mod tests {
         // // this will fail because both cpfp_txn0 and txn1 depends on txn0, only 1c1p is allowed in a package
         // let tx_package = vec![txn0, cpfp_txn0, txn1, cpfp_txn1];
         // client.broadcast_package(&tx_package).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unlimited_opreturn() {
+        let network = Network::Testnet;
+        set_network(network);
+        let esplora = get_esplora_client().await;
+        let bank_address = node_p2wsh_address(network, &bank_keypair().public_key().into());
+        let utxos = esplora.get_address_utxo(bank_address.clone()).await.unwrap();
+        let utxo = if utxos.is_empty() {
+            panic!("No UTXOs found for bank address");
+        } else {
+            utxos[0].clone()
+        };
+        let msg = b"test OP_RETURN with more than 80 bytes.\n\"A purely peer-to-peer version of electronic cash would allow online payments to be sent directly from one party to another without going through a financial institution. Digital signatures provide part of the solution, but the main benefits are lost if a trusted third party is still required to prevent double-spending.We propose a solution to the double-spending problem using a peer-to-peer network.The network timestamps transactions by hashing them into an ongoing chain of hash-based proof-of-work, forming a record that cannot be changed without redoing the proof-of-work. The longest chain not only serves as proof of the sequence of events witnessed, but proof that it came from the largest pool of CPU power. As long as a majority of CPU power is controlled by nodes that are not cooperating to attack the network, they'll generate the longest chain and outpace attackers. The network itself requires minimal structure. Messages are broadcast on a best effort basis, and nodes can leave and rejoin the network at will, accepting the longest proof-of-work chain as proof of what happened while they were gone.\"";
+        // let msg = b"short OP_RETURN message";
+        let opreturn_script = script! {
+            OP_RETURN
+            {msg.to_vec()}
+        }
+        .compile();
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: utxo.txid, vout: utxo.vout },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::default(),
+            }],
+            output: vec![
+                TxOut { value: Amount::ZERO, script_pubkey: opreturn_script },
+                TxOut { value: Amount::ZERO, script_pubkey: bank_address.script_pubkey() },
+            ],
+        };
+        let tx_size = tx.weight().to_vbytes_ceil() + 200;
+        if utxo.value < Amount::from_sat(tx_size) {
+            panic!("cannot find utxo with enough value for the test");
+        }
+        let change_amount = utxo.value - Amount::from_sat(tx_size); // 1 sat/vbyte fee
+        if change_amount > Amount::from_sat(330) {
+            tx.output[1].value = change_amount;
+        } else {
+            tx.output.pop(); // remove change output if it's too small
+        }
+        node_sign(&mut tx, 0, utxo.value, EcdsaSighashType::All, &bank_keypair()).unwrap();
+        esplora.broadcast(&tx).await.unwrap();
+        println!(
+            "Broadcasted transaction with {} bytes OP_RETURN: {}",
+            msg.len(),
+            tx.compute_txid()
+        );
     }
 }
