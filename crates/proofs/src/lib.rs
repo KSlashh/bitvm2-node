@@ -56,7 +56,6 @@ pub async fn get_groth16_proof(
         proof: bincode::deserialize(&proof)?,
         public_values: bincode::deserialize(&public_values)?,
         zkm_version: zkm_version.to_string(),
-        // stdin: ZKMStdin::default(),
     };
 
     // Convert the gnark proof to an arkworks proof.
