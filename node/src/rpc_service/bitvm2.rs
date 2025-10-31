@@ -3,11 +3,11 @@ use alloy::hex::ToHexExt;
 use bitcoin::Txid;
 use client::Utxo;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::default::Default;
 use std::str::FromStr;
 use store::localdb::GraphQuery;
 use store::{Graph, GraphStatus, Instance, SerializableTxid, convert_to_step_state};
+use strum::{Display, EnumString};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -15,42 +15,41 @@ pub struct InstanceSettingResponse {
     pub bridge_in_amount: Vec<f32>,
 }
 
-#[derive(Deserialize, Serialize)]
-#[allow(dead_code)]
-pub struct BridgeInTransactionPrepareResponse {}
-
-#[derive(Debug, Deserialize)]
-pub struct GraphPresignCheckParams {
-    pub instance_id: String,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct GraphTxGetParams {
     pub tx_name: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-pub struct GraphPresignCheckResponse {
-    pub instance_id: String,
-    pub instance_status: String,
-    pub graph_status: HashMap<String, String>,
-    pub tx: Option<Instance>,
-}
-
 /// get tx detail
 #[derive(Debug, Deserialize)]
 pub struct InstanceListRequest {
+    pub is_bridge_in: bool,
     pub from_addr: Option<String>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
+pub enum StatusUserAction {
+    #[default]
+    None,
+    Submit,
+    Cancel,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct StatusExtra {
+    pub user_action: StatusUserAction,
+    pub is_failed: bool,
+    pub error: Option<String>,
+}
 #[derive(Deserialize, Serialize, Default)]
 pub struct InstanceExtended {
-    pub instance: Option<Instance>,
-    pub utxo: Option<Vec<Utxo>>,
+    pub instance: Instance,
+    pub utxo: Vec<Utxo>,
+    pub waiting_time_in_mins: i64,
     pub confirmations: u32,
     pub target_confirmations: u32,
+    pub status_extra: StatusExtra,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -64,14 +63,6 @@ pub struct InstanceGetResponse {
     pub instance_wrap: InstanceExtended,
 }
 
-#[derive(Deserialize)]
-pub struct InstanceUpdateRequest {
-    pub instance: Instance,
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct InstanceUpdateResponse {}
-
 #[derive(Deserialize, Serialize, Default)]
 pub struct InstanceOverviewResponse {
     pub instances_overview: InstanceOverview,
@@ -83,6 +74,8 @@ pub struct InstanceOverview {
     pub total_bridge_in_txn: i64,
     pub total_bridge_out_amount: i64,
     pub total_bridge_out_txn: i64,
+    pub total_peg_out_amount: i64,
+    pub total_peg_out_txn: i64,
     pub online_nodes: i64,
     pub total_nodes: i64,
 }
@@ -133,14 +126,6 @@ impl BtcTxData {
     }
 }
 
-#[derive(Deserialize)]
-pub struct GraphUpdateRequest {
-    pub graph: Graph,
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct GraphUpdateResponse {}
-
 #[derive(Debug, Deserialize)]
 pub struct GraphQueryParams {
     pub status: Option<String>,
@@ -172,17 +157,39 @@ impl From<GraphQueryParams> for GraphQuery {
             false
         };
 
-        let status = value.status.map(|status| convert_to_step_state(&status));
+        let statuses = match value.status.map(|status| convert_to_step_state(&status)) {
+            Some(v) => vec![v],
+            None => vec![],
+        };
+        let mut raw_conditions = vec![];
+        if is_bridge_out && statuses.is_empty() {
+            raw_conditions.push(
+                "( status NOT IN ('OperatorPresigned','CommitteePresigned', 'OperatorDataPushed') OR \
+                 (status = 'OperatorDataPushed'  AND init_withdraw_txid IS NOT NULL ) )".to_string()
+            );
+        }
+        if is_init_withdraw_not_null {
+            raw_conditions.push("init_withdraw_txid IS NOT NULL".to_string());
+        }
+
         GraphQuery {
-            status,
-            is_bridge_out,
-            operator: value.operator,
+            statuses,
+            operator_pubkey: value.operator,
+            kickoff_index: None,
             from_addr,
             graph_id: graph_ip_op,
             pegin_txid: pegin_txid_op,
+            raw_conditions,
+            order: Some(
+                "CASE
+                     WHEN bridge_out_start_at > 0
+                     THEN bridge_out_start_at
+                    ELSE created_at
+                END DESC"
+                    .to_string(),
+            ),
             offset: value.offset,
             limit: value.limit,
-            is_init_withdraw_not_null,
         }
     }
 }
@@ -204,75 +211,4 @@ pub struct GraphExtended {
     pub target_confirmations: u32,
     pub proof_height: Option<i64>,
     pub proof_query_url: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::{generate_random_bytes, get_rand_goat_address};
-    use store::localdb::GraphQuery;
-    use uuid::Uuid;
-
-    #[test]
-    fn test_from_graph_query_params_basic() {
-        let params = GraphQueryParams {
-            status: Some("pending".to_string()),
-            operator: Some("op1".to_string()),
-            from_addr: Some(get_rand_goat_address()),
-            graph_field: None,
-            offset: Some(10),
-            limit: Some(20),
-        };
-        let filter: GraphQuery = params.into();
-        assert!(filter.status.is_some());
-        assert_eq!(filter.operator, Some("op1".to_string()));
-        assert_eq!(filter.offset, Some(10));
-        assert_eq!(filter.limit, Some(20));
-        assert!(filter.is_bridge_out);
-    }
-
-    #[test]
-    fn test_from_graph_query_params_with_graph_field_txid() {
-        let params = GraphQueryParams {
-            status: None,
-            operator: None,
-            from_addr: None,
-            graph_field: Some(hex::encode(generate_random_bytes(32))),
-            offset: None,
-            limit: None,
-        };
-        let filter: GraphQuery = params.into();
-        assert!(filter.pegin_txid.is_some() || filter.graph_id.is_some());
-    }
-
-    #[test]
-    fn test_from_graph_query_params_with_graph_field_uuid() {
-        let params = GraphQueryParams {
-            status: None,
-            operator: None,
-            from_addr: None,
-            graph_field: Some(Uuid::new_v4().to_string()),
-            offset: None,
-            limit: None,
-        };
-        let filter: GraphQuery = params.into();
-        assert!(filter.graph_id.is_some() || filter.pegin_txid.is_some());
-    }
-
-    #[test]
-    fn test_filter_graph_params_builder_pattern() {
-        let params = GraphQuery::default()
-            .with_status("pending".to_string())
-            .with_operator("op1".to_string())
-            .with_from_addr("0x1234567890abcdef".to_string())
-            .with_pagination(10, 20)
-            .with_bridge_out(true);
-
-        assert_eq!(params.status, Some("pending".to_string()));
-        assert_eq!(params.operator, Some("op1".to_string()));
-        assert_eq!(params.from_addr, Some("0x1234567890abcdef".to_string()));
-        assert_eq!(params.offset, Some(10));
-        assert_eq!(params.limit, Some(20));
-        assert!(params.is_bridge_out);
-    }
 }

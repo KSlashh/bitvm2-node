@@ -2,10 +2,10 @@ use crate::schema::NODE_STATUS_OFFLINE;
 use crate::schema::NODE_STATUS_ONLINE;
 use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
-    CommitChainProof, CommitInfo, CommitteeSignatures, GoatTxRecord, Graph, GraphBtcTxVoutMonitor,
-    GraphRawData, HeaderChainProof, Instance, Message, MessageBroadcast, Node, NodesOverview,
-    OperatorProof, PeginGraphProcessData, PeginInstanceProcessData, ProofInfo, ProofType,
-    SerializableTxid, WatchContract, WatchtowerProof,
+    CommitChainProof, CommitInfo, GoatTxRecord, Graph, GraphBtcTxVoutMonitor, GraphRawData,
+    HeaderChainProof, Instance, Message, MessageBroadcast, Node, NodesOverview, OperatorProof,
+    PeginGraphProcessData, PeginInstanceProcessData, ProofInfo, ProofType, SerializableTxid,
+    WatchContract, WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -87,15 +87,22 @@ impl LocalDB {
 
 #[derive(Clone, Debug, Default)]
 pub struct InstanceQuery {
+    pub is_bridge_in: bool,
     pub from_addr: Option<String>,
     pub statuses: Vec<String>,
     pub earliest_updated: Option<i64>,
     pub pegin_request_height_threshold: Option<i64>,
+    pub order: Option<String>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
 }
 
 impl InstanceQuery {
+    pub fn with_is_bridge_in(mut self, is_bridge_in: bool) -> Self {
+        self.is_bridge_in = is_bridge_in;
+        self
+    }
+
     pub fn with_from_addr(mut self, from_addr: String) -> Self {
         self.from_addr = Some(from_addr);
         self
@@ -108,6 +115,11 @@ impl InstanceQuery {
 
     pub fn with_statuses(mut self, statuses: Vec<String>) -> Self {
         self.statuses = statuses;
+        self
+    }
+
+    pub fn with_order(mut self, order: String) -> Self {
+        self.order = Some(order);
         self
     }
 
@@ -136,6 +148,32 @@ impl InstanceQuery {
         self.limit = Some(limit);
         self
     }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::new(base_sql);
+        query_builder.and_where("is_bridge_in = ?", Some(QueryParam::Bool(self.is_bridge_in)));
+
+        if let Some(from_addr) = &self.from_addr {
+            query_builder.and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
+        }
+        if !self.statuses.is_empty() {
+            query_builder.and_where_in("status", &self.statuses, false);
+        }
+        if let Some(earliest_updated) = self.earliest_updated {
+            query_builder.and_where("updated_at >= ?", Some(QueryParam::Int(earliest_updated)));
+        }
+        if let Some(pegin_request_height_threshold) = self.pegin_request_height_threshold {
+            query_builder.and_where(
+                "goat_tx_height < ?",
+                Some(QueryParam::Int(pegin_request_height_threshold)),
+            );
+        }
+        if let Some(order) = &self.order {
+            query_builder.apply_order(order);
+        }
+        query_builder.apply_pagination(self.limit, self.offset);
+        query_builder
+    }
 }
 
 /// Instance field update parameters
@@ -146,9 +184,8 @@ pub struct InstanceUpdate {
     pub instance_id: Uuid,
     pub status: Option<String>,
     pub pegin_confirm_txid: Option<String>,
-    pub pegin_data_txid: Option<String>,
-    pub pegin_prepare_height: Option<i64>,
-    pub committees_answers: Option<HashMap<String, CommitteeSignatures>>,
+    pub btc_height: Option<i64>,
+    pub committees_answers: Option<HashMap<String, Vec<u8>>>,
 }
 
 impl InstanceUpdate {
@@ -158,8 +195,7 @@ impl InstanceUpdate {
             instance_id,
             status: None,
             pegin_confirm_txid: None,
-            pegin_data_txid: None,
-            pegin_prepare_height: None,
+            btc_height: None,
             committees_answers: None,
         }
     }
@@ -176,56 +212,94 @@ impl InstanceUpdate {
         self
     }
 
-    /// Set pegin data transaction ID
-    pub fn with_pegin_data_txid(mut self, txid: String) -> Self {
-        self.pegin_data_txid = Some(txid);
-        self
-    }
-
     /// Set committees answers
-    pub fn with_committees_answers(
-        mut self,
-        committees_answers: HashMap<String, CommitteeSignatures>,
-    ) -> Self {
+    pub fn with_committees_answers(mut self, committees_answers: HashMap<String, Vec<u8>>) -> Self {
         self.committees_answers = Some(committees_answers);
         self
     }
 
-    pub fn with_pegin_prepare_height(mut self, timeout: i64) -> Self {
-        self.pegin_prepare_height = Some(timeout);
+    pub fn with_btc_height(mut self, timeout: i64) -> Self {
+        self.btc_height = Some(timeout);
         self
     }
     /// Check if any fields need to be updated
     pub fn has_updates(&self) -> bool {
         self.status.is_some()
             || self.pegin_confirm_txid.is_some()
-            || self.pegin_data_txid.is_some()
             || self.committees_answers.is_some()
-            || self.pegin_prepare_height.is_some()
+            || self.btc_height.is_some()
+    }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::update(base_sql);
+        // Set field
+        if let Some(ref status) = self.status {
+            query_builder.set_field("status", QueryParam::Text(status.clone()));
+        }
+
+        if let Some(ref txid) = self.pegin_confirm_txid {
+            query_builder.set_field("pegin_confirm_txid", QueryParam::Text(txid.clone()));
+        }
+
+        if let Some(pegin_prepare_height) = self.btc_height {
+            query_builder.set_field("btc_height", QueryParam::Int(pegin_prepare_height));
+        }
+
+        // Add update time
+        let current_time = get_current_timestamp_secs();
+        query_builder.set_field("updated_at", QueryParam::Int(current_time));
+
+        // Add WHERE clause
+        query_builder.and_where(
+            "hex(instance_id) = ? COLLATE NOCASE ",
+            Some(QueryParam::Text(hex::encode(self.instance_id))),
+        );
+
+        query_builder
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct GraphQuery {
-    pub status: Option<String>,
-    pub is_bridge_out: bool,
-    pub operator: Option<String>,
+    pub statuses: Vec<String>,
+    pub operator_pubkey: Option<String>,
+    pub kickoff_index: Option<i64>,
     pub from_addr: Option<String>,
     pub graph_id: Option<String>,
     pub pegin_txid: Option<SerializableTxid>,
+    pub raw_conditions: Vec<String>,
+    pub order: Option<String>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
-    pub is_init_withdraw_not_null: bool,
 }
 
 impl GraphQuery {
     pub fn with_status(mut self, status: String) -> Self {
-        self.status = Some(status);
+        self.statuses.push(status);
         self
     }
 
-    pub fn with_operator(mut self, operator: String) -> Self {
-        self.operator = Some(operator);
+    pub fn with_statuses(mut self, statuses: Vec<String>) -> Self {
+        self.statuses = statuses;
+        self
+    }
+    pub fn with_raw_condition(mut self, raw_condition: String) -> Self {
+        self.raw_conditions.push(raw_condition);
+        self
+    }
+
+    pub fn with_raw_conditions(mut self, raw_conditions: Vec<String>) -> Self {
+        self.raw_conditions = raw_conditions;
+        self
+    }
+
+    pub fn with_operator_pubkey(mut self, operator_pubkey: String) -> Self {
+        self.operator_pubkey = Some(operator_pubkey);
+        self
+    }
+
+    pub fn with_order(mut self, order: String) -> Self {
+        self.order = Some(order);
         self
     }
 
@@ -244,13 +318,8 @@ impl GraphQuery {
         self
     }
 
-    pub fn with_bridge_out(mut self, is_bridge_out: bool) -> Self {
-        self.is_bridge_out = is_bridge_out;
-        self
-    }
-
-    pub fn with_init_withdraw_not_null(mut self, is_init_withdraw_not_null: bool) -> Self {
-        self.is_init_withdraw_not_null = is_init_withdraw_not_null;
+    pub fn with_kickoff_index(mut self, kickoff_index: i64) -> Self {
+        self.kickoff_index = Some(kickoff_index);
         self
     }
 
@@ -268,6 +337,48 @@ impl GraphQuery {
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
+    }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::new(base_sql);
+        // Add WHERE conditions
+        if !self.statuses.is_empty() {
+            query_builder.and_where_in("status", &self.statuses, false);
+        }
+
+        if let Some(from_addr) = &self.from_addr {
+            query_builder.and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
+        }
+
+        if let Some(operator) = &self.operator_pubkey {
+            query_builder
+                .and_where("operator_pubkey = ?", Some(QueryParam::Text(operator.clone())));
+        }
+
+        if let Some(kickoff_index) = self.kickoff_index {
+            query_builder.and_where("kickoff_index = ?", Some(QueryParam::Int(kickoff_index)));
+        }
+
+        if let Some(pegin_txid) = &self.pegin_txid {
+            query_builder
+                .and_where("pegin_txid = ?", Some(QueryParam::BTCTxid(pegin_txid.clone())));
+        }
+
+        if let Some(graph_id) = &self.graph_id {
+            query_builder.and_where(
+                "hex(graph_id) = ? COLLATE NOCASE",
+                Some(QueryParam::Text(graph_id.clone())),
+            );
+        }
+        for raw_condition in &self.raw_conditions {
+            query_builder.add_raw_condition(raw_condition);
+        }
+        if let Some(order) = &self.order {
+            query_builder.apply_order(order)
+        }
+        // Add pagination
+        query_builder.apply_pagination(self.limit, self.offset);
+        query_builder
     }
 }
 
@@ -349,6 +460,136 @@ impl GraphUpdate {
             || self.init_withdraw_txid.is_some()
             || self.disprove_txid.is_some()
     }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::update(base_sql);
+        // Add SET fields
+        if let Some(ref status) = self.status {
+            query_builder.set_field("status", QueryParam::Text(status.clone()));
+        }
+        if let Some(ref sub_status) = self.sub_status {
+            query_builder.set_field("sub_status", QueryParam::Text(sub_status.clone()));
+        }
+        if let Some(ref ipfs_base_url) = self.ipfs_base_url {
+            query_builder.set_field("graph_ipfs_base_url", QueryParam::Text(ipfs_base_url.clone()));
+        }
+        if let Some(ref challenge_txid) = self.challenge_txid {
+            query_builder.set_field("challenge_txid", QueryParam::BTCTxid(challenge_txid.clone()));
+        }
+        if let Some(ref disprove_txid) = self.disprove_txid {
+            query_builder.set_field("disprove_txid", QueryParam::BTCTxid(disprove_txid.clone()));
+        }
+        if let Some(bridge_out_start_at) = self.bridge_out_start_at {
+            query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
+        }
+        if let Some(ref init_withdraw_txid) = self.init_withdraw_txid {
+            if init_withdraw_txid.is_empty() {
+                // Set NULL value
+                query_builder.set_field_null("init_withdraw_txid");
+            } else {
+                query_builder
+                    .set_field("init_withdraw_txid", QueryParam::Text(init_withdraw_txid.clone()));
+            }
+        }
+        // Add update time
+        let current_time = get_current_timestamp_secs();
+        query_builder.set_field("updated_at", QueryParam::Int(current_time));
+
+        // Add WHERE clause
+        query_builder.and_where(
+            "hex(graph_id) = ? COLLATE NOCASE",
+            Some(QueryParam::Text(hex::encode(self.graph_id))),
+        );
+
+        query_builder
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NodeQuery {
+    pub actor: Option<String>,
+    pub goat_addr: Option<String>,
+    pub time_threshold: i64,
+    pub status_expect: Option<String>,
+    pub order: Option<String>,
+    pub offset: Option<u32>,
+    pub limit: Option<u32>,
+}
+impl NodeQuery {
+    pub fn with_actor(mut self, actor: String) -> Self {
+        self.actor = Some(actor);
+        self
+    }
+
+    pub fn with_goat_addr(mut self, goat_addr: String) -> Self {
+        self.goat_addr = Some(goat_addr);
+        self
+    }
+
+    pub fn with_time_threshold(mut self, time_threshold: i64) -> Self {
+        self.time_threshold = time_threshold;
+        self
+    }
+
+    pub fn with_status_expect(mut self, status_expect: String) -> Self {
+        self.status_expect = Some(status_expect);
+        self
+    }
+
+    pub fn with_order(mut self, order: String) -> Self {
+        self.order = Some(order);
+        self
+    }
+
+    pub fn with_pagination(mut self, offset: u32, limit: u32) -> Self {
+        self.offset = Some(offset);
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn with_offset(mut self, offset: u32) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::new(base_sql);
+
+        // Add WHERE conditions
+        if let Some(actor) = &self.actor {
+            query_builder.and_where("actor = ?", Some(QueryParam::Text(actor.clone())));
+        }
+
+        if let Some(goat_addr) = &self.goat_addr {
+            query_builder.and_where("goat_addr = ?", Some(QueryParam::Text(goat_addr.clone())));
+        }
+        if let Some(status_expect) = &self.status_expect {
+            match status_expect.as_str() {
+                NODE_STATUS_ONLINE => {
+                    query_builder
+                        .and_where("updated_at > ?", Some(QueryParam::Int(self.time_threshold)));
+                }
+                NODE_STATUS_OFFLINE => {
+                    query_builder
+                        .and_where("updated_at <= ?", Some(QueryParam::Int(self.time_threshold)));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(order) = &self.order {
+            query_builder.apply_order(order)
+        }
+
+        // Add pagination
+        query_builder.apply_pagination(self.limit, self.offset);
+        query_builder
+    }
 }
 
 impl<'a> StorageProcessor<'a> {
@@ -388,11 +629,12 @@ impl<'a> StorageProcessor<'a> {
         let committees_answers_json = serde_json::to_string(&instance.committees_answers)?;
         let res = sqlx::query!(
             "INSERT OR
-            REPLACE INTO instance (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, status, pegin_request_tx_hash, pegin_request_height,
-                        user_xonly_pubkey, user_change_addr, user_refund_addr, pegin_prepare_txid, pegin_confirm_txid, pegin_cancel_txid, unsign_pegin_confirm_tx, committees_answers,
-                       pegin_data_tx_hash, pegin_prepare_height, parameters, created_at, updated_at)
+            REPLACE INTO instance (instance_id, is_bridge_in,  network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
+                        user_xonly_pubkey, user_change_addr, user_refund_addr, btc_txid, pegin_confirm_txid, pegin_cancel_txid, committees_answers,
+                       pegin_data_tx_hash, btc_height, parameters, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             instance.instance_id,
+            instance.is_bridge_in,
             instance.network,
             instance.from_addr,
             instance.to_addr,
@@ -400,18 +642,17 @@ impl<'a> StorageProcessor<'a> {
             instance.fees,
             instance.input_utxos,
             instance.status,
-            instance.pegin_request_tx_hash,
-            instance.pegin_request_height,
+            instance.goat_tx_hash,
+            instance.goat_tx_height,
             instance.user_xonly_pubkey,
             instance.user_change_addr,
             instance.user_refund_addr,
-            instance.pegin_prepare_txid,
+            instance.btc_txid,
             instance.pegin_confirm_txid,
             instance.pegin_cancel_txid,
-            instance.unsign_pegin_confirm_tx,
             committees_answers_json,
             instance.pegin_data_tx_hash,
-            instance.pegin_prepare_height,
+            instance.btc_height,
             instance.parameters,
             instance.created_at,
             instance.updated_at
@@ -433,14 +674,10 @@ impl<'a> StorageProcessor<'a> {
     /// - Ok(None) if no instance with the given ID exists
     /// - Err if the query failed
     pub async fn find_instance(&mut self, instance_id: &Uuid) -> anyhow::Result<Option<Instance>> {
-        let row = sqlx::query_as::<_, Instance>(
-            "SELECT * 
-                 FROM instance
-                 WHERE instance_id = ?",
-        )
-        .bind(instance_id)
-        .fetch_optional(self.conn())
-        .await?;
+        let row = sqlx::query_as::<_, Instance>("SELECT * FROM instance WHERE instance_id = ?")
+            .bind(instance_id)
+            .fetch_optional(self.conn())
+            .await?;
         Ok(row)
     }
 
@@ -460,102 +697,23 @@ impl<'a> StorageProcessor<'a> {
         &mut self,
         params: InstanceQuery,
     ) -> anyhow::Result<(Vec<Instance>, i64)> {
-        let mut instances_query_builder = QueryBuilder::new(
-            "SELECT instance_id,
-                    network,
-                    from_addr,
-                    to_addr,
-                    amount,
-                    fees,
-                    input_utxos,
-                    status,
-                    pegin_request_tx_hash,
-                    pegin_request_height,
-                    user_xonly_pubkey,
-                    user_change_addr,
-                    user_refund_addr
-                    pegin_prepare_txid,
-                    pegin_confirm_txid,
-                    pegin_cancel_txid,
-                    unsign_pegin_confirm_tx,
-                    committees_answers,
-                    pegin_data_tx_hash,
-                    pegin_prepare_height,
-                    parameters,
-                    created_at,
-                    updated_at
-             FROM instance",
-        );
-
-        let mut count_query_builder =
-            QueryBuilder::new("SELECT count(*) as total_instances FROM instance");
-
-        // Apply filters
-        if let Some(from_addr) = &params.from_addr {
-            instances_query_builder
-                .and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
-            count_query_builder
-                .and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
-        }
-        if !params.statuses.is_empty() {
-            instances_query_builder.and_where_in("status", &params.statuses, false);
-            count_query_builder.and_where_in("status", &params.statuses, false);
-        }
-        if let Some(earliest_updated) = params.earliest_updated {
-            instances_query_builder
-                .and_where("updated_at >= ?", Some(QueryParam::Int(earliest_updated)));
-            count_query_builder
-                .and_where("updated_at >= ?", Some(QueryParam::Int(earliest_updated)));
-        }
-        if let Some(pegin_request_height_threshold) = params.pegin_request_height_threshold {
-            instances_query_builder.and_where(
-                "pegin_request_height < ?",
-                Some(QueryParam::Int(pegin_request_height_threshold)),
-            );
-            count_query_builder.and_where(
-                "pegin_request_height < ?",
-                Some(QueryParam::Int(pegin_request_height_threshold)),
-            );
-        }
-
-        // Apply ordering and pagination
-        instances_query_builder.apply_order("created_at DESC");
-        count_query_builder.apply_order("created_at DESC");
-        instances_query_builder.apply_pagination(params.limit, params.offset);
-
+        let mut count_params = params.clone();
+        (count_params.order, count_params.offset) = (None, None);
+        let instances_query_builder = params.get_query_builder("SELECT * FROM instance");
+        let count_query_builder =
+            count_params.get_query_builder("SELECT count(*) as total_instances FROM instance");
         // Execute data query
         let sql = instances_query_builder.get_sql();
-        let query_params = instances_query_builder.get_params();
         let mut data_query = sqlx::query_as::<_, Instance>(&sql);
-
-        // Bind parameters for data query
-        for param in &query_params {
-            data_query = match param {
-                QueryParam::Text(s) => data_query.bind(s),
-                QueryParam::Int(i) => data_query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => data_query.bind(btc_txid),
-            };
-        }
-
+        data_query = instances_query_builder.query_as(data_query);
         // Execute count query
         let count_sql = count_query_builder.get_sql();
-        let count_query_params = count_query_builder.get_params();
         let mut count_query = sqlx::query(&count_sql);
-
-        // Bind parameters for count query
-        for param in &count_query_params {
-            count_query = match param {
-                QueryParam::Text(s) => count_query.bind(s),
-                QueryParam::Int(i) => count_query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => count_query.bind(btc_txid),
-            };
-        }
-
-        let instances = data_query.fetch_all(self.conn()).await?;
-        let total_instances =
-            count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_instances");
-
-        Ok((instances, total_instances))
+        count_query = count_query_builder.query(count_query);
+        Ok((
+            data_query.fetch_all(self.conn()).await?,
+            count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_instances"),
+        ))
     }
     /// Get network type by instance ID
     ///
@@ -681,55 +839,12 @@ impl<'a> StorageProcessor<'a> {
         if !params.has_updates() {
             return Ok(false);
         }
-
-        // Build dynamic update query using QueryBuilder
-        let mut query_builder = QueryBuilder::update("instance");
-
-        // Add SET fields
-        if let Some(ref status) = params.status {
-            query_builder.set_field("status", QueryParam::Text(status.clone()));
-        }
-
-        if let Some(ref txid) = params.pegin_confirm_txid {
-            query_builder.set_field("pegin_confirm_txid", QueryParam::Text(txid.clone()));
-        }
-
-        if let Some(ref txid) = params.pegin_data_txid {
-            query_builder.set_field("pegin_data_txid", QueryParam::Text(txid.clone()));
-        }
-
-        if let Some(ref committees_answers) = params.committees_answers {
-            let committees_answers_json = serde_json::to_string(committees_answers)?;
-            query_builder
-                .set_field("committees_answers", QueryParam::Text(committees_answers_json));
-        }
-
-        if let Some(pegin_prepare_height) = params.pegin_prepare_height {
-            query_builder.set_field("pegin_prepare_height", QueryParam::Int(pegin_prepare_height));
-        }
-
-        // Add update time
-        let current_time = get_current_timestamp_secs();
-        query_builder.set_field("updated_at", QueryParam::Int(current_time));
-
-        // Add WHERE clause
-        query_builder
-            .and_where("instance_id = ?", Some(QueryParam::Text(params.instance_id.to_string())));
-
+        let query_builder = params.get_query_builder("instance");
         // Get SQL and parameters
         let update_sql = query_builder.get_sql();
-        let query_params = query_builder.get_params();
-
         // Execute query
         let mut query = sqlx::query(&update_sql);
-        for param in &query_params {
-            query = match param {
-                QueryParam::Text(s) => query.bind(s),
-                QueryParam::Int(i) => query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => query.bind(btc_txid),
-            }
-        }
-
+        query = query_builder.query(query);
         let result = query.execute(self.conn()).await?;
         Ok(result.rows_affected() > 0)
     }
@@ -765,8 +880,6 @@ impl<'a> StorageProcessor<'a> {
         instance_id: &Uuid,
         committee_addr: &str,
         pubkey: Vec<u8>,
-        l1_sig: Vec<u8>,
-        l2_sig: Vec<u8>,
     ) -> anyhow::Result<bool> {
         // First, get the current committees_answers
         let current_instance = self.find_instance(instance_id).await?;
@@ -778,15 +891,9 @@ impl<'a> StorageProcessor<'a> {
         committees_answers
             .entry(committee_addr.to_string())
             .and_modify(|existing| {
-                existing.pubkey = pubkey.clone();
-                if !l1_sig.is_empty() {
-                    existing.l1_sig = l1_sig.clone();
-                }
-                if !l2_sig.is_empty() {
-                    existing.l2_sig = l2_sig.clone();
-                }
+                *existing = pubkey.clone();
             })
-            .or_insert_with(|| CommitteeSignatures { pubkey, l1_sig, l2_sig });
+            .or_insert_with(|| pubkey);
         self.update_instance_committees_answers_map(instance_id, &committees_answers).await
     }
 
@@ -816,7 +923,7 @@ impl<'a> StorageProcessor<'a> {
     pub async fn get_instance_committees_answers(
         &mut self,
         instance_id: &Uuid,
-    ) -> anyhow::Result<Option<IndexMap<String, CommitteeSignatures>>> {
+    ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         let current_instance = self.find_instance(instance_id).await?;
         if let Some(instance) = current_instance {
             Ok(Some(instance.committees_answers))
@@ -832,7 +939,7 @@ impl<'a> StorageProcessor<'a> {
     pub async fn update_instance_committees_answers_map(
         &mut self,
         instance_id: &Uuid,
-        committees_answers: &IndexMap<String, CommitteeSignatures>,
+        committees_answers: &IndexMap<String, Vec<u8>>,
     ) -> anyhow::Result<bool> {
         let current_time = get_current_timestamp_secs();
         let committees_answers_json = serde_json::to_string(&committees_answers)?;
@@ -896,14 +1003,14 @@ impl<'a> StorageProcessor<'a> {
         let assert_commit_timeout_txids_json =
             serde_json::to_string(&graph.assert_commit_timeout_txids)?;
         let res = sqlx::query!(
-            r#"INSERT OR
+            "INSERT OR
              REPLACE INTO graph (graph_id, instance_id, kickoff_index, from_addr, to_addr, graph_ipfs_base_url, amount, challenge_amount,
                     status, sub_status, operator_pubkey, cur_prekickoff_txid, next_prekickoff, force_skip_kickoff_txid,
                     quick_challenge_txid, challenge_incomplete_kickoff_txid, pegin_txid, kickoff_txid, take1_txid,
                     challenge_txid, take2_txid, disprove_txid,  watchtower_challenge_init_txid, watchtower_challenge_timeout_txids, nack_txids,
                     blockhash_commit_timeout_txid, assert_init_txid, assert_commit_timeout_txids, init_withdraw_tx_hash,
                     bridge_out_start_at, zkm_version,created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             graph.graph_id,
             graph.instance_id,
             graph.kickoff_index,
@@ -943,67 +1050,10 @@ impl<'a> StorageProcessor<'a> {
     }
 
     pub async fn update_graph_fields(&mut self, params: GraphUpdate) -> anyhow::Result<()> {
-        // Build dynamic update query using QueryBuilder
-        let mut query_builder = QueryBuilder::update("graph");
-
-        // Add SET fields
-        if let Some(status) = params.status {
-            query_builder.set_field("status", QueryParam::Text(status));
-        }
-        if let Some(sub_status) = params.sub_status {
-            query_builder.set_field("sub_status", QueryParam::Text(sub_status));
-        }
-        if let Some(ipfs_base_url) = params.ipfs_base_url {
-            query_builder.set_field("graph_ipfs_base_url", QueryParam::Text(ipfs_base_url));
-        }
-        if let Some(challenge_txid) = params.challenge_txid {
-            query_builder.set_field("challenge_txid", QueryParam::BTCTxid(challenge_txid));
-        }
-        if let Some(disprove_txid) = params.disprove_txid {
-            query_builder.set_field("disprove_txid", QueryParam::BTCTxid(disprove_txid));
-        }
-        if let Some(bridge_out_start_at) = params.bridge_out_start_at {
-            query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
-        }
-        if let Some(init_withdraw_txid) = params.init_withdraw_txid {
-            if init_withdraw_txid.is_empty() {
-                // Set NULL value
-                query_builder.set_field_null("init_withdraw_txid");
-            } else {
-                query_builder.set_field("init_withdraw_txid", QueryParam::Text(init_withdraw_txid));
-            }
-        }
-        // Check if we have any updates
-        if query_builder.get_params().is_empty()
-            && !query_builder.get_sql().contains("init_withdraw_txid = NULL")
-        {
-            return Ok(());
-        }
-
-        // Add update time
-        let current_time = get_current_timestamp_secs();
-        query_builder.set_field("updated_at", QueryParam::Int(current_time));
-
-        // Add WHERE clause
-        query_builder.and_where(
-            "hex(graph_id) = ? COLLATE NOCASE",
-            Some(QueryParam::Text(hex::encode(params.graph_id))),
-        );
-
-        // Get SQL and parameters
+        let query_builder = params.get_query_builder("graph");
         let update_sql = query_builder.get_sql();
-        let query_params = query_builder.get_params();
-
-        // Execute query
-        let mut query = sqlx::query(&update_sql);
-        for param in &query_params {
-            query = match param {
-                QueryParam::Text(s) => query.bind(s),
-                QueryParam::Int(i) => query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => query.bind(btc_txid),
-            }
-        }
-
+        let query = sqlx::query(&update_sql);
+        let query = query_builder.query(query);
         let _ = query.execute(self.conn()).await?;
         Ok(())
     }
@@ -1041,7 +1091,9 @@ impl<'a> StorageProcessor<'a> {
 
     pub async fn find_graphs(&mut self, params: GraphQuery) -> anyhow::Result<(Vec<Graph>, i64)> {
         // Build base query
-        let mut query = QueryBuilder::new(
+        let mut count_params = params.clone();
+        (count_params.offset, count_params.limit) = (None, None);
+        let query_builder = params.get_query_builder(
             "SELECT graph_id,
                     instance_id,
                     kickoff_index,
@@ -1082,98 +1134,19 @@ impl<'a> StorageProcessor<'a> {
              FROM graph",
         );
 
-        // Build count query
-        let mut count_query =
-            QueryBuilder::new("SELECT count(graph_id) as total_graphs FROM graph");
-
-        // Add WHERE conditions
-        if let Some(status) = &params.status {
-            query.and_where("status = ?", Some(QueryParam::Text(status.clone())));
-            count_query.and_where("status = ?", Some(QueryParam::Text(status.clone())));
-        }
-
-        if let Some(from_addr) = &params.from_addr {
-            query.and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
-            count_query.and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
-        }
-
-        if let Some(operator) = &params.operator {
-            query.and_where("operator = ?", Some(QueryParam::Text(operator.clone())));
-            count_query.and_where("operator = ?", Some(QueryParam::Text(operator.clone())));
-        }
-
-        if let Some(pegin_txid) = &params.pegin_txid {
-            query.and_where("pegin_txid = ?", Some(QueryParam::BTCTxid(pegin_txid.clone())));
-            count_query.and_where("pegin_txid = ?", Some(QueryParam::BTCTxid(pegin_txid.clone())));
-        }
-
-        if let Some(graph_id) = &params.graph_id {
-            query.and_where(
-                "hex(graph_id) = ? COLLATE NOCASE",
-                Some(QueryParam::Text(graph_id.clone())),
-            );
-            count_query.and_where(
-                "hex(graph_id) = ? COLLATE NOCASE ",
-                Some(QueryParam::Text(graph_id.clone())),
-            );
-        }
-
-        if params.is_bridge_out && params.status.is_none() {
-            query.add_raw_condition(
-                "( status NOT IN ('OperatorPresigned','CommitteePresigned', 'OperatorDataPushed') OR \
-                 (status = 'OperatorDataPushed'  AND init_withdraw_txid IS NOT NULL ) )"
-            );
-            count_query.add_raw_condition(
-                "( status NOT IN ('OperatorPresigned','CommitteePresigned', 'OperatorDataPushed') OR \
-                 (status = 'OperatorDataPushed'  AND init_withdraw_txid IS NOT NULL ) )"
-            );
-        }
-
-        if params.is_init_withdraw_not_null {
-            query.add_raw_condition("init_withdraw_txid IS NOT NULL");
-            count_query.add_raw_condition("init_withdraw_txid IS NOT NULL");
-        }
-
-        // Add ORDER BY clause
-        query.apply_order(
-            "CASE
-                WHEN bridge_out_start_at > 0
-                THEN bridge_out_start_at
-                ELSE created_at
-             END DESC",
-        );
-
-        // Add pagination
-        query.apply_pagination(params.limit, params.offset);
-
-        // Execute query
-        let sql = query.get_sql();
-        let params = query.get_params();
+        let count_query_builder =
+            count_params.get_query_builder("SELECT count(graph_id) as total_graphs FROM graph");
+        let sql = query_builder.get_sql();
         let mut graphs_query = sqlx::query_as::<_, Graph>(&sql);
-        for param in &params {
-            graphs_query = match param {
-                QueryParam::Text(s) => graphs_query.bind(s),
-                QueryParam::Int(i) => graphs_query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => graphs_query.bind(btc_txid),
-            }
-        }
-        let graphs = graphs_query.fetch_all(self.conn()).await?;
+        graphs_query = query_builder.query_as(graphs_query);
+        let count_sql = count_query_builder.get_sql();
+        let mut count_query = sqlx::query(&count_sql);
+        count_query = count_query_builder.query(count_query);
 
-        // Execute count query
-        let count_sql = count_query.get_sql();
-        let count_params = count_query.get_params();
-        let mut count_query_exec = sqlx::query(&count_sql);
-        for param in &count_params {
-            count_query_exec = match param {
-                QueryParam::Text(s) => count_query_exec.bind(s),
-                QueryParam::Int(i) => count_query_exec.bind(i),
-                QueryParam::BTCTxid(btc_txid) => count_query_exec.bind(btc_txid),
-            }
-        }
-        let total_graphs =
-            count_query_exec.fetch_one(self.conn()).await?.get::<i64, &str>("total_graphs");
-
-        Ok((graphs, total_graphs))
+        Ok((
+            graphs_query.fetch_all(self.conn()).await?,
+            count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_graphs"),
+        ))
     }
 
     pub async fn find_graphs_by_status_group_by_operator(
@@ -1273,41 +1246,11 @@ impl<'a> StorageProcessor<'a> {
         Ok(graph_ids.into_iter().map(|v| (v.graph_id, v.instance_id, v.operator)).collect())
     }
 
-    pub async fn get_operator_graphs(
-        &mut self,
-        operator_pubkey: &str,
-        kickoff_index: Option<i64>,
-        statuses: Vec<String>,
-        order: Option<String>,
-        offset: Option<u32>,
-        limit: Option<u32>,
-    ) -> anyhow::Result<Vec<Graph>> {
-        let mut graph_query_builder = QueryBuilder::new("SELECT * FROM graph");
-        graph_query_builder
-            .and_where("operator_pubkey = ?", Some(QueryParam::Text(operator_pubkey.to_string())));
-        if let Some(kickoff_index) = kickoff_index {
-            graph_query_builder
-                .and_where("kickoff_index = ?", Some(QueryParam::Int(kickoff_index)));
-        }
-
-        if !statuses.is_empty() {
-            graph_query_builder.and_where_in("status", &statuses, false);
-        }
-        if let Some(order) = order {
-            graph_query_builder.apply_order(&order);
-        }
-        graph_query_builder.apply_pagination(limit, offset);
+    pub async fn get_operator_graphs(&mut self, params: GraphQuery) -> anyhow::Result<Vec<Graph>> {
+        let graph_query_builder = params.get_query_builder("SELECT * FROM graph");
         let operator_graph_sql = graph_query_builder.get_sql();
-        let query_params = graph_query_builder.get_params();
         let mut operator_graphs_query = sqlx::query_as::<_, Graph>(&operator_graph_sql);
-        for param in &query_params {
-            operator_graphs_query = match param {
-                QueryParam::Text(s) => operator_graphs_query.bind(s),
-                QueryParam::Int(i) => operator_graphs_query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => operator_graphs_query.bind(btc_txid),
-            };
-        }
-
+        operator_graphs_query = graph_query_builder.query_as(operator_graphs_query);
         Ok(operator_graphs_query.fetch_all(self.conn()).await?)
     }
 
@@ -1445,88 +1388,25 @@ impl<'a> StorageProcessor<'a> {
         .await?)
     }
 
-    /// Query node list
-    pub async fn node_list(
-        &mut self,
-        actor: Option<String>,
-        goat_addr: Option<String>,
-        offset: Option<u32>,
-        limit: Option<u32>,
-        time_threshold: i64,
-        status_expect: Option<String>,
-    ) -> anyhow::Result<(Vec<Node>, i64)> {
-        // Build base query
-        let mut query = QueryBuilder::new(
-            "SELECT peer_id,
-                    actor,
-                    goat_addr,
-                    btc_pub_key,
-                    socket_addr,
-                    reward,
-                    created_at,
-                    updated_at
-             FROM node",
-        );
+    pub async fn find_nodes(&mut self, params: &NodeQuery) -> anyhow::Result<(Vec<Node>, i64)> {
+        let data_query_builder = params.get_query_builder("SELECT *  FROM node");
+        let mut count_params = params.clone();
+        (count_params.offset, count_params.limit) = (None, None);
+        let count_query_builder =
+            count_params.get_query_builder("SELECT count(peer_id) as total_nodes FROM node");
 
-        // Build count query
-        let mut count_query = QueryBuilder::new("SELECT count(*) as total_nodes FROM node");
+        let data_sql = data_query_builder.get_sql();
+        let mut nodes_query = sqlx::query_as::<_, Node>(&data_sql);
+        nodes_query = data_query_builder.query_as(nodes_query);
 
-        // Add WHERE conditions
-        if let Some(actor) = &actor {
-            query.and_where("actor = ?", Some(QueryParam::Text(actor.clone())));
-            count_query.and_where("actor = ?", Some(QueryParam::Text(actor.clone())));
-        }
+        let count_sql = count_query_builder.get_sql();
+        let mut count_query = sqlx::query(&count_sql);
+        count_query = count_query_builder.query(count_query);
 
-        if let Some(goat_addr) = &goat_addr {
-            query.and_where("goat_addr = ?", Some(QueryParam::Text(goat_addr.clone())));
-            count_query.and_where("goat_addr = ?", Some(QueryParam::Text(goat_addr.clone())));
-        }
-
-        if let Some(status_expect) = &status_expect {
-            match status_expect.as_str() {
-                NODE_STATUS_ONLINE => {
-                    query.and_where("updated_at > ?", Some(QueryParam::Int(time_threshold)));
-                    count_query.and_where("updated_at > ?", Some(QueryParam::Int(time_threshold)));
-                }
-                NODE_STATUS_OFFLINE => {
-                    query.and_where("updated_at <= ?", Some(QueryParam::Int(time_threshold)));
-                    count_query.and_where("updated_at <= ?", Some(QueryParam::Int(time_threshold)));
-                }
-                _ => {}
-            }
-        }
-
-        // Add pagination
-        query.apply_pagination(limit, offset);
-
-        // Execute query
-        let sql = query.get_sql();
-        let params = query.get_params();
-        let mut nodes_query = sqlx::query_as::<_, Node>(&sql);
-        for param in &params {
-            nodes_query = match param {
-                QueryParam::Text(s) => nodes_query.bind(s),
-                QueryParam::Int(i) => nodes_query.bind(i),
-                QueryParam::BTCTxid(btc_txid) => nodes_query.bind(btc_txid),
-            }
-        }
-        let nodes = nodes_query.fetch_all(self.conn()).await?;
-
-        // Execute count query
-        let count_sql = count_query.get_sql();
-        let count_params = count_query.get_params();
-        let mut count_query_exec = sqlx::query(&count_sql);
-        for param in &count_params {
-            count_query_exec = match param {
-                QueryParam::Text(s) => count_query_exec.bind(s),
-                QueryParam::Int(i) => count_query_exec.bind(i),
-                QueryParam::BTCTxid(btc_txid) => count_query_exec.bind(btc_txid),
-            }
-        }
-        let total_nodes =
-            count_query_exec.fetch_one(self.conn()).await?.get::<i64, &str>("total_nodes");
-
-        Ok((nodes, total_nodes))
+        Ok((
+            nodes_query.fetch_all(self.conn()).await?,
+            count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_nodes"),
+        ))
     }
 
     pub async fn get_proof_server_node(&mut self) -> anyhow::Result<Option<Node>> {
@@ -1578,7 +1458,8 @@ impl<'a> StorageProcessor<'a> {
                     (res.offline_committee, res.online_committee) = (record.offline, record.online);
                 }
                 "Relayer" => {
-                    (res.offline_relayer, res.online_relayer) = (record.offline, record.online);
+                    (res.offline_watchtower, res.online_watchtower) =
+                        (record.offline, record.online);
                 }
                 _ => {}
             };
@@ -1674,7 +1555,7 @@ impl<'a> StorageProcessor<'a> {
     ) -> anyhow::Result<bool> {
         let current_time = get_current_timestamp_secs();
         let query_str = format!(
-            "Update  message Set state = \'{state}\', updated_at = {current_time} WHERE id IN ({})",
+            "Update  message Set state = \'{state}\', updated_at = {current_time} WHERE message_id IN ({})",
             create_place_holders(ids)
         );
         let mut query = sqlx::query(&query_str);

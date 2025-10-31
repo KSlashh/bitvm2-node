@@ -54,7 +54,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::ipfs::IPFS;
-use store::localdb::{GraphUpdate, InstanceUpdate, LocalDB, StorageProcessor};
+use store::localdb::{GraphQuery, GraphUpdate, InstanceUpdate, LocalDB, StorageProcessor};
 use store::{
     ByteArray32, GoatTxProceedWithdrawExtra, GoatTxProcessingStatus, GoatTxRecord, GoatTxType,
     Graph, GraphRawData, GraphStatus, Instance, InstanceStatus, Message, MessageState, Node,
@@ -2103,12 +2103,10 @@ pub async fn get_current_prekickoff_tx(
     let mut storage_processor = local_db.acquire().await?;
     let graphs = storage_processor
         .get_operator_graphs(
-            &operator_pubkey.to_string(),
-            None,
-            vec![],
-            Some("kickoff_index DESC".to_string()),
-            None,
-            Some(1),
+            GraphQuery::default()
+                .with_operator_pubkey(operator_pubkey.to_string())
+                .with_order("kickoff_index DESC".to_string())
+                .with_limit(1),
         )
         .await?;
 
@@ -2165,6 +2163,7 @@ pub async fn store_pegin_request(
     storage_processor
         .upsert_instance(&Instance {
             instance_id,
+            is_bridge_in: true,
             network: get_network().to_string(),
             from_addr,
             to_addr: EvmAddress::from(&user_info.depositor_evm_address).to_string(),
@@ -2172,18 +2171,17 @@ pub async fn store_pegin_request(
             fees: UInt64Array3(user_info.txn_fees),
             input_utxos: serde_json::to_string(&input_utxos)?,
             status: InstanceStatus::UserInited.to_string(),
-            pegin_request_tx_hash,
-            pegin_request_height,
+            goat_tx_hash: pegin_request_tx_hash,
+            goat_tx_height: pegin_request_height,
             user_xonly_pubkey: ByteArray32(user_info.user_xonly_pubkey.clone().serialize()),
             user_change_addr: user_info.user_change_address.clone().to_string(),
             user_refund_addr: user_info.user_refund_address.clone().to_string(),
-            pegin_prepare_txid: None,
+            btc_txid: None,
             pegin_confirm_txid: None,
             pegin_cancel_txid: None,
-            unsign_pegin_confirm_tx: None,
             committees_answers: IndexMap::new(),
             pegin_data_tx_hash: "".to_string(),
-            pegin_prepare_height: 0,
+            btc_height: 0,
             parameters: None,
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
@@ -2329,12 +2327,11 @@ pub async fn get_latest_pegout_finalized_graph(
     let mut storage_processor = local_db.acquire().await?;
     let graphs = storage_processor
         .get_operator_graphs(
-            &operator_pubkey.to_string(),
-            None,
-            statuses,
-            Some("kickoff_index DESC".to_string()),
-            None,
-            Some(1),
+            GraphQuery::default()
+                .with_operator_pubkey(operator_pubkey.to_string())
+                .with_statuses(statuses)
+                .with_order("kickoff_index DESC".to_string())
+                .with_limit(1),
         )
         .await?;
     if graphs.is_empty() {
@@ -2353,12 +2350,11 @@ pub async fn get_graph_id_by_nonce(
     let mut storage_processor = local_db.acquire().await?;
     let graphs = storage_processor
         .get_operator_graphs(
-            &operator_pubkey.to_string(),
-            Some(graph_nonce as i64),
-            vec![],
-            Some("kickoff_index DESC".to_string()),
-            None,
-            Some(1),
+            GraphQuery::default()
+                .with_operator_pubkey(operator_pubkey.to_string())
+                .with_kickoff_index(graph_nonce as i64)
+                .with_order("kickoff_index DESC".to_string())
+                .with_limit(1),
         )
         .await?;
     if graphs.is_empty() { Ok(None) } else { Ok(Some((graphs[0].instance_id, graphs[0].graph_id))) }
