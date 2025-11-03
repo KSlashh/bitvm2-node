@@ -366,7 +366,7 @@ mod tests {
         let bank_address = node_p2wsh_address(network(), &bank_keypair().public_key().into());
         let user_xonly_pubkey = XOnlyPublicKey::from(user_master_key().public_key());
         let user_address = node_p2wsh_address(network(), &user_master_key().public_key().into());
-        let pegin_deposit_input_amount = pegin_amount + default_fee_amount;
+        let pegin_deposit_input_amount = pegin_amount + default_fee_amount * 2;
         let pegin_deposit_inputs = vec![Input {
             outpoint: fund_address(
                 esplora,
@@ -479,7 +479,7 @@ mod tests {
             operator_receive_address: bank_address.clone(),
             watchtower_pubkeys: watchtower_master_key()
                 .iter()
-                .map(|k| k.master_keypair().public_key().into())
+                .map(|k| k.master_keypair().public_key().x_only_public_key().0)
                 .collect(),
             hashlocks: hashlocks().1.to_vec(),
             guest_constant_value: [0u8; 32], // all zero for test

@@ -20,6 +20,10 @@ pub struct GraphTxGetParams {
     pub tx_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GraphTxnGetParams {
+    pub _cursor: i32, //  -1 pre graph tx : 0: current graph tx; 1 next graph tx
+}
 /// get tx detail
 #[derive(Debug, Deserialize)]
 pub struct InstanceListRequest {
@@ -47,8 +51,8 @@ pub struct InstanceExtended {
     pub instance: Instance,
     pub utxo: Vec<Utxo>,
     pub waiting_time_in_mins: i64,
-    pub confirmations: u32,
-    pub target_confirmations: u32,
+    // pub confirmations: u32,
+    // pub target_confirmations: u32,
     pub status_extra: StatusExtra,
 }
 
@@ -114,14 +118,19 @@ pub struct ProgressData {
 pub struct BtcTxData {
     pub raw_data: String,
     pub progresses: Vec<ProgressData>,
+    pub fail_reason: Option<String>,
 }
 
 impl BtcTxData {
     pub fn new(raw_data: String) -> Self {
-        Self { raw_data, progresses: vec![] }
+        Self { raw_data, progresses: vec![], fail_reason: None }
     }
     pub fn with_progresses(mut self, progresses: Vec<ProgressData>) -> Self {
         self.progresses = progresses;
+        self
+    }
+    pub fn with_fail_reason(mut self, fail_reason: Option<String>) -> Self {
+        self.fail_reason = fail_reason;
         self
     }
 }
@@ -207,8 +216,19 @@ pub struct GraphListResponse {
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct GraphExtended {
     pub graph: Graph,
-    pub confirmations: u32,
-    pub target_confirmations: u32,
-    pub proof_height: Option<i64>,
-    pub proof_query_url: Option<String>,
+    pub waiting_time_in_mins: i64,
+    // pub proof_height: Option<i64>,
+    // pub proof_query_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphReadyToKickoffRequest {
+    pub goat_addr: Option<String>,
+    pub btc_pub_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphReadyToKickoffResponse {
+    pub graph: Option<Graph>,
+    pub no_ready_reason: Option<String>,
 }

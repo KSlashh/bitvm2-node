@@ -373,6 +373,9 @@ pub async fn recv_and_dispatch(
         update_node_timestamp(local_db, &from_peer_id.to_string()).await?;
     }
 
+    // Determine whether the message comes from this node itself to optionally skip validations
+    let is_self_peer = get_local_node_info().peer_id == from_peer_id.to_string();
+
     let message: GOATMessage = serde_json::from_slice(message)?;
     let content: GOATMessageContent = message.to_typed()?;
     match (content, actor) {
@@ -525,6 +528,7 @@ pub async fn recv_and_dispatch(
             let disprove_scripts = get_disprove_scripts(local_db, &graph_params).await?;
             let mut graph = generate_bitvm_graph(graph_params, disprove_scripts)?;
             operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
+            store_graph(local_db, &graph.to_simplified()?).await?;
             // 4. broadcast CreateGraph
             let message_content = GOATMessageContent::CreateGraph(CreateGraph {
                 instance_id,
@@ -624,19 +628,6 @@ pub async fn recv_and_dispatch(
             let pub_nonces_unchecked =
                 get_committee_pub_nonces_for_graph(local_db, instance_id, graph_id).await?;
             if pub_nonces_unchecked.len() == committee_pubkeys.len() {
-                let graph = match get_graph_or_defer(
-                    swarm,
-                    local_db,
-                    goat_client,
-                    instance_id,
-                    graph_id,
-                    &message,
-                )
-                .await?
-                {
-                    Some(g) => g,
-                    None => return Ok(()),
-                };
                 let mut graph = Bitvm2Graph::from_simplified(&graph)?;
                 let watchtower_num = graph.parameters.watchtower_pubkeys.len();
                 let assert_commit_num = graph.assert_commit_timeout_txns.len();
@@ -685,13 +676,14 @@ pub async fn recv_and_dispatch(
             Actor::Committee,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -712,7 +704,7 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle NonceGeneration for {instance_id}:{graph_id} from {}",
@@ -842,13 +834,14 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -869,7 +862,7 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle NonceGeneration for {instance_id}:{graph_id} from {}",
@@ -890,18 +883,15 @@ pub async fn recv_and_dispatch(
                 );
                 return Ok(());
             }
-            let graph = match get_graph_or_defer(
-                swarm,
-                local_db,
-                goat_client,
-                instance_id,
-                graph_id,
-                &message,
-            )
-            .await?
-            {
+            let graph = match get_graph(local_db, instance_id, graph_id).await? {
                 Some(g) => g,
-                None => return Ok(()),
+                None => {
+                    tracing::warn!(
+                        "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: graph not found, maybe belongs to another Operator",
+                        received_committee_pubkey.to_string()
+                    );
+                    return Ok(());
+                }
             };
             let watchtower_num = graph.parameters.watchtower_pubkeys.len();
             let assert_commit_num = graph.assert_commit_num;
@@ -947,13 +937,14 @@ pub async fn recv_and_dispatch(
             Actor::Committee,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -974,7 +965,7 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle CommitteePresign for {instance_id}:{graph_id} from {}",
@@ -1042,13 +1033,14 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -1069,7 +1061,7 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle CommitteePresign for {instance_id}:{graph_id} from {}",
@@ -1102,14 +1094,15 @@ pub async fn recv_and_dispatch(
             Actor::Operator,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee_with_evm_address(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-                &committee_evm_address,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee_with_evm_address(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                    &committee_evm_address,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -1130,25 +1123,22 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle EndorseGraph for {instance_id}:{graph_id} from {}",
                 received_committee_pubkey.to_string()
             );
             // 1. check endorsement signature
-            let graph = match get_graph_or_defer(
-                swarm,
-                local_db,
-                goat_client,
-                instance_id,
-                graph_id,
-                &message,
-            )
-            .await?
-            {
+            let graph = match get_graph(local_db, instance_id, graph_id).await? {
                 Some(g) => g,
-                None => return Ok(()),
+                None => {
+                    tracing::warn!(
+                        "Ignore EndorseGraph for {instance_id}:{graph_id} from {}: graph not found, maybe belongs to another Operator",
+                        received_committee_pubkey.to_string()
+                    );
+                    return Ok(());
+                }
             };
             let full_graph = Bitvm2Graph::from_simplified(&graph)?;
             if let Err(e) = verify_graph_endorsement(
@@ -1201,7 +1191,8 @@ pub async fn recv_and_dispatch(
         ) => {
             // received from Operator
             // 1. check graph data & ipfs cid
-            if let Err(e) = todo_funcs::validate_finalized_graph(goat_client, &graph, &endorse_sigs)
+            if let Err(e) =
+                todo_funcs::validate_finalized_graph(goat_client, &graph, &endorse_sigs).await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -1301,7 +1292,8 @@ pub async fn recv_and_dispatch(
         ) => {
             // received from Operator
             // 1. check graph data & ipfs cid
-            if let Err(e) = todo_funcs::validate_finalized_graph(goat_client, &graph, &endorse_sigs)
+            if let Err(e) =
+                todo_funcs::validate_finalized_graph(goat_client, &graph, &endorse_sigs).await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -1334,13 +1326,14 @@ pub async fn recv_and_dispatch(
             Actor::Committee,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -1361,7 +1354,7 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle PeginConfirmNonce for {instance_id} from {}",
@@ -1463,13 +1456,14 @@ pub async fn recv_and_dispatch(
             Actor::Committee,
         ) => {
             // received from Committee members
-            if let Err(e) = validate_committee(
-                goat_client,
-                &from_peer_id,
-                instance_id,
-                &received_committee_pubkey,
-            )
-            .await
+            if !is_self_peer
+                && let Err(e) = validate_committee(
+                    goat_client,
+                    &from_peer_id,
+                    instance_id,
+                    &received_committee_pubkey,
+                )
+                .await
             {
                 if let Some(msg) = e.downcast_ref::<SpecialError>() {
                     match msg {
@@ -1490,7 +1484,7 @@ pub async fn recv_and_dispatch(
                         _ => {}
                     }
                 };
-                bail!(e)
+                bail!(e);
             }
             tracing::info!(
                 "Handle PeginConfirmPartialSig for {instance_id} from {}",
@@ -2012,7 +2006,7 @@ pub async fn recv_and_dispatch(
                 .parameters
                 .watchtower_pubkeys
                 .iter()
-                .position(|pk| *pk == watchtower_keypair.public_key().into())
+                .position(|pk| *pk == watchtower_keypair.public_key().x_only_public_key().0)
             {
                 Some(index) => index,
                 None => {
