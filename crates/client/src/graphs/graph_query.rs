@@ -87,10 +87,10 @@ impl GatewayEventEntity {
                 builder = builder
                     .add_field(&tag, "id")
                     .add_field(&tag, "instanceId")
+                    .add_field(&tag, "transactionHash")
                     .add_field(&tag, "depositorAddress")
                     .add_field(&tag, "peginAmountSats")
                     .add_field(&tag, "txnFees")
-                    .add_field(&tag, "userInputs {txid  vout  amountSats} ")
                     .add_field(&tag, "userXonlyPubkey")
                     .add_field(&tag, "userChangeAddress")
                     .add_field(&tag, "userRefundAddress")
@@ -315,8 +315,6 @@ pub struct BridgeInRequestEvent {
     pub pegin_amount_sats: String,
     #[serde(rename = "txnFees")]
     pub txn_fees: [String; 3],
-    #[serde(rename = "userInputs")]
-    pub user_inputs: Vec<UserInput>,
     #[serde(rename = "userXonlyPubkey")]
     pub user_xonly_pubkey: String,
     #[serde(rename = "userChangeAddress")]

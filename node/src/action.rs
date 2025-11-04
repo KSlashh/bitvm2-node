@@ -340,7 +340,8 @@ pub async fn handle_self_p2p_msg(
                 let mut storage_processor = local_db.acquire().await?;
                 storage_processor
                     .update_messages_state(
-                        &[message.message_id],
+                        &message.message_id,
+                        message.message_version,
                         MessageState::Processed.to_string(),
                     )
                     .await?;
@@ -1222,6 +1223,8 @@ pub async fn recv_and_dispatch(
                 endorse_sigs.clone(),
             )
             .await?;
+            // After storing, mark the graph as endorsed
+            mark_graph_as_endorsed(local_db, instance_id, graph_id).await?;
             // 3. if endorsed graph count >= threshold, generate & broadcast PeginConfirmNonce
             if get_endorsed_graph_count(local_db, instance_id).await?
                 >= todo_funcs::min_required_operator()
@@ -1418,6 +1421,13 @@ pub async fn recv_and_dispatch(
                     partial_sig,
                 )
                 .await?;
+                store_committee_endorse_sig_for_pegin(
+                    local_db,
+                    instance_id,
+                    local_committee_pubkey,
+                    endorse_sig.as_bytes().to_vec(),
+                )
+                .await?;
                 // 4. (Relayer) if received enough partial signatures, aggregate the sigs
                 if is_relayer() {
                     let partial_sigs =
@@ -1586,15 +1596,21 @@ pub async fn recv_and_dispatch(
                 let pegin_height = match btc_client.get_tx_status(&pegin_txid).await?.block_height {
                     Some(height) => height as u64,
                     None => {
-                        let delay_secs = 60 * 10; // 10 minutes
-                        push_local_unhandled_messages(local_db, instance_id, &message, delay_secs)
-                            .await?;
+                        let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network()); // wait for 1 blocks
+                        push_local_unhandled_messages(
+                            local_db,
+                            instance_id,
+                            &message,
+                            delay_secs as usize,
+                        )
+                        .await?;
                         return Ok(());
                     }
                 };
-                let goat_confirmed_height = goat_client.btc_spv_latest_confirmed_height().await?;
+                let goat_confirmed_height = goat_client.btc_spv_latest_height().await?;
                 if goat_confirmed_height < pegin_height {
-                    let delay_secs = 60 * 10 * (pegin_height - goat_confirmed_height);
+                    let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network())
+                        * (pegin_height - goat_confirmed_height);
                     push_local_unhandled_messages(
                         local_db,
                         instance_id,
@@ -1735,9 +1751,14 @@ pub async fn recv_and_dispatch(
                     tracing::info!(
                         "Operator {operator_pubkey} skipped obsoleted graph {current_instance_id}:{current_graph_id}"
                     );
-                    let delay_secs = 20 * 60; // 20 minutes
-                    push_local_unhandled_messages(local_db, current_graph_id, &message, delay_secs)
-                        .await?;
+                    let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network()); // wait for 1 blocks
+                    push_local_unhandled_messages(
+                        local_db,
+                        current_graph_id,
+                        &message,
+                        delay_secs as usize,
+                    )
+                    .await?;
                     return Ok(());
                 } else {
                     tracing::warn!(
@@ -1798,11 +1819,11 @@ pub async fn recv_and_dispatch(
             }
             // 2. check withdraw status, if it's invalid, sign & broadcast challenge txn
             let withdraw_status = goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-            let goat_confirmed_btc_height =
-                goat_client.btc_spv_latest_confirmed_height().await? as u32;
+            let goat_confirmed_btc_height = goat_client.btc_spv_latest_height().await? as u32;
             if [WithdrawStatus::None, WithdrawStatus::Canceled].contains(&withdraw_status) {
                 if kickoff_height >= goat_confirmed_btc_height {
-                    let delay_secs = (kickoff_height + 1 - goat_confirmed_btc_height) * 600; // blocks * 10 minutes
+                    let delay_secs = (kickoff_height + 1 - goat_confirmed_btc_height)
+                        * todo_funcs::avg_block_time_secs(btc_client.network()) as u32;
                     push_local_unhandled_messages(
                         local_db,
                         graph_id,
@@ -2524,16 +2545,18 @@ pub async fn recv_and_dispatch(
                     Some(tx) => broadcast_package(btc_client, &[assert_init_tx, tx]).await?,
                     None => broadcast_tx(btc_client, &assert_init_tx).await?,
                 };
-                // assert-commit should be broadcasted after assert-init is confirmed (wait 20 minutes here)
-                let delay_secs = 20 * 60; // 20 minutes
-                push_local_unhandled_messages(local_db, graph_id, &message, delay_secs).await?;
+                // assert-commit should be broadcasted after assert-init is confirmed (wait for 1 block)
+                let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network());
+                push_local_unhandled_messages(local_db, graph_id, &message, delay_secs as usize)
+                    .await?;
                 return Ok(());
             }
             // 2. sign & broadcast assert-commit txns
             if !tx_confirmed(btc_client, &assert_init_txid).await? {
-                // assert-commit should be broadcasted after assert-init is confirmed (wait 20 minutes here)
-                let delay_secs = 20 * 60; // 20 minutes
-                push_local_unhandled_messages(local_db, graph_id, &message, delay_secs).await?;
+                // assert-commit should be broadcasted after assert-init is confirmed (wait for 1 block)
+                let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network());
+                push_local_unhandled_messages(local_db, graph_id, &message, delay_secs as usize)
+                    .await?;
                 return Ok(());
             } else {
                 let wots_secret_keys =
@@ -2913,15 +2936,21 @@ pub async fn recv_and_dispatch(
                 match btc_client.get_tx_status(&challenge_finish_txid).await?.block_height {
                     Some(height) => height as u64,
                     None => {
-                        let delay_secs = 60 * 10; // 10 minutes
-                        push_local_unhandled_messages(local_db, graph_id, &message, delay_secs)
-                            .await?;
+                        let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network()); // wait for 1 block
+                        push_local_unhandled_messages(
+                            local_db,
+                            graph_id,
+                            &message,
+                            delay_secs as usize,
+                        )
+                        .await?;
                         return Ok(());
                     }
                 };
-            let goat_confirmed_height = goat_client.btc_spv_latest_confirmed_height().await?;
+            let goat_confirmed_height = goat_client.btc_spv_latest_height().await?;
             if goat_confirmed_height < challenge_finish_height {
-                let delay_secs = 60 * 10 * (challenge_finish_height - goat_confirmed_height);
+                let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network())
+                    * (challenge_finish_height - goat_confirmed_height);
                 push_local_unhandled_messages(local_db, graph_id, &message, delay_secs as usize)
                     .await?;
                 return Ok(());
@@ -3021,14 +3050,21 @@ pub async fn recv_and_dispatch(
             let take1_height = match btc_client.get_tx_status(&take1_txid).await?.block_height {
                 Some(height) => height as u64,
                 None => {
-                    let delay_secs = 60 * 10; // 10 minutes
-                    push_local_unhandled_messages(local_db, graph_id, &message, delay_secs).await?;
+                    let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network()); // wait for 1 block
+                    push_local_unhandled_messages(
+                        local_db,
+                        graph_id,
+                        &message,
+                        delay_secs as usize,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
-            let goat_confirmed_height = goat_client.btc_spv_latest_confirmed_height().await?;
+            let goat_confirmed_height = goat_client.btc_spv_latest_height().await?;
             if goat_confirmed_height < take1_height {
-                let delay_secs = 60 * 10 * (take1_height - goat_confirmed_height);
+                let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network())
+                    * (take1_height - goat_confirmed_height);
                 push_local_unhandled_messages(local_db, graph_id, &message, delay_secs as usize)
                     .await?;
                 return Ok(());
@@ -3151,14 +3187,21 @@ pub async fn recv_and_dispatch(
             let take2_height = match btc_client.get_tx_status(&take2_txid).await?.block_height {
                 Some(height) => height as u64,
                 None => {
-                    let delay_secs = 60 * 10; // 10 minutes
-                    push_local_unhandled_messages(local_db, graph_id, &message, delay_secs).await?;
+                    let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network()); // wait for 1 block
+                    push_local_unhandled_messages(
+                        local_db,
+                        graph_id,
+                        &message,
+                        delay_secs as usize,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
-            let goat_confirmed_height = goat_client.btc_spv_latest_confirmed_height().await?;
+            let goat_confirmed_height = goat_client.btc_spv_latest_height().await?;
             if goat_confirmed_height < take2_height {
-                let delay_secs = 60 * 10 * (take2_height - goat_confirmed_height);
+                let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network())
+                    * (take2_height - goat_confirmed_height);
                 push_local_unhandled_messages(local_db, graph_id, &message, delay_secs as usize)
                     .await?;
                 return Ok(());
@@ -3262,9 +3305,9 @@ pub async fn try_finalize_graph(
         let agg_nonces = nonces_aggregation(&pub_nonces)?;
         let partial_sigs = partial_sigs.into_iter().map(|(_, ps)| ps).collect::<Vec<_>>();
         let committee_sig_for_graph = signature_aggregation(&partial_sigs, &agg_nonces, &graph)?;
+        push_committee_pre_signatures(&mut graph, &committee_sig_for_graph)?;
         let simplified_graph = graph.to_simplified()?;
         store_graph(local_db, &simplified_graph).await?;
-        push_committee_pre_signatures(&mut graph, &committee_sig_for_graph)?;
         if broadcast_graph_finalize {
             let message_content = GOATMessageContent::GraphFinalize(GraphFinalize {
                 instance_id,

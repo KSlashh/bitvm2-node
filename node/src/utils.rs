@@ -107,6 +107,15 @@ pub mod todo_funcs {
     }
 
     // other operations
+    pub fn avg_block_time_secs(network: Network) -> u64 {
+        match network {
+            Network::Bitcoin => 600, // 10 minutes
+            Network::Testnet => 300, // 5 minutes
+            Network::Regtest => 60,  // 1 minute
+            Network::Signet => 300,  // 5 minutes
+            _ => 600,                // default to 10 minutes
+        }
+    }
     pub fn assert_commmit_num() -> usize {
         let use_compact = false;
         let wots32_num = NUM_GUEST_PUBS_ASSERT + NUM_PUBS + NUM_U256;
@@ -1478,7 +1487,7 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut Bitvm2Graph
     let child_tx =
         build_cpfp_txns(btc_client, &prekickoff_tx, anchor_vout, prekickoff_tx_total_input_amount)
             .await?;
-    // TODO: if prekickoff already confirmed, just broadcast skip_kickoff tx
+    let prekickoff_txid = prekickoff_tx.compute_txid();
     match operator_sign_skip_kickoff(
         operator_graph_keypair,
         graph,
@@ -1486,21 +1495,30 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut Bitvm2Graph
         get_fee_rate(btc_client).await?,
     )? {
         Some(skip_kickoff_tx) => {
-            let prekickoff_txid = prekickoff_tx.compute_txid();
-            broadcast_package(btc_client, &[prekickoff_tx, skip_kickoff_tx]).await?;
+            let skip_kickoff_txid = skip_kickoff_tx.compute_txid();
             if !tx_on_chain(btc_client, &prekickoff_txid).await? {
-                bail!("prekickoff tx not on chain after broadcasting");
-            }
-            if let Some(child_tx) = child_tx {
-                broadcast_tx(btc_client, &child_tx).await?;
+                broadcast_package(btc_client, &[prekickoff_tx, skip_kickoff_tx]).await?;
+                if let Some(child_tx) = child_tx {
+                    broadcast_tx(btc_client, &child_tx).await?;
+                }
+            } else if !tx_on_chain(btc_client, &skip_kickoff_txid).await? {
+                if let Some(child_tx) = child_tx {
+                    broadcast_package(btc_client, &[skip_kickoff_tx, child_tx]).await?;
+                } else {
+                    broadcast_tx(btc_client, &skip_kickoff_tx).await?;
+                }
             }
         }
         None => match child_tx {
             Some(tx) => {
-                broadcast_package(btc_client, &[prekickoff_tx, tx]).await?;
+                if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+                    broadcast_package(btc_client, &[prekickoff_tx, tx]).await?;
+                }
             }
             None => {
-                broadcast_tx(btc_client, &prekickoff_tx).await?;
+                if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+                    broadcast_tx(btc_client, &prekickoff_tx).await?;
+                }
             }
         },
     };
@@ -1808,7 +1826,7 @@ pub async fn create_message(
     let msg_type = get_goat_message_content_type(&message_content).to_string();
     let message_id = generate_message_id(business_id, msg_type.clone(), sub_type);
     storage_processor
-        .create_message(Message {
+        .upsert_message(Message {
             message_id,
             business_id,
             actor: actor.to_string(),
@@ -1818,6 +1836,7 @@ pub async fn create_message(
             weight,
             lock_time_until: current_time_secs() + lock_time,
             state: MessageState::Pending.to_string(),
+            message_version: 0,
         })
         .await?;
     Ok(())
