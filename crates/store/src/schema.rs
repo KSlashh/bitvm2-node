@@ -162,10 +162,13 @@ define_numeric_array!(UInt64Array3, 3, u64);
 pub struct Node {
     pub peer_id: String,
     pub actor: String,
+    pub node_name: String,
     pub goat_addr: String,
     pub btc_pub_key: String,
     pub socket_addr: String,
     pub reward: i64,
+    pub service_fee_rate: f64,
+    pub available_peg_btc: i64,
     pub updated_at: i64,
     pub created_at: i64,
 }
@@ -248,7 +251,6 @@ pub enum GraphStatus {
     Challenge,
     Disprove,
     Obsoleted, // reimbursement by other operators
-    Discarded,
     Skipped,
     OperatorTake1,
     OperatorTake2,
@@ -263,17 +265,33 @@ pub enum GraphStatus {
 }
 
 impl GraphStatus {
+    pub fn get_closed_status() -> Vec<GraphStatus> {
+        vec![
+            GraphStatus::OperatorTake1,
+            GraphStatus::OperatorTake2,
+            GraphStatus::Skipped,
+            GraphStatus::Disprove,
+        ]
+    }
+    pub fn get_pegin_finalized_status() -> GraphStatus {
+        GraphStatus::OperatorDataPushed
+    }
+
+    pub fn get_pegout_started_status() -> GraphStatus {
+        GraphStatus::OperatorKickOff
+    }
+
     pub fn is_pegin_finalized(&self) -> bool {
-        todo!("")
+        GraphStatus::get_pegin_finalized_status().eq(self)
     }
     pub fn is_pegout_started(&self) -> bool {
-        todo!("")
+        GraphStatus::get_pegout_started_status().eq(self)
     }
     pub fn is_closed(&self) -> bool {
-        todo!("")
+        GraphStatus::get_closed_status().contains(self)
     }
     pub fn is_obsoleted(&self) -> bool {
-        todo!("")
+        self.eq(&GraphStatus::Obsoleted)
     }
 }
 

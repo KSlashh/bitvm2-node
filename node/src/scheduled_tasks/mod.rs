@@ -1,8 +1,10 @@
 mod event_watch_task;
 pub mod graph_maintenance_tasks;
 pub mod instance_maintenance_tasks;
+mod node_maintenance_tasks;
 
 use crate::action::GOATMessageContent;
+use crate::env::is_relayer;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     detect_init_withdraw_call, detect_kickoff, detect_take1_or_challenge, process_graph_challenge,
     scan_obsolete_sibling_graphs,
@@ -11,6 +13,7 @@ use crate::scheduled_tasks::instance_maintenance_tasks::{
     instance_answers_monitor, instance_btc_tx_monitor, instance_expiration_monitor,
     instance_window_expiration_monitor,
 };
+use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use bitvm2_lib::actors::Actor;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
@@ -28,7 +31,6 @@ async fn fetch_on_turn_graph_by_status<'a>(
 ) -> anyhow::Result<Vec<Graph>> {
     let graphs_ori =
         storage_processor.find_graphs_by_status_group_by_operator(graph_status).await?;
-    // todo add other logic later
     let mut graphs: Vec<Graph> = vec![];
     let mut pre_operator_pubkey = "".to_string();
     for graph in graphs_ori {
@@ -48,63 +50,49 @@ async fn run(
     let btc_client = btc_client.as_ref();
     let goat_client = goat_client.as_ref();
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && is_processing_history_events(local_db, goat_client).await?
+    if (actor == Actor::Operator || is_relayer())
+        && let Err(err) = node_available_pbtc_update_monitor(local_db, goat_client).await
     {
+        warn!("node_available_pbtc_update_monitor, err {:?}", err)
+    }
+
+    if is_processing_history_events(local_db, goat_client).await? {
         warn!("Still in history events processing");
         return Ok(());
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = instance_answers_monitor(local_db).await
-    {
+    if let Err(err) = instance_answers_monitor(local_db).await {
         warn!("instance_answers_monitor, err {:?}", err)
     }
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = instance_window_expiration_monitor(local_db, goat_client).await
-    {
+    if let Err(err) = instance_window_expiration_monitor(local_db, goat_client).await {
         warn!("instance_window_expiration_monitor, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = instance_expiration_monitor(local_db, btc_client).await
-    {
+    if let Err(err) = instance_expiration_monitor(local_db, btc_client).await {
         warn!("instance_expiration_monitor, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = instance_btc_tx_monitor(local_db, btc_client).await
-    {
+    if let Err(err) = instance_btc_tx_monitor(local_db, btc_client).await {
         warn!("instance_btc_tx_monitor, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = scan_obsolete_sibling_graphs(local_db).await
-    {
+    if let Err(err) = scan_obsolete_sibling_graphs(local_db).await {
         warn!("scan_obsolete_sibling_graphs, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = detect_init_withdraw_call(local_db).await
-    {
+    if let Err(err) = detect_init_withdraw_call(local_db).await {
         warn!("detect_init_withdraw_call, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = detect_kickoff(local_db, btc_client).await
-    {
+    if let Err(err) = detect_kickoff(local_db, btc_client).await {
         warn!("detect_kickoff, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = detect_take1_or_challenge(local_db, btc_client).await
-    {
+    if let Err(err) = detect_take1_or_challenge(local_db, btc_client).await {
         warn!("detect_take1_or_challenge, err {:?}", err)
     }
 
-    if [Actor::Committee, Actor::Operator].contains(&actor)
-        && let Err(err) = process_graph_challenge(local_db, btc_client).await
-    {
+    if let Err(err) = process_graph_challenge(local_db, btc_client).await {
         warn!("process_grpah_challenge, err {:?}", err)
     }
     Ok(())

@@ -31,7 +31,7 @@ use goat::connectors::{
 };
 use goat::contexts::base::generate_n_of_n_public_key;
 use goat::disprove_scripts::hash160;
-use goat::scripts::{generate_burn_script_address, generate_opreturn_script};
+use goat::scripts::generate_opreturn_script;
 use goat::transactions::base::Input;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::signing::populate_p2wsh_witness;
@@ -40,6 +40,7 @@ use rand::Rng;
 use secp256k1::Secp256k1;
 
 use anyhow::{Result, anyhow, bail};
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
 use goat::transactions::prekickoff::PrekickoffTransaction;
 use indexmap::IndexMap;
@@ -85,34 +86,50 @@ pub mod todo_funcs {
     // db operations
     // proof network
     pub async fn get_watchtower_proof(instance_id: Uuid, graph_id: Uuid) -> Result<Vec<u8>> {
-        todo!("get watchtower proof from proof network")
+        Ok(b"watchtower_proof".to_vec())
     }
     pub async fn get_operator_proof_blockhash(
         instance_id: Uuid,
         graph_id: Uuid,
     ) -> Result<[u8; 32]> {
-        todo!("get blockhash used for operator proof")
+        Ok([0xbbu8; 32])
     }
     pub async fn get_operator_proof(
         instance_id: Uuid,
         graph_id: Uuid,
     ) -> Result<(GuestInputs, Groth16Proof, PublicInputs, VerifyingKey)> {
-        todo!("get operator proof from proof network")
+        let proof = hex::decode(
+            "b6ef2c5aa48a2f599a13bc4d8010e4d0190aeb05ff79e21266aff8dde6353d1756191f0959c787f6dedfc0c47751aed2648775101285b9da2d6c4e912e74891f884bd672f94f4d78528fb10b5410a94b53bcef07f99952ef72b68c72a5c4ff2a3de7c314ffbf17df018a753f070448c2f698706d4c2b99bdb06f928cffe1bea0",
+        )?;
+        let pis = hex::decode(
+            "02000000000000002000000000000000721db33a295a3b29a61c7360486e6d8346288822dc5cab652722e34d4b423d002000000000000000cfdc2f035c3699c6d17563570ea05a3d6d08302487937dd079a6b1671d484c0d",
+        )?;
+        let proof = goat::proof::deserialize_proof(proof);
+        let pis = goat::proof::deserialize_pubin(pis);
+        let pk = get_operator_proof_vk(instance_id, graph_id).await?;
+        let guest_inputs = [
+            get_guest_constant_value(instance_id, graph_id).await?,
+            [0xffu8; 32], // use [0u8; 32] to test non-inclusion challenge
+        ];
+        Ok((guest_inputs, proof, pis, pk))
     }
     pub async fn get_operator_proof_vk(instance_id: Uuid, graph_id: Uuid) -> Result<VerifyingKey> {
-        todo!("get vk for operator proof")
+        let zkm_v1_vk_bytes = hex::decode(
+            "e2f26dbea299f5223b646cb1fb33eadb059d9407559d7441dfd902e3a79a4d2dabb73dc17fbc13021e2471e0c08bd67d8401f52b73d6d07483794cad4778180e0c06f33bbc4c79a9cadef253a68084d382f17788f885c9afd176f7cb2f036789edf692d95cbdde46ddda5ef7d422436779445c5e66006a42761e1f12efde0018c212f3aeb785e49712e7a9353349aaf1255dfb31b7bf60723a480d9293938e19ffdb10cf9f7e2b08673477187c33a695a397702cf22005900724518b57f92f2ce08f8dfe36ca3eff63b1743d64812936d8cab0d74c063d260e20a9a3339b2a8c0300000000000000d17e1efc51d15eef04bde8dc794edc9e5788eb7539171d3a49d970ab9215b89c9ab6c5ab119ca81927393ef29332a1d15ac5f197b878ea89a1f8f686b747011eaad636dcb52cdfd674d155ddd67d21186fbdd1c0a62ebd74dcd6ddc6784b819e",
+        )?;
+        Ok(goat::proof::deserialize_vk(zkm_v1_vk_bytes))
     }
     pub async fn get_guest_constant_value(instance_id: Uuid, graph_id: Uuid) -> Result<[u8; 32]> {
-        Ok([0u8; 32])
+        Ok([0xccu8; 32])
     }
 
     // other operations
     pub fn avg_block_time_secs(network: Network) -> u64 {
         match network {
             Network::Bitcoin => 600, // 10 minutes
-            Network::Testnet => 300, // 5 minutes
+            Network::Testnet => 60,  // 1 minute
             Network::Regtest => 60,  // 1 minute
-            Network::Signet => 300,  // 5 minutes
+            Network::Signet => 60,   // 1 minute
             _ => 600,                // default to 10 minutes
         }
     }
@@ -358,7 +375,13 @@ pub mod todo_funcs {
         Ok(operator_master_key.preimage_for_graph(graph_id, index))
     }
     pub async fn broadcast_nonstandard_tx(btc_client: &BTCClient, tx: &Transaction) -> Result<()> {
-        todo!("broadcast non-standard tx")
+        match broadcast_tx(btc_client, tx).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!("broadcast_nonstandard_tx not implemented yet: {} , Skipped", e);
+                Ok(())
+            }
+        }
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -407,17 +430,7 @@ pub(crate) async fn refresh_graph(
     // check if Graph has been posted on GoatChain
     if current_status == GraphStatus::CommitteePresigned {
         let graph_data_on_goat = goat_client.gateway_get_graph_data(&graph_id).await?;
-        if graph_data_on_goat.operator_pubkey == [0u8; 32] {
-            update_graph_status(
-                local_db,
-                instance_id,
-                graph_id,
-                GraphStatus::CommitteePresigned,
-                None,
-            )
-            .await?;
-            return Ok((GraphStatus::CommitteePresigned, None));
-        } else {
+        if graph_data_on_goat.operator_pubkey != [0u8; 32] {
             current_status = GraphStatus::OperatorDataPushed;
         }
     }
@@ -434,15 +447,24 @@ pub(crate) async fn refresh_graph(
     }
     // check Prekickoff
     let prekickoff_txid = graph.cur_prekickoff.tx().compute_txid();
-    if matches!(current_status, GraphStatus::OperatorDataPushed | GraphStatus::Obsoleted) {
+    if matches!(
+        current_status,
+        GraphStatus::CommitteePresigned | GraphStatus::OperatorDataPushed | GraphStatus::Obsoleted
+    ) {
         if !tx_on_chain(btc_client, &prekickoff_txid).await? {
             update_graph_status(local_db, instance_id, graph_id, current_status.clone(), None)
                 .await?;
             return Ok((current_status, None));
         } else {
-            current_status = if current_status != GraphStatus::Obsoleted {
+            current_status = if current_status == GraphStatus::OperatorDataPushed {
                 GraphStatus::PreKickoff
             } else {
+                // for GraphStatus::CommitteePresigned: if prekickoff is on-chain while graph data not yet posted,
+                // it means this graph will never be posted and operator is going to skip it,
+                // mark it as Obsoleted so that it can be skipped later
+                //
+                // for GraphStatus::Obsoleted: if the graph is obsoleted,
+                // keep it as Obsoleted so that it can be skipped later
                 GraphStatus::Obsoleted
             };
         }
@@ -985,7 +1007,7 @@ pub async fn get_disprove_scripts(
 pub async fn get_fee_rate(client: &BTCClient) -> Result<f64> {
     match client.network() {
         //TODO mempool api /fee-estimates failed, fix it latter
-        Network::Testnet | Network::Regtest => Ok(10.0),
+        Network::Testnet | Network::Regtest => Ok(2.0),
         _ => {
             let res = client.get_fee_estimates().await?;
             Ok(*res.get(&DEFAULT_CONFIRMATION_TARGET).ok_or(anyhow!(
@@ -1559,18 +1581,38 @@ pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut Bitvm2Graph) -
         build_cpfp_txns(btc_client, &kickoff_tx, anchor_vout, kickoff_tx_total_input_amount)
             .await?;
 
-    broadcast_package(btc_client, &[prekickoff_tx, kickoff_tx]).await?;
+    // If a tx is already on-chain, skip rebroadcasting and move to the next one.
+    let mut kickoff_child_broadcasted = false;
+    if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+        // Parent not on-chain yet: broadcast parent and kickoff together as a package.
+        broadcast_package(btc_client, &[prekickoff_tx, kickoff_tx]).await?;
+    } else if !tx_on_chain(btc_client, &kickoff_txid).await? {
+        // Parent is on-chain, but kickoff isn't: try kickoff (and its CPFP child if present).
+        if let Some(child) = kickoff_child_tx.as_ref() {
+            broadcast_package(btc_client, &[kickoff_tx, child.clone()]).await?;
+            kickoff_child_broadcasted = true;
+        } else {
+            broadcast_tx(btc_client, &kickoff_tx).await?;
+        }
+    }
+
+    // Ensure both transactions are seen on-chain and then handle CPFP children.
     if !tx_on_chain(btc_client, &prekickoff_txid).await? {
         bail!("prekickoff tx not on chain after broadcasting");
     }
-    if let Some(prekickoff_child_tx) = prekickoff_child_tx {
-        broadcast_tx(btc_client, &prekickoff_child_tx).await?;
+    if let Some(prekickoff_child_tx) = prekickoff_child_tx
+        && let Err(e) = broadcast_tx(btc_client, &prekickoff_child_tx).await
+    {
+        tracing::warn!("failed to broadcast prekickoff child tx: {e}");
     }
     if !tx_on_chain(btc_client, &kickoff_txid).await? {
         bail!("kickoff tx not on chain after broadcasting");
     }
-    if let Some(kickoff_child_tx) = kickoff_child_tx {
-        broadcast_tx(btc_client, &kickoff_child_tx).await?;
+    if !kickoff_child_broadcasted
+        && let Some(kickoff_child_tx) = kickoff_child_tx
+        && let Err(e) = broadcast_tx(btc_client, &kickoff_child_tx).await
+    {
+        tracing::warn!("failed to broadcast kickoff child tx: {e}");
     }
     Ok(())
 }
@@ -2001,10 +2043,13 @@ pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<
         .upsert_node(Node {
             peer_id: node_info.peer_id.clone(),
             actor: node_info.actor.clone(),
+            node_name: node_info.node_name.clone(),
             goat_addr: node_info.goat_addr.clone(),
             btc_pub_key: node_info.btc_pub_key.clone(),
             socket_addr: node_info.socket_addr.clone(),
             reward: 0,
+            service_fee_rate: node_info.service_fee_rate,
+            available_peg_btc: node_info.available_peg_btc,
             updated_at: current_time,
             created_at: current_time,
         })
@@ -2109,13 +2154,6 @@ pub async fn set_node_external_socket_addr_env(rpc_addr: &str) -> Result<()> {
         }
     }
     Ok(())
-}
-// TODO
-pub fn get_fixed_disprove_output() -> Result<TxOut> {
-    Ok(TxOut {
-        script_pubkey: generate_burn_script_address(get_network()).script_pubkey(),
-        value: Amount::from_sat(DUST_AMOUNT),
-    })
 }
 
 pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
@@ -2315,8 +2353,12 @@ pub async fn get_instance_parameters(
     instance_id: Uuid,
 ) -> Result<Option<Bitvm2InstanceParameters>> {
     let mut storage_processor = local_db.acquire().await?;
-    if let Some(data_str) = storage_processor.get_instance_parameters_by_id(&instance_id).await? {
-        Ok(Some(serde_json::from_str(&data_str)?))
+    if let Some(instance) = storage_processor.find_instance(&instance_id).await? {
+        Ok(if let Some(parameters) = instance.parameters {
+            Some(serde_json::from_str(&parameters)?)
+        } else {
+            gen_instance_parameters_local(&instance).ok()
+        })
     } else {
         Ok(None)
     }
@@ -2437,7 +2479,8 @@ pub async fn get_latest_pegout_finalized_graph(
     operator_pubkey: &PublicKey,
 ) -> Result<Option<(u64, Uuid)>> {
     // get latest pegout finalized graph nonce & id from local db
-    let statuses: Vec<String> = vec![];
+    let statuses: Vec<String> =
+        GraphStatus::get_closed_status().iter().map(|status| status.to_string()).collect();
     let mut storage_processor = local_db.acquire().await?;
     let graphs = storage_processor
         .get_operator_graphs(
@@ -2881,4 +2924,62 @@ pub async fn get_graph_ids_for_instance(
     let mut storage_processor = local_db.acquire().await?;
     let graphs = storage_processor.get_graphs_by_instance_id(&instance_id).await?;
     Ok(graphs.into_iter().map(|v| v.graph_id).collect())
+}
+
+pub fn gen_instance_parameters_local(
+    instance: &Instance,
+) -> anyhow::Result<Bitvm2InstanceParameters> {
+    let network = Network::from_str(&instance.network)?;
+    let committee_pubkeys: Vec<PublicKey> = instance
+        .committees_answers
+        .iter()
+        .map(|(_k, v)| PublicKey::from_slice(v).unwrap())
+        .collect();
+
+    let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
+    let utxos: Vec<client::Utxo> = serde_json::from_str(&instance.input_utxos)?;
+    Ok(Bitvm2InstanceParameters {
+        network,
+        instance_id: instance.instance_id,
+        user_info: gen_user_info(
+            network,
+            &instance.to_addr,
+            &instance.user_change_addr.clone(),
+            &instance.user_refund_addr.clone(),
+            utxos,
+            instance.fees.0,
+            &instance.user_xonly_pubkey.0,
+        )?,
+        pegin_amount: Amount::from_sat(instance.amount as u64),
+        committee_pubkeys,
+        committee_agg_pubkey,
+    })
+}
+
+fn gen_user_info(
+    network: Network,
+    depositor_evm_address: &str,
+    user_change_addr: &str,
+    user_refund_addr: &str,
+    utxos: Vec<client::Utxo>,
+    txn_fees: [u64; 3],
+    user_xonly_pubkey: &[u8; 32],
+) -> anyhow::Result<UserInfo> {
+    let user_change_address: Address<NetworkUnchecked> = Address::from_str(user_change_addr)?;
+    let user_refund_addr: Address<NetworkUnchecked> = Address::from_str(user_refund_addr)?;
+    let inputs = utxos
+        .into_iter()
+        .map(|utxo| Input {
+            outpoint: OutPoint { txid: Txid::from_slice(&utxo.txid).unwrap(), vout: utxo.vout },
+            amount: Amount::from_sat(utxo.amount_stats),
+        })
+        .collect();
+    Ok(UserInfo {
+        depositor_evm_address: EvmAddress::from_str(depositor_evm_address)?.into_array(),
+        txn_fees,
+        inputs,
+        user_xonly_pubkey: XOnlyPublicKey::from_slice(user_xonly_pubkey)?,
+        user_change_address: user_change_address.require_network(network)?,
+        user_refund_address: user_refund_addr.require_network(network)?,
+    })
 }

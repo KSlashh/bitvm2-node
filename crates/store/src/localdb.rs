@@ -391,7 +391,7 @@ pub struct GraphUpdate {
     pub challenge_txid: Option<SerializableTxid>,
     pub disprove_txid: Option<SerializableTxid>,
     pub bridge_out_start_at: Option<i64>,
-    pub init_withdraw_txid: Option<String>,
+    pub init_withdraw_tx_hash: Option<String>,
 }
 
 impl GraphUpdate {
@@ -405,7 +405,7 @@ impl GraphUpdate {
             challenge_txid: None,
             disprove_txid: None,
             bridge_out_start_at: None,
-            init_withdraw_txid: None,
+            init_withdraw_tx_hash: None,
         }
     }
 
@@ -445,8 +445,8 @@ impl GraphUpdate {
     }
 
     /// Set init withdraw transaction ID
-    pub fn with_init_withdraw_txid(mut self, init_withdraw_txid: String) -> Self {
-        self.init_withdraw_txid = Some(init_withdraw_txid);
+    pub fn with_init_withdraw_tx_hash(mut self, init_withdraw_tx_hash: String) -> Self {
+        self.init_withdraw_tx_hash = Some(init_withdraw_tx_hash);
         self
     }
 
@@ -457,7 +457,7 @@ impl GraphUpdate {
             || self.ipfs_base_url.is_some()
             || self.challenge_txid.is_some()
             || self.bridge_out_start_at.is_some()
-            || self.init_withdraw_txid.is_some()
+            || self.init_withdraw_tx_hash.is_some()
             || self.disprove_txid.is_some()
     }
 
@@ -482,13 +482,15 @@ impl GraphUpdate {
         if let Some(bridge_out_start_at) = self.bridge_out_start_at {
             query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
         }
-        if let Some(ref init_withdraw_txid) = self.init_withdraw_txid {
-            if init_withdraw_txid.is_empty() {
+        if let Some(ref init_withdraw_tx_hash) = self.init_withdraw_tx_hash {
+            if init_withdraw_tx_hash.is_empty() {
                 // Set NULL value
-                query_builder.set_field_null("init_withdraw_txid");
+                query_builder.set_field_null("init_withdraw_tx_hash");
             } else {
-                query_builder
-                    .set_field("init_withdraw_txid", QueryParam::Text(init_withdraw_txid.clone()));
+                query_builder.set_field(
+                    "init_withdraw_tx_hash",
+                    QueryParam::Text(init_withdraw_tx_hash.clone()),
+                );
             }
         }
         // Add update time
@@ -1191,7 +1193,7 @@ impl<'a> StorageProcessor<'a> {
             pub next_prekickoff: SerializableTxid,
         }
         let res = sqlx::query_as::<_, NextPrekickoffRow>(
-            "SELECT next_prekickoff FROM graph WHERE cur_prekickoff_txid  = ?",
+            "SELECT graph_id,  instance_id,  cur_prekickoff_txid, next_prekickoff FROM graph WHERE cur_prekickoff_txid  = ?",
         )
         .bind(current_pre_kickoff)
         .fetch_optional(self.conn())
@@ -1327,20 +1329,26 @@ impl<'a> StorageProcessor<'a> {
     pub async fn upsert_node(&mut self, node: Node) -> anyhow::Result<u64> {
         let res = sqlx::query!(
             r#"
-            INSERT INTO node (peer_id, actor, goat_addr, btc_pub_key, socket_addr, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (peer_id) DO UPDATE SET
-                actor = excluded.actor,
-                goat_addr = excluded.goat_addr,
-                btc_pub_key = excluded.btc_pub_key,
-                socket_addr = excluded.socket_addr,
-                updated_at = excluded.updated_at
+            INSERT INTO node (peer_id, node_name, actor, goat_addr, btc_pub_key, socket_addr, service_fee_rate, available_peg_btc,
+                              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (peer_id) DO UPDATE SET actor             = excluded.actor,
+                                                node_name         = excluded.node_name,
+                                                goat_addr         = excluded.goat_addr,
+                                                btc_pub_key       = excluded.btc_pub_key,
+                                                service_fee_rate       = excluded.service_fee_rate,
+                                                available_peg_btc = excluded.available_peg_btc,
+                                                socket_addr       = excluded.socket_addr,
+                                                updated_at        = excluded.updated_at
             "#,
             node.peer_id,
+            node.node_name,
             node.actor,
             node.goat_addr,
             node.btc_pub_key,
             node.socket_addr,
+            node.service_fee_rate,
+            node.available_peg_btc,
             node.created_at,
             node.updated_at,
         )
@@ -1366,26 +1374,28 @@ impl<'a> StorageProcessor<'a> {
         Ok(())
     }
 
+    pub async fn add_node_peg_btc_by_addr(
+        &mut self,
+        goat_addr: &str,
+        peg_btc: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query!(
+            r#"UPDATE node SET available_peg_btc = ? WHERE goat_addr = ?"#,
+            peg_btc,
+            goat_addr
+        )
+        .execute(self.conn())
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_node_by_btc_pub_key(
         &mut self,
         btc_pub_key: &str,
     ) -> anyhow::Result<Option<Node>> {
-        Ok(sqlx::query_as!(
-            Node,
-            "SELECT peer_id,
-                    actor,
-                    goat_addr,
-                    btc_pub_key,
-                    socket_addr,
-                    reward,
-                    created_at,
-                    updated_at
-             FROM node
-             WHERE btc_pub_key = ?",
-            btc_pub_key
-        )
-        .fetch_optional(self.conn())
-        .await?)
+        Ok(sqlx::query_as!(Node, r#"SELECT *  FROM node WHERE btc_pub_key = ?"#, btc_pub_key)
+            .fetch_optional(self.conn())
+            .await?)
     }
 
     pub async fn find_nodes(&mut self, params: &NodeQuery) -> anyhow::Result<(Vec<Node>, i64)> {
@@ -1407,26 +1417,6 @@ impl<'a> StorageProcessor<'a> {
             nodes_query.fetch_all(self.conn()).await?,
             count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_nodes"),
         ))
-    }
-
-    pub async fn get_proof_server_node(&mut self) -> anyhow::Result<Option<Node>> {
-        Ok(sqlx::query_as!(
-            Node,
-            "SELECT peer_id,
-                    actor,
-                    goat_addr,
-                    btc_pub_key,
-                    socket_addr,
-                    reward,
-                    created_at,
-                    updated_at
-             FROM node
-             WHERE socket_addr != ''
-             ORDER BY updated_at DESC
-             LIMIT 1",
-        )
-        .fetch_optional(self.conn())
-        .await?)
     }
 
     pub async fn node_overview(&mut self, time_threshold: i64) -> anyhow::Result<NodesOverview> {
@@ -1468,22 +1458,9 @@ impl<'a> StorageProcessor<'a> {
     }
 
     pub async fn node_by_id(&mut self, peer_id: &str) -> anyhow::Result<Option<Node>> {
-        let res = sqlx::query_as!(
-            Node,
-            r#"SELECT peer_id,
-                    actor,
-                    goat_addr,
-                    btc_pub_key,
-                    socket_addr,
-                    reward,
-                    created_at,
-                    updated_at
-             FROM node
-             WHERE peer_id = ?"#,
-            peer_id
-        )
-        .fetch_optional(self.conn())
-        .await?;
+        let res = sqlx::query_as!(Node, r#"SELECT * FROM node WHERE peer_id = ?"#, peer_id)
+            .fetch_optional(self.conn())
+            .await?;
         Ok(res)
     }
 

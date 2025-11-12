@@ -26,7 +26,6 @@ pub const ENV_GOAT_SEQUENCER_SET_PUBLISHER_CONTRACT_ADDRESS: &str =
     "GOAT_SEQUENCER_SET_PUBLISHER_CONTRACT_ADDRESS";
 pub const ENV_GOAT_SEQUENCER_SET_MULTI_SIG_VERIFIER_ADDRESS: &str =
     "ENV_GOAT_SEQUENCER_SET_MULTI_SIG_VERIFIER_ADDRESS";
-/// Relayer
 pub const ENV_ENABLE_RELAYER: &str = "ENABLE_RELAYER";
 pub const ENV_GOAT_PRIVATE_KEY: &str = "GOAT_PRIVATE_KEY";
 
@@ -35,6 +34,10 @@ pub const ENV_GOAT_EVENT_FILTER_FROM: &str = "GOAT_EVENT_FILTER_FROM";
 pub const ENV_GOAT_EVENT_FILTER_GAP: &str = "GOAT_EVENT_FILTER_GAP";
 
 /// Operator Challenge
+pub const ENV_NODE_NAME: &str = "NODE_NAME";
+pub const DEFAULT_NODE_NAME: &str = "ZKM";
+pub const ENV_OPERATOR_NODE_SERVICE_FEE_RATE: &str = "OPERATOR_NODE_SERVICE_FEE";
+pub const DEFAULT_OPERATOR_NODE_SERVICE_FEE_RATE: f64 = 0.001;
 pub const ENV_GOAT_ADDRESS: &str = "GOAT_ADDRESS";
 /// Operator(private key), Relayer(private key),  Committee(seed)
 pub const ENV_BITVM_SECRET: &str = "BITVM_SECRET";
@@ -62,10 +65,10 @@ pub const CHEKSIG_P2TR_INPUT_VBYTES: u64 = 100;
 pub const P2WSH_OUTPUT_VBYTES: u64 = 50;
 pub const P2TR_OUTPUT_VBYTES: u64 = 50;
 pub const P2A_OUTPUT_VBYTES: u64 = 50;
-pub const PRE_KICKOFF_BASE_VBYTES: u64 = 200;
-pub const PEGIN_BASE_VBYTES: u64 = 200;
-pub const CHALLENGE_BASE_VBYTES: u64 = 200;
-pub const ANCHOR_CHILD_BASE_VBYTES: u64 = 100;
+pub const PRE_KICKOFF_BASE_VBYTES: u64 = 300;
+pub const PEGIN_BASE_VBYTES: u64 = 300;
+pub const CHALLENGE_BASE_VBYTES: u64 = 300;
+pub const ANCHOR_CHILD_BASE_VBYTES: u64 = 200;
 
 // reduce costs to facilitate testing
 pub const MIN_SATKE_AMOUNT: u64 = 4_000_000; // 0.04 BTC
@@ -91,7 +94,7 @@ pub const SYNC_GRAPH_INTERVAL: u64 = 3;
 pub const SYNC_GRAPH_MAX_WAIT_SECS: u64 = 30;
 
 // use to judge load history event thread is dead
-pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 3600;
+pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 600;
 
 pub const GATEWAY_RATE_MULTIPLIER: u64 = 10000;
 
@@ -271,6 +274,9 @@ pub fn get_local_node_info() -> NodeInfo {
         goat_addr: goat_address.unwrap_or("".to_string()),
         btc_pub_key: pubkey_str,
         socket_addr,
+        node_name: get_node_name(),
+        service_fee_rate: get_operator_node_service_fee_rate(),
+        available_peg_btc: 0,
     }
 }
 pub fn get_committee_member_num() -> usize {
@@ -325,7 +331,7 @@ pub fn get_goat_event_filter_from_from_env() -> i64 {
 
 pub fn get_goat_event_filter_gap_from_env() -> i64 {
     let event_filter_gap_str =
-        std::env::var(ENV_GOAT_EVENT_FILTER_GAP).unwrap_or("300".to_string());
+        std::env::var(ENV_GOAT_EVENT_FILTER_GAP).unwrap_or("1000".to_string());
     event_filter_gap_str
         .parse::<i64>()
         .unwrap_or_else(|_| panic!("Failed to parse {event_filter_gap_str} to address"))
@@ -343,7 +349,13 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
     let rpc_url = get_goat_url_from_env();
     let private_key = std::env::var(ENV_GOAT_PRIVATE_KEY).ok();
     let gateway_address = get_goat_address_from_env(ENV_GOAT_GATEWAY_CONTRACT_ADDRESS);
-    let (chain_id, committee_management_address, stake_management_address, btc_spv_address) = {
+    let (
+        chain_id,
+        committee_management_address,
+        stake_management_address,
+        btc_spv_address,
+        peg_btc_address,
+    ) = {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
         let chain_id = provider
             .get_chain_id()
@@ -351,21 +363,32 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
             .unwrap_or_else(|_| panic!("cannot get chain_id from {rpc_url}"))
             as u32;
 
-        let (committee_management_address, stake_management_address, btc_spv_address) =
-            if let Some(gateway_address) = gateway_address {
-                let (committee_management_address, stake_management_address, btc_spv_address) =
+        let (
+            committee_management_address,
+            stake_management_address,
+            btc_spv_address,
+            peg_btc_address,
+        ) = if let Some(gateway_address) = gateway_address {
+            let (committee_management_address, stake_management_address, btc_spv_address, peg_btc_address) =
                     get_gateway_relay_contracts(&provider, gateway_address).await.expect(
-                        "fail to get committee and stake management contract online addresses",
+                        "fail to get committee, stake management, btc spv, peg btc contract online addresses",
                     );
-                (
-                    Some(committee_management_address),
-                    Some(stake_management_address),
-                    Some(btc_spv_address),
-                )
-            } else {
-                (None, None, None)
-            };
-        (chain_id, committee_management_address, stake_management_address, btc_spv_address)
+            (
+                Some(committee_management_address),
+                Some(stake_management_address),
+                Some(btc_spv_address),
+                Some(peg_btc_address),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        (
+            chain_id,
+            committee_management_address,
+            stake_management_address,
+            btc_spv_address,
+            peg_btc_address,
+        )
     };
 
     GoatInitConfig {
@@ -382,6 +405,7 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
             ENV_GOAT_SEQUENCER_SET_MULTI_SIG_VERIFIER_ADDRESS,
         ),
         btc_spv_address,
+        peg_btc_address,
     }
 }
 
@@ -405,4 +429,18 @@ pub fn get_rpc_support_actors() -> Vec<Actor> {
 
 pub fn get_proof_server_url() -> Option<String> {
     std::env::var(ENV_PROOF_SEVER_URL).ok()
+}
+
+pub fn get_node_name() -> String {
+    std::env::var(ENV_NODE_NAME).unwrap_or(DEFAULT_NODE_NAME.to_owned())
+}
+
+pub fn get_operator_node_service_fee_rate() -> f64 {
+    if let Ok(service_fee) = std::env::var(ENV_OPERATOR_NODE_SERVICE_FEE_RATE)
+        && let Ok(fee) = service_fee.parse::<f64>()
+    {
+        fee
+    } else {
+        DEFAULT_OPERATOR_NODE_SERVICE_FEE_RATE
+    }
 }

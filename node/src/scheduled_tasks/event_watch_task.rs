@@ -7,9 +7,9 @@ use client::goat_chain::GOATClient;
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
     BlockRange, BridgeInEvent, BridgeInRequestEvent, CancelWithdrawEvent, CommitteeResponseEvent,
-    GatewayEventEntity, InitWithdrawEvent, ProceedWithdrawEvent, UserGraphWithdrawEvent,
-    WithdrawDisprovedEvent, WithdrawHappyEvent, WithdrawPathsEvent, WithdrawUnhappyEvent,
-    get_gateway_events_query,
+    GatewayEventEntity, InitWithdrawEvent, PostGraphDataEvent, ProceedWithdrawEvent,
+    UserGraphWithdrawEvent, WithdrawDisprovedEvent, WithdrawHappyEvent, WithdrawPathsEvent,
+    WithdrawUnhappyEvent, get_gateway_events_query,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::localdb::{GraphUpdate, LocalDB, StorageProcessor};
 use store::{
-    GoatTxProcessingStatus, GoatTxRecord, GoatTxType, InstanceStatus, WatchContract,
+    GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, InstanceStatus, WatchContract,
     WatchContractStatus,
 };
 use tokio::time::sleep;
@@ -48,6 +48,7 @@ pub async fn fetch_and_handle_block_range_events<'a>(
     let mut bridge_in_request_events: Vec<BridgeInRequestEvent> = vec![];
     let mut committee_response_events: Vec<CommitteeResponseEvent> = vec![];
     let mut bridge_in_events: Vec<BridgeInEvent> = vec![];
+    let mut post_graph_data_events: Vec<PostGraphDataEvent> = vec![];
     for event_entity in event_entities {
         let entity = event_entity.clone();
         if let Some(value_vec) = query_res[entity.to_string()].as_array() {
@@ -94,13 +95,17 @@ pub async fn fetch_and_handle_block_range_events<'a>(
                     bridge_in_events =
                         serde_json::from_value(serde_json::Value::Array(value_vec.clone()))?;
                 }
+                GatewayEventEntity::PostGraphDatas => {
+                    post_graph_data_events =
+                        serde_json::from_value(serde_json::Value::Array(value_vec.clone()))?;
+                }
             };
         }
     }
     info!(
         "get user init withdraw events: {}, cancel withdraw events: {}, proceed_withdraw_events: {}, \
          withdraw_paths_events: {},  withdraw_disproved_events: {}, bridge_in_request_events: {}  \
-         committee_response_events: {}, bridge_in_events: {} block range {from_height}:{to_height}",
+         committee_response_events: {}, bridge_in_events: {}  post_graph_data_events: {} block range {from_height}:{to_height}",
         init_withdraw_events.len(),
         cancel_withdraw_events.len(),
         proceed_withdraw_events.len(),
@@ -108,7 +113,8 @@ pub async fn fetch_and_handle_block_range_events<'a>(
         withdraw_disproved_events.len(),
         bridge_in_request_events.len(),
         committee_response_events.len(),
-        bridge_in_events.len()
+        bridge_in_events.len(),
+        post_graph_data_events.len(),
     );
     handle_user_withdraw_events(storage_processor, init_withdraw_events, cancel_withdraw_events)
         .await?;
@@ -119,6 +125,7 @@ pub async fn fetch_and_handle_block_range_events<'a>(
     handle_bridge_in_request_events(storage_processor, bridge_in_request_events).await?;
     handle_committee_response_events(storage_processor, committee_response_events).await?;
     handle_bridge_in_events(storage_processor, bridge_in_events).await?;
+    handle_post_graph_data_events(storage_processor, post_graph_data_events).await?;
     Ok(())
 }
 
@@ -142,7 +149,7 @@ async fn handle_user_withdraw_events<'a>(
                     .update_graph_fields(
                         GraphUpdate::new(graph_id)
                             .with_bridge_out_start_at(current_time_secs())
-                            .with_init_withdraw_txid(init_event.transaction_hash.clone()),
+                            .with_init_withdraw_tx_hash(init_event.transaction_hash.clone()),
                     )
                     .await?;
                 storage_processor
@@ -167,7 +174,7 @@ async fn handle_user_withdraw_events<'a>(
                     .update_graph_fields(
                         GraphUpdate::new(graph_id)
                             .with_bridge_out_start_at(0)
-                            .with_init_withdraw_txid("".to_string()),
+                            .with_init_withdraw_tx_hash("".to_string()),
                     )
                     .await?;
                 storage_processor
@@ -233,22 +240,25 @@ async fn handle_withdraw_paths_events<'a>(
             continue;
         }
         storage_processor.add_node_reward_by_addr(&goat_addr.unwrap(), reward_add).await?;
-        let (graph_id, instance_id, tx_type) = match event.clone() {
+        let (graph_id, instance_id, tx_type, status) = match event.clone() {
             WithdrawPathsEvent::WithdrawHappyEvent(v) => (
                 v.graph_id.clone(),
                 v.instance_id.clone(),
                 GoatTxType::WithdrawHappyPath.to_string(),
+                GraphStatus::OperatorTake1.to_string(),
             ),
             WithdrawPathsEvent::WithdrawUnhappyEvent(v) => (
                 v.graph_id.clone(),
                 v.instance_id.clone(),
                 GoatTxType::WithdrawUnhappyPath.to_string(),
+                GraphStatus::OperatorTake2.to_string(),
             ),
         };
+        let graph_id = Uuid::from_str(&strip_hex_prefix_owned(&graph_id))?;
         storage_processor
             .upsert_goat_tx_record(&GoatTxRecord {
                 instance_id: Uuid::from_str(&strip_hex_prefix_owned(&instance_id))?,
-                graph_id: Uuid::from_str(&strip_hex_prefix_owned(&graph_id))?,
+                graph_id,
                 tx_type,
                 tx_hash: event.tx_hash(),
                 height: event.get_block_number(),
@@ -257,6 +267,9 @@ async fn handle_withdraw_paths_events<'a>(
                 extra: None,
                 created_at: current_time_secs(),
             })
+            .await?;
+        storage_processor
+            .update_graph_fields(GraphUpdate::new(graph_id).with_status(status))
             .await?;
     }
     Ok(())
@@ -267,6 +280,7 @@ async fn handle_withdraw_disproved_events<'a>(
     withdraw_disproved_events: Vec<WithdrawDisprovedEvent>,
 ) -> anyhow::Result<()> {
     for event in withdraw_disproved_events {
+        let graph_id = Uuid::from_str(&strip_hex_prefix_owned(&event.graph_id))?;
         let challenger_reward_add: i64 = event.challenger_amount_sats.parse::<i64>()?;
         let disprover_reward_add: i64 = event.disprover_amount_sats.parse::<i64>()?;
         let (flag, challenger_addr) = reflect_goat_address(Some(event.challenger_addr.clone()));
@@ -292,6 +306,11 @@ async fn handle_withdraw_disproved_events<'a>(
         storage_processor
             .add_node_reward_by_addr(&disprover_addr.unwrap(), disprover_reward_add)
             .await?;
+        storage_processor
+            .update_graph_fields(
+                GraphUpdate::new(graph_id).with_status(GraphStatus::Disprove.to_string()),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -301,8 +320,15 @@ async fn handle_bridge_in_request_events<'a>(
     bridge_in_request_events: Vec<BridgeInRequestEvent>,
 ) -> anyhow::Result<()> {
     for event in bridge_in_request_events {
-        // let instance = generate_instance_from_event(btc_client, &event).await?;
-        // storage_processor.upsert_instance(&instance).await?;
+        let current_time_secs = current_time_secs();
+        let processing_status = if let Ok(block_timestamp) = event.block_timestamp.parse::<i64>()
+            && (current_time_secs - 60 * 10) <= block_timestamp
+        {
+            GoatTxProcessingStatus::Pending.to_string()
+        } else {
+            GoatTxProcessingStatus::Skipped.to_string()
+        };
+
         storage_processor
             .upsert_goat_tx_record(&GoatTxRecord {
                 instance_id: Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?,
@@ -311,11 +337,11 @@ async fn handle_bridge_in_request_events<'a>(
                 tx_hash: event.transaction_hash.clone(),
                 height: event.block_number.parse::<i64>()?,
                 is_local: false,
-                processing_status: GoatTxProcessingStatus::Pending.to_string(),
+                processing_status,
                 extra: Some(serde_json::to_string(&event)?),
-                created_at: current_time_secs(),
+                created_at: current_time_secs,
             })
-            .await?
+            .await?;
     }
     Ok(())
 }
@@ -359,6 +385,24 @@ async fn handle_bridge_in_events<'a>(
         if let Ok(instance_id) = &Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id)) {
             storage_processor
                 .update_instance_status(instance_id, &InstanceStatus::RelayerL2Minted.to_string())
+                .await?;
+        } else {
+            warn!("failed to parse instance id:{event:?}");
+        }
+    }
+    Ok(())
+}
+async fn handle_post_graph_data_events<'a>(
+    storage_processor: &mut StorageProcessor<'a>,
+    post_graph_data_events: Vec<PostGraphDataEvent>,
+) -> anyhow::Result<()> {
+    for event in post_graph_data_events {
+        if let Ok(graph_id) = Uuid::from_str(&strip_hex_prefix_owned(&event.graph_id)) {
+            storage_processor
+                .update_graph_fields(
+                    GraphUpdate::new(graph_id)
+                        .with_status(GraphStatus::OperatorDataPushed.to_string()),
+                )
                 .await?;
         } else {
             warn!("failed to parse instance id:{event:?}");
@@ -468,15 +512,14 @@ pub async fn monitor_events(
         return Ok(());
     }
 
-    if watch_contract.from_height + watch_contract.gap < current_finalized {
-        if watch_contract.status == WatchContractStatus::Syncing.to_string()
-            && watch_contract.updated_at + LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS
-                > current_time_secs()
-        {
-            info!("Still in handle local event! will check later");
-            return Ok(());
-        }
+    if watch_contract.status == WatchContractStatus::Syncing.to_string()
+        && watch_contract.updated_at + LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS > current_time_secs()
+    {
+        info!("Event sync not finished ");
+        return Ok(());
+    }
 
+    if watch_contract.from_height + watch_contract.gap < current_finalized {
         let watch_contract_clone = watch_contract.clone();
         let local_db_clone = local_db.clone();
         let query_client_clone = query_client.clone();
@@ -495,10 +538,6 @@ pub async fn monitor_events(
         return Ok(());
     }
 
-    if watch_contract.status != WatchContractStatus::Synced.to_string() {
-        info!("Event sync not finished ");
-        return Ok(());
-    }
     let to_height = current_finalized.min(watch_contract.from_height + watch_contract.gap);
     let mut tx = local_db.start_transaction().await?;
     fetch_and_handle_block_range_events(
@@ -512,6 +551,7 @@ pub async fn monitor_events(
     .await?;
     info!("finish monitor event from: {}, to: {to_height}", watch_contract.from_height);
     watch_contract.from_height = to_height + 1;
+    watch_contract.status = WatchContractStatus::Synced.to_string();
     watch_contract.updated_at = current_time_secs();
     tx.upsert_watch_contract(&watch_contract).await?;
     tx.commit().await?;
@@ -536,11 +576,51 @@ pub async fn run_watch_event_task(
                 GatewayEventEntity::WithdrawUnhappyPaths,
                 GatewayEventEntity::WithdrawDisproveds,
                 GatewayEventEntity::BridgeInRequests,
+                GatewayEventEntity::BridgeIns,
+                GatewayEventEntity::PostGraphDatas,
             ],
         ),
         (
             Actor::Operator,
-            vec![GatewayEventEntity::ProceedWithdraws, GatewayEventEntity::BridgeInRequests],
+            vec![
+                GatewayEventEntity::InitWithdraws,
+                GatewayEventEntity::CancelWithdraws,
+                GatewayEventEntity::ProceedWithdraws,
+                GatewayEventEntity::WithdrawHappyPaths,
+                GatewayEventEntity::WithdrawUnhappyPaths,
+                GatewayEventEntity::WithdrawDisproveds,
+                GatewayEventEntity::BridgeInRequests,
+                GatewayEventEntity::BridgeIns,
+                GatewayEventEntity::PostGraphDatas,
+            ],
+        ),
+        (
+            Actor::Challenger,
+            vec![
+                GatewayEventEntity::InitWithdraws,
+                GatewayEventEntity::CancelWithdraws,
+                GatewayEventEntity::ProceedWithdraws,
+                GatewayEventEntity::WithdrawHappyPaths,
+                GatewayEventEntity::WithdrawUnhappyPaths,
+                GatewayEventEntity::WithdrawDisproveds,
+                GatewayEventEntity::BridgeInRequests,
+                GatewayEventEntity::BridgeIns,
+                GatewayEventEntity::PostGraphDatas,
+            ],
+        ),
+        (
+            Actor::Watchtower,
+            vec![
+                GatewayEventEntity::InitWithdraws,
+                GatewayEventEntity::CancelWithdraws,
+                GatewayEventEntity::ProceedWithdraws,
+                GatewayEventEntity::WithdrawHappyPaths,
+                GatewayEventEntity::WithdrawUnhappyPaths,
+                GatewayEventEntity::WithdrawDisproveds,
+                GatewayEventEntity::BridgeInRequests,
+                GatewayEventEntity::BridgeIns,
+                GatewayEventEntity::PostGraphDatas,
+            ],
         ),
     ]);
     loop {
@@ -573,14 +653,28 @@ async fn get_watch_contract<'a>(
     storage_processor: &mut StorageProcessor<'a>,
 ) -> anyhow::Result<WatchContract> {
     let addr = env::get_goat_gateway_contract_from_env().to_string();
-    if let Some(watch_contract) = storage_processor.get_watch_contract(&addr).await? {
+    let from_height = env::get_goat_event_filter_from_from_env();
+    let the_graph_url = env::get_goat_event_the_graph_url_from_env();
+    let gap = env::get_goat_event_filter_gap_from_env();
+
+    if let Some(mut watch_contract) = storage_processor.get_watch_contract(&addr).await? {
+        if from_height > watch_contract.from_height {
+            watch_contract.from_height = from_height;
+        }
+        if the_graph_url != watch_contract.the_graph_url {
+            watch_contract.the_graph_url = the_graph_url;
+        }
+
+        if gap != watch_contract.gap {
+            watch_contract.gap = gap
+        }
         Ok(watch_contract)
     } else {
         Ok(WatchContract {
             addr,
-            the_graph_url: env::get_goat_event_the_graph_url_from_env(),
-            gap: env::get_goat_event_filter_gap_from_env(),
-            from_height: env::get_goat_event_filter_from_from_env(),
+            the_graph_url,
+            gap,
+            from_height,
             status: WatchContractStatus::UnSync.to_string(),
             extra: None,
             updated_at: current_time_secs(),

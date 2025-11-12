@@ -51,8 +51,8 @@ pub struct InstanceExtended {
     pub instance: Instance,
     pub utxo: Vec<Utxo>,
     pub waiting_time_in_mins: i64,
-    // pub confirmations: u32,
-    // pub target_confirmations: u32,
+    pub confirmations: u32,
+    pub target_confirmations: u32,
     pub status_extra: StatusExtra,
 }
 
@@ -174,11 +174,11 @@ impl From<GraphQueryParams> for GraphQuery {
         if is_bridge_out && statuses.is_empty() {
             raw_conditions.push(
                 "( status NOT IN ('OperatorPresigned','CommitteePresigned', 'OperatorDataPushed') OR \
-                 (status = 'OperatorDataPushed'  AND init_withdraw_txid IS NOT NULL ) )".to_string()
+                 (status = 'OperatorDataPushed'  AND init_withdraw_tx_hash IS NOT NULL ) )".to_string()
             );
         }
         if is_init_withdraw_not_null {
-            raw_conditions.push("init_withdraw_txid IS NOT NULL".to_string());
+            raw_conditions.push("init_withdraw_tx_hash IS NOT NULL".to_string());
         }
 
         GraphQuery {
