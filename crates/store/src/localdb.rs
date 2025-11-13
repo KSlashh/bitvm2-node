@@ -1544,6 +1544,25 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.rows_affected() > 0)
     }
 
+    pub async fn update_messages_lock_time_until(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        lock_time_until: i64,
+    ) -> anyhow::Result<bool> {
+        let current_time = get_current_timestamp_secs();
+        let res = sqlx::query!(
+            "Update  message Set lock_time_until = ?, updated_at = ? WHERE message_id = ? AND  message_version = ?",
+            lock_time_until,
+            current_time,
+            message_id,
+            message_version
+
+        ).execute(self.conn()).await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn set_messages_expired(&mut self, expired: i64) -> anyhow::Result<()> {
         sqlx::query!(
             r#"UPDATE message
@@ -1562,6 +1581,31 @@ impl<'a> StorageProcessor<'a> {
             .execute(self.conn())
             .await?;
         Ok(())
+    }
+
+    pub async fn find_messages_by_id(
+        &mut self,
+        message_id: &str,
+    ) -> anyhow::Result<Option<Message>> {
+        let res = sqlx::query_as!(
+            Message,
+            "SELECT message_id,
+                    business_id AS \"business_id:Uuid\",
+                    from_peer,
+                    actor,
+                    msg_type,
+                    content,
+                    message_version,
+                    state,
+                    weight,
+                    lock_time_until
+             FROM message
+             WHERE message_id = ?",
+            message_id,
+        )
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
     }
 
     pub async fn filter_messages(
@@ -3100,10 +3144,11 @@ impl<'a> StorageProcessor<'a> {
         let res = sqlx::query!(
             r#"
             INSERT OR REPLACE INTO graph_btc_tx_vout_monitor
-            (graph_id, txid, height, vout_len, monitor_data, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (graph_id, tx_name, txid, height, vout_len, monitor_data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             monitor.graph_id,
+            monitor.tx_name,
             monitor.txid,
             monitor.height,
             monitor.vout_len,
@@ -3127,6 +3172,7 @@ impl<'a> StorageProcessor<'a> {
             r#"
             SELECT
                 graph_id AS "graph_id: Uuid",
+                tx_name,
                 txid AS "txid: SerializableTxid",
                 height,
                 vout_len,
@@ -3148,6 +3194,7 @@ impl<'a> StorageProcessor<'a> {
     pub async fn update_graph_btc_tx_vout_monitor_data(
         &mut self,
         graph_id: &Uuid,
+        txid: &SerializableTxid,
         monitor_data: String,
     ) -> anyhow::Result<u64> {
         let current_time = get_current_timestamp_secs();
@@ -3155,10 +3202,11 @@ impl<'a> StorageProcessor<'a> {
             "UPDATE graph_btc_tx_vout_monitor
              SET monitor_data = ?,
                  updated_at   = ?
-             WHERE graph_id = ?",
+             WHERE graph_id = ? AND txid = ?",
             monitor_data,
             current_time,
             graph_id,
+            txid
         )
         .execute(self.conn())
         .await?;

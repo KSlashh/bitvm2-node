@@ -350,7 +350,19 @@ pub async fn handle_self_p2p_msg(
                     .await?;
             }
             Err(err) => {
-                warn!("fail to process message:{}: {}", message.message_id, err);
+                let lock_time = 600;
+                warn!(
+                    "fail to process message:{}: {} will lock seconds {lock_time}",
+                    message.message_id, err
+                );
+                let mut storage_processor = local_db.acquire().await?;
+                storage_processor
+                    .update_messages_lock_time_until(
+                        &message.message_id,
+                        message.message_version,
+                        current_time_secs() + lock_time,
+                    )
+                    .await?;
             }
         }
     }
@@ -3709,8 +3721,9 @@ pub async fn push_local_unhandled_messages(
     let mut storage_processor = local_db.acquire().await?;
     let actor = message.actor.clone();
     let content: GOATMessageContent = message.to_typed()?;
-    create_message(
+    upsert_message(
         &mut storage_processor,
+        true,
         business_id,
         None,
         "Self".to_string(),
