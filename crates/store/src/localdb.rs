@@ -1,5 +1,3 @@
-use crate::schema::NODE_STATUS_OFFLINE;
-use crate::schema::NODE_STATUS_ONLINE;
 use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
     CommitChainProof, CommitInfo, GoatTxRecord, Graph, GraphBtcTxVoutMonitor, GraphRawData,
@@ -511,8 +509,8 @@ impl GraphUpdate {
 pub struct NodeQuery {
     pub actor: Option<String>,
     pub goat_addr: Option<String>,
-    pub time_threshold: i64,
-    pub status_expect: Option<String>,
+    pub time_threshold: Option<i64>,
+    pub is_in_time_threshold: bool,
     pub order: Option<String>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
@@ -528,13 +526,9 @@ impl NodeQuery {
         self
     }
 
-    pub fn with_time_threshold(mut self, time_threshold: i64) -> Self {
-        self.time_threshold = time_threshold;
-        self
-    }
-
-    pub fn with_status_expect(mut self, status_expect: String) -> Self {
-        self.status_expect = Some(status_expect);
+    pub fn with_time_threshold(mut self, time_threshold: i64, is_in_time_threshold: bool) -> Self {
+        self.time_threshold = Some(time_threshold);
+        self.is_in_time_threshold = is_in_time_threshold;
         self
     }
 
@@ -570,17 +564,12 @@ impl NodeQuery {
         if let Some(goat_addr) = &self.goat_addr {
             query_builder.and_where("goat_addr = ?", Some(QueryParam::Text(goat_addr.clone())));
         }
-        if let Some(status_expect) = &self.status_expect {
-            match status_expect.as_str() {
-                NODE_STATUS_ONLINE => {
-                    query_builder
-                        .and_where("updated_at > ?", Some(QueryParam::Int(self.time_threshold)));
-                }
-                NODE_STATUS_OFFLINE => {
-                    query_builder
-                        .and_where("updated_at <= ?", Some(QueryParam::Int(self.time_threshold)));
-                }
-                _ => {}
+
+        if let Some(time_threshold) = &self.time_threshold {
+            if self.is_in_time_threshold {
+                query_builder.and_where("updated_at > ?", Some(QueryParam::Int(*time_threshold)));
+            } else {
+                query_builder.and_where("updated_at <= ?", Some(QueryParam::Int(*time_threshold)));
             }
         }
 
@@ -998,7 +987,7 @@ impl<'a> StorageProcessor<'a> {
     /// Returns:
     /// - Ok(affected_rows) number of rows affected by the operation
     /// - Err if the operation failed
-    pub async fn upsert_graph(&mut self, graph: Graph) -> anyhow::Result<u64> {
+    pub async fn upsert_graph(&mut self, graph: &Graph) -> anyhow::Result<u64> {
         let nack_txids_json = serde_json::to_string(&graph.nack_txids)?;
         let watchtower_challenge_timeout_txids_json =
             serde_json::to_string(&graph.watchtower_challenge_timeout_txids)?;
@@ -1195,9 +1184,9 @@ impl<'a> StorageProcessor<'a> {
         let res = sqlx::query_as::<_, NextPrekickoffRow>(
             "SELECT graph_id,  instance_id,  cur_prekickoff_txid, next_prekickoff FROM graph WHERE cur_prekickoff_txid  = ?",
         )
-        .bind(current_pre_kickoff)
-        .fetch_optional(self.conn())
-        .await?;
+            .bind(current_pre_kickoff)
+            .fetch_optional(self.conn())
+            .await?;
         Ok(res.map(|v| (v.graph_id, v.instance_id, v.cur_prekickoff_txid, v.next_prekickoff)))
     }
 
@@ -1325,8 +1314,40 @@ impl<'a> StorageProcessor<'a> {
         Ok(())
     }
 
+    pub async fn find_graph_neighbor_ids(
+        &mut self,
+        graph_id: Uuid,
+        range: i64,
+    ) -> anyhow::Result<Vec<(i64, Uuid)>> {
+        #[derive(sqlx::FromRow)]
+        struct GraphIds {
+            pub graph_id: Uuid,
+            pub kickoff_index: i64,
+        }
+        if let Some(graph) = self.find_graph(&graph_id).await? {
+            let start = 0.max(graph.kickoff_index - range);
+            let end = graph.kickoff_index + range;
+            let res = sqlx::query_as!(
+                GraphIds,
+                "SELECT graph_id AS \"graph_id:Uuid\", kickoff_index
+                 FROM graph
+                 WHERE operator_pubkey = ?
+                   AND kickoff_index >= ?
+                   AND kickoff_index <= ?",
+                graph.operator_pubkey,
+                start,
+                end
+            )
+            .fetch_all(self.conn())
+            .await?;
+
+            Ok(res.into_iter().map(|g| (g.kickoff_index, g.graph_id)).collect())
+        } else {
+            Ok(vec![])
+        }
+    }
     /// Insert or update node without reward field
-    pub async fn upsert_node(&mut self, node: Node) -> anyhow::Result<u64> {
+    pub async fn upsert_node(&mut self, node: &Node) -> anyhow::Result<u64> {
         let res = sqlx::query!(
             r#"
             INSERT INTO node (peer_id, node_name, actor, goat_addr, btc_pub_key, socket_addr, service_fee_rate, available_peg_btc,
@@ -1447,7 +1468,7 @@ impl<'a> StorageProcessor<'a> {
                 "Committee" => {
                     (res.offline_committee, res.online_committee) = (record.offline, record.online);
                 }
-                "Relayer" => {
+                "Watchtower" => {
                     (res.offline_watchtower, res.online_watchtower) =
                         (record.offline, record.online);
                 }
@@ -1485,7 +1506,7 @@ impl<'a> StorageProcessor<'a> {
         Ok((record.total, record.tx_count))
     }
 
-    pub async fn get_sum_bridge_out(&mut self, statuses: &[String]) -> anyhow::Result<(i64, i64)> {
+    pub async fn get_sum_peg_out(&mut self, statuses: &[String]) -> anyhow::Result<(i64, i64)> {
         #[derive(sqlx::FromRow)]
         struct BridgeOutRow {
             pub total: i64,

@@ -9,9 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use strum::{Display, EnumString};
 use uuid::Uuid;
 
-pub const NODE_STATUS_ONLINE: &str = "Online";
-pub const NODE_STATUS_OFFLINE: &str = "Offline";
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SerializableTxid(pub Txid);
 
@@ -195,7 +192,7 @@ pub struct CommitteeSignatures {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
-pub enum InstanceStatus {
+pub enum InstanceBridgeInStatus {
     #[default]
     UserInited, // from contract event request
     // committee won't answer if userRequest is invalid(e.g. insufficient fee)
@@ -209,6 +206,29 @@ pub enum InstanceStatus {
     Timeout,                    // time to cancle bridgein
     UserCanceled,               // user broadcast Pegin-cancel tx
     NoEnoughCommitteesAnswered, // no enough committee responsed & window expired
+
+    // for front end display
+    Initiated,  // UserInited
+    Verified,   // CommitteesAnswered
+    Submitted,  // UserBroadcastPeginPrepare
+    Failed,     // PresignedFailed, RelayerL2MintedFailed, NoEnoughCommitteesAnswered
+    Processing, // Presigned, RelayerL1Broadcasted
+    Success,    // RelayerL2Minted
+    Canceled,   // UserCanceled
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
+pub enum InstanceBridgeOutStatus {
+    #[default]
+    UserL2Locked,
+    OperatorL1Locked,
+    OperatorToL1LockedTimeout,
+    UserL1Unlocked,
+    OperatorL2Unlocked,    // success
+    UserL2LockTimeout,     // L2Locked -> L2 timeout (operator is offline)
+    OperatorL1LockTimeout, // L1Locked -> L1 timeout -> L2 timeout (user doesn't presign)
+    OperatorL1Refunded,
+    UserL2Refunded,
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
@@ -221,7 +241,7 @@ pub struct Instance {
     pub amount: i64,
     pub fees: UInt64Array3,
     pub input_utxos: String,
-    pub status: String,
+    pub status: String,       // InstanceBridgeInStatus | InstanceBridgeOutStatus
     pub goat_tx_hash: String, // bridgeIn:pegin Request tx || bridgeOut goat tx
     pub goat_tx_height: i64,
     pub user_xonly_pubkey: ByteArray32,
@@ -240,7 +260,9 @@ pub struct Instance {
 }
 
 /// graph status
-#[derive(Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq, Display, EnumString)]
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq, Display, EnumString,
+)]
 pub enum GraphStatus {
     #[default]
     OperatorPresigned,
@@ -259,7 +281,7 @@ pub enum GraphStatus {
     Created,
     Presigned,
     L2Recorded,
-    KickOffing,
+    OperatorKickOffing,
     Challenging,
     Disproving,
 }
@@ -292,6 +314,48 @@ impl GraphStatus {
     }
     pub fn is_obsoleted(&self) -> bool {
         self.eq(&GraphStatus::Obsoleted)
+    }
+    pub fn get_previous_status(&self) -> Option<GraphStatus> {
+        match self {
+            GraphStatus::OperatorPresigned => None,
+            GraphStatus::CommitteePresigned => Some(GraphStatus::OperatorPresigned),
+            GraphStatus::OperatorDataPushed => Some(GraphStatus::CommitteePresigned),
+            GraphStatus::PreKickoff => Some(GraphStatus::OperatorDataPushed),
+            GraphStatus::Skipped => Some(GraphStatus::OperatorDataPushed),
+            GraphStatus::Obsoleted => Some(GraphStatus::OperatorDataPushed),
+            GraphStatus::OperatorKickOff => Some(GraphStatus::PreKickoff),
+            GraphStatus::OperatorTake1 => Some(GraphStatus::OperatorKickOff),
+            GraphStatus::Challenge => Some(GraphStatus::OperatorKickOff),
+            GraphStatus::Disprove => Some(GraphStatus::Challenge),
+            GraphStatus::OperatorTake2 => Some(GraphStatus::Challenge),
+            // frontend use only
+            GraphStatus::Created => None,
+            GraphStatus::Presigned => Some(GraphStatus::Created),
+            GraphStatus::L2Recorded => Some(GraphStatus::Presigned),
+            GraphStatus::OperatorKickOffing => Some(GraphStatus::L2Recorded),
+            GraphStatus::Challenging => Some(GraphStatus::OperatorKickOffing),
+            GraphStatus::Disproving => Some(GraphStatus::Challenging),
+        }
+    }
+    pub fn is_before(&self, other: &GraphStatus) -> bool {
+        let mut current = *other;
+        while let Some(prev) = current.get_previous_status() {
+            if &prev == self {
+                return true;
+            }
+            current = prev;
+        }
+        false
+    }
+    pub fn is_after(&self, other: &GraphStatus) -> bool {
+        let mut current = *self;
+        while let Some(prev) = current.get_previous_status() {
+            if &prev == other {
+                return true;
+            }
+            current = prev;
+        }
+        false
     }
 }
 
@@ -347,35 +411,6 @@ pub struct Graph {
     pub zkm_version: String,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-pub fn modify_graph_status(ori_status: &str, is_kickoffing: bool) -> String {
-    // TODO update
-    match ori_status {
-        "OperatorPresigned" => "Created".to_string(),
-        "CommitteePresigned" => "Presigned".to_string(),
-        "OperatorDataPushed" => {
-            if is_kickoffing {
-                "OperatorKickOffing".to_string()
-            } else {
-                "L2Recorded".to_string()
-            }
-        }
-        "OperatorKickOff" => "Challenging".to_string(),
-        _ => ori_status.to_string(),
-    }
-}
-
-pub fn convert_to_step_state(ori_status: &str) -> String {
-    // TODO update
-    match ori_status {
-        "Created" => "OperatorPresigned".to_string(),
-        "Presigned" => "CommitteePresigned".to_string(),
-        "L2Recorded" => "OperatorDataPushed".to_string(),
-        "KickOffing" => "OperatorDataPushed".to_string(),
-        "Challenging" => "OperatorKickOff".to_string(),
-        _ => ori_status.to_string(),
-    }
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
@@ -698,6 +733,14 @@ pub enum ProofType {
     Groth16Proof,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default, Display, EnumString)]
+pub enum ProofStatus {
+    #[default]
+    Pending,
+    Readying,
+    Proved,
+    Failed,
+}
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct CommitInfo {
     pub txid: SerializableTxid,
@@ -813,10 +856,10 @@ mod tests {
     #[test]
     fn test_bridge_in_status_from_str() {
         assert_eq!(
-            InstanceStatus::from_str("RelayerL2Minted").unwrap(),
-            InstanceStatus::RelayerL2Minted
+            InstanceBridgeInStatus::from_str("RelayerL2Minted").unwrap(),
+            InstanceBridgeInStatus::RelayerL2Minted
         );
-        assert!(InstanceStatus::from_str("Invalid").is_err());
+        assert!(InstanceBridgeInStatus::from_str("Invalid").is_err());
     }
 
     #[test]
