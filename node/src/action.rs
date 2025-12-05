@@ -86,6 +86,7 @@ pub struct PeginRequest {
     pub instance_id: Uuid,
     pub pegin_request_tx_hash: String, // goat tx hash
     pub pegin_request_height: i64,
+    pub pegin_timestamp: i64,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ConfirmInstance {
@@ -400,6 +401,7 @@ pub async fn recv_and_dispatch(
                 instance_id,
                 pegin_request_tx_hash,
                 pegin_request_height,
+                pegin_timestamp,
             }),
             Actor::Committee,
         ) => {
@@ -428,11 +430,14 @@ pub async fn recv_and_dispatch(
             store_pegin_request(
                 btc_client,
                 local_db,
-                instance_id,
-                user_info,
-                pegin_amount,
-                pegin_request_tx_hash,
-                pegin_request_height,
+                GenerateInstanceParams {
+                    instance_id,
+                    user_info,
+                    pegin_amount,
+                    pegin_request_tx_hash,
+                    pegin_request_height,
+                    pegin_timestamp,
+                },
             )
             .await?;
             // 3. call Gateway.answerPeginRequest
@@ -447,6 +452,7 @@ pub async fn recv_and_dispatch(
                 instance_id,
                 pegin_request_tx_hash,
                 pegin_request_height,
+                pegin_timestamp,
             }),
             _,
         ) => {
@@ -475,11 +481,14 @@ pub async fn recv_and_dispatch(
             store_pegin_request(
                 btc_client,
                 local_db,
-                instance_id,
-                user_info,
-                pegin_amount,
-                pegin_request_tx_hash,
-                pegin_request_height,
+                GenerateInstanceParams {
+                    instance_id,
+                    user_info,
+                    pegin_amount,
+                    pegin_request_tx_hash,
+                    pegin_request_height,
+                    pegin_timestamp,
+                },
             )
             .await?;
         }
@@ -2924,6 +2933,14 @@ pub async fn recv_and_dispatch(
                 let delay_secs = todo_funcs::avg_block_time_secs(btc_client.network());
                 push_local_unhandled_messages(local_db, graph_id, &message, delay_secs as usize)
                     .await?;
+                return Ok(());
+            }
+            let connector_d_vout = graph.assert_commit_timeout_txns.len() as u64;
+            if outpoint_spent_txid(btc_client, &assert_init_txid, connector_d_vout).await?.is_some()
+            {
+                tracing::warn!(
+                    "Ignore AssertInitReady for {instance_id}:{graph_id}: connector_D already spent"
+                );
                 return Ok(());
             }
             // 2. sign & broadcast assert-commit txns

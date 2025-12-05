@@ -533,15 +533,15 @@ pub(crate) async fn refresh_graph(
         if let Some(spent_txid) =
             outpoint_spent_txid(btc_client, &kickoff_txid, connector_e_vout).await?
         {
-            if spent_txid != take2_txid {
+            let (current_status, sub_status) = if spent_txid != take2_txid {
                 sub_status.disprove_type = Some(DisproveTxType::Disprove);
-                current_status = GraphStatus::Disprove;
+                (GraphStatus::Disprove, Some(sub_status))
             } else {
-                current_status = GraphStatus::OperatorTake2;
-            }
-            update_graph_status(local_db, instance_id, graph_id, current_status, Some(sub_status))
+                (GraphStatus::OperatorTake2, None)
+            };
+            update_graph_status(local_db, instance_id, graph_id, current_status, sub_status)
                 .await?;
-            return Ok((current_status, Some(sub_status)));
+            return Ok((current_status, sub_status));
         }
     }
     // check Watchtower-Challenge & Assert-Commit process
@@ -1113,7 +1113,7 @@ pub async fn read_pegin_request(
         .iter()
         .map(|u| Input {
             outpoint: OutPoint { txid: Txid::from_byte_array(u.txid), vout: u.vout },
-            amount: Amount::from_sat(u.amount_stats),
+            amount: Amount::from_sat(u.amount_sats),
         })
         .collect();
     // TODO: we need to run our own bitcoin node in case of downtime or ddos attack.
@@ -1162,7 +1162,7 @@ pub async fn read_instance_info_from_goat(
         .iter()
         .map(|u| Input {
             outpoint: OutPoint { txid: Txid::from_byte_array(u.txid), vout: u.vout },
-            amount: Amount::from_sat(u.amount_stats),
+            amount: Amount::from_sat(u.amount_sats),
         })
         .collect();
     let user_info = UserInfo {
@@ -2433,7 +2433,7 @@ pub async fn get_groth16_proof(
 
     let mut storage_processor = local_db.acquire().await?;
     if let Some(tx_record) = storage_processor
-        .get_graph_goat_tx_record(&graph_id, &GoatTxType::ProceedWithdraw.to_string())
+        .get_graph_goat_tx_record(&instance_id, &graph_id, &GoatTxType::ProceedWithdraw.to_string())
         .await?
         && let Ok((proof, pis, vk, version)) =
             proofs::get_groth16_proof(local_db, tx_record.height as u64).await
@@ -2572,16 +2572,6 @@ pub async fn get_graph_status(
         GraphStatus::from_str(&graph.status)
             .map_err(|_| anyhow!("unknown graph status: {}", graph.status))?,
     ))
-}
-
-pub async fn update_graphs_status_by_instance_ids(
-    local_db: &LocalDB,
-    status: &str,
-    instance_ids: &[Uuid],
-) -> Result<()> {
-    let mut storage_process = local_db.acquire().await?;
-    storage_process.update_graphs_status_by_instance_ids(status, instance_ids).await?;
-    Ok(())
 }
 
 /// Returns:
@@ -2911,69 +2901,82 @@ pub async fn get_current_prekickoff_tx(
     }
 }
 
-pub async fn store_pegin_request(
+pub struct GenerateInstanceParams {
+    pub instance_id: Uuid,
+    pub user_info: UserInfo,
+    pub pegin_amount: Amount,
+    pub pegin_request_tx_hash: String,
+    pub pegin_request_height: i64,
+    pub pegin_timestamp: i64,
+}
+pub async fn generate_instance(
     btc_client: &BTCClient,
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    user_info: UserInfo,
-    pegin_amount: Amount,
-    pegin_request_tx_hash: String,
-    pegin_request_height: i64,
-) -> Result<()> {
-    // store instance info to local db
-    let mut storage_processor = local_db.acquire().await?;
-    let from_addr = if !user_info.inputs.is_empty()
-        && let Some(tx) = btc_client.get_tx(&user_info.inputs[0].outpoint.txid).await?
+    params: GenerateInstanceParams,
+) -> Result<Instance> {
+    let from_addr = if !params.user_info.inputs.is_empty()
+        && let Some(tx) = btc_client.get_tx(&params.user_info.inputs[0].outpoint.txid).await?
     {
         let tx_scripts =
-            tx.output[user_info.inputs[0].outpoint.vout as usize].script_pubkey.clone();
+            tx.output[params.user_info.inputs[0].outpoint.vout as usize].script_pubkey.clone();
         Address::from_script(&tx_scripts, env::get_network())
             .map(|addr| addr.to_string())
             .unwrap_or_default()
     } else {
         warn!(
-            "failed to decode instance {instance_id} from_address from pegin_request as input_utxos is empty or decode address failed",
+            "failed to decode instance {} from_address from pegin_request as input_utxos is empty or decode address failed",
+            params.instance_id
         );
         "".to_string()
     };
-
-    let input_utxos = user_info
+    let input_utxos = params
+        .user_info
         .inputs
         .iter()
         .map(|input| ClientUtxo {
             txid: input.outpoint.txid.to_byte_array(),
             vout: input.outpoint.vout,
-            amount_stats: input.amount.to_sat(),
+            amount_sats: input.amount.to_sat(),
         })
         .collect::<Vec<_>>();
+    let current_time = current_time_secs();
 
-    storage_processor
-        .upsert_instance(&Instance {
-            instance_id,
-            is_bridge_in: true,
-            network: get_network().to_string(),
-            from_addr,
-            to_addr: EvmAddress::from(&user_info.depositor_evm_address).to_string(),
-            amount: pegin_amount.to_sat() as i64,
-            fees: UInt64Array3(user_info.txn_fees),
-            input_utxos: serde_json::to_string(&input_utxos)?,
-            status: InstanceBridgeInStatus::UserInited.to_string(),
-            goat_tx_hash: pegin_request_tx_hash,
-            goat_tx_height: pegin_request_height,
-            user_xonly_pubkey: ByteArray32(user_info.user_xonly_pubkey.clone().serialize()),
-            user_change_addr: user_info.user_change_address.clone().to_string(),
-            user_refund_addr: user_info.user_refund_address.clone().to_string(),
-            btc_txid: None,
-            pegin_confirm_txid: None,
-            pegin_cancel_txid: None,
-            committees_answers: IndexMap::new(),
-            pegin_data_tx_hash: "".to_string(),
-            btc_height: 0,
-            parameters: None,
-            created_at: current_time_secs(),
-            updated_at: current_time_secs(),
-        })
-        .await?;
+    Ok(Instance {
+        instance_id: params.instance_id,
+        is_bridge_in: true,
+        network: get_network().to_string(),
+        from_addr,
+        to_addr: EvmAddress::from(&params.user_info.depositor_evm_address).to_string(),
+        amount: params.pegin_amount.to_sat() as i64,
+        fees: UInt64Array3(params.user_info.txn_fees),
+        input_utxos: serde_json::to_string(&input_utxos)?,
+        status: InstanceBridgeInStatus::UserInited.to_string(),
+        goat_tx_hash: params.pegin_request_tx_hash,
+        goat_tx_height: params.pegin_request_height,
+        user_xonly_pubkey: ByteArray32(params.user_info.user_xonly_pubkey.clone().serialize()),
+        user_change_addr: params.user_info.user_change_address.clone().to_string(),
+        user_refund_addr: params.user_info.user_refund_address.clone().to_string(),
+        btc_txid: None,
+        pegin_confirm_txid: None,
+        pegin_cancel_txid: None,
+        committees_answers: IndexMap::new(),
+        pegin_data_tx_hash: "".to_string(),
+        btc_height: 0,
+        parameters: None,
+        status_updated_at: params.pegin_timestamp,
+        created_at: current_time,
+        updated_at: current_time,
+    })
+}
+
+pub async fn store_pegin_request(
+    btc_client: &BTCClient,
+    local_db: &LocalDB,
+    params: GenerateInstanceParams,
+) -> Result<()> {
+    // store instance info to local db
+    let mut storage_processor = local_db.acquire().await?;
+    let instance = generate_instance(btc_client, params).await?;
+    storage_processor.upsert_instance(&instance).await?;
     Ok(())
 }
 
@@ -3071,6 +3074,7 @@ pub async fn store_graph(local_db: &LocalDB, simple_graph: &SimplifiedBitvm2Grap
         init_withdraw_tx_hash: None,
         bridge_out_start_at: 0,
         zkm_version: proofs::get_zkm_version(),
+        status_updated_at: current_time,
         created_at: current_time,
         updated_at: current_time,
     };
@@ -3651,7 +3655,7 @@ pub async fn update_graph_status(
         graph_update = graph_update.with_sub_status(serde_json::to_string(&sub_status)?);
     }
 
-    storage_processor.update_graph_fields(graph_update).await?;
+    storage_processor.update_graph(&graph_update).await?;
     Ok(())
 }
 pub async fn get_graph_ids_for_instance(
@@ -3708,7 +3712,7 @@ fn gen_user_info(
         .into_iter()
         .map(|utxo| Input {
             outpoint: OutPoint { txid: Txid::from_slice(&utxo.txid).unwrap(), vout: utxo.vout },
-            amount: Amount::from_sat(utxo.amount_stats),
+            amount: Amount::from_sat(utxo.amount_sats),
         })
         .collect();
     Ok(UserInfo {
@@ -3719,4 +3723,26 @@ fn gen_user_info(
         user_change_address: user_change_address.require_network(network)?,
         user_refund_address: user_refund_addr.require_network(network)?,
     })
+}
+
+pub async fn check_bridge_in_uxto_available_or_self_spent(
+    btc_client: &BTCClient,
+    target_txid: Option<String>,
+    utxos: &[client::Utxo],
+) -> Result<bool> {
+    for utxo in utxos {
+        if let Ok(txid) = Txid::from_slice(&utxo.txid)
+            && let Ok(Some(status)) = btc_client.get_output_status(&txid, utxo.vout as u64).await
+            && status.spent
+        {
+            if let Some(target_txid) = target_txid
+                && let Some(txid) = status.txid
+                && txid.to_string() == target_txid
+            {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

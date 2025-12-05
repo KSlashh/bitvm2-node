@@ -1,13 +1,13 @@
 use crate::env::GraphBtcTxName;
-use crate::rpc_service::AppState;
 use crate::rpc_service::bitvm2::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;
 use crate::rpc_service::response::{ApiErrorExt, ApiResult, ErrorResponse};
 use crate::rpc_service::validation::InputValidator;
+use crate::rpc_service::{AppState, current_time_secs};
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     AssertInitTxVoutMonitorData, ChallengeSubStatus, WTInitTxVoutMonitorData,
 };
-use crate::utils::parse_graph_raw_data;
+use crate::utils::{gen_instance_parameters_local, parse_graph_raw_data};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize_hex;
@@ -18,7 +18,7 @@ use http::StatusCode;
 use std::default::Default;
 use std::sync::Arc;
 use store::localdb::{GraphQuery, InstanceQuery, StorageProcessor};
-use store::{Graph, GraphStatus, InstanceBridgeInStatus};
+use store::{Graph, GraphStatus, Instance, InstanceBridgeInStatus};
 use tracing::warn;
 
 /// Get instance settings
@@ -55,6 +55,86 @@ pub async fn instance_settings(
         StatusCode::OK,
         Json(InstanceSettingResponse { bridge_in_amount: BRIDGE_IN_AMOUNTS.to_vec() }),
     ))
+}
+
+/// Prepare bridge-in request
+///
+/// Validates user-provided data against the allowed bridge-in options returned by
+/// [`instance_settings`](routes::v1::INSTANCES_SETTINGS). Clients should first call
+/// `instance_settings` to know the supported `bridge_in_amount` list and then submit a
+/// bridge-in request using one of those amounts.
+///
+/// # Request Body
+///
+/// - `instance_id`: UUID of the bridge-in request created earlier
+/// - `network`: Target Bitcoin network (e.g. `testnet3`, `mainnet`)
+/// - `from_addr`: Funding Bitcoin address selected by the user
+/// - `to_addr`: Destination address that receives bridged assets on L2
+/// - `bridge_request_tx_hash`: Goat chain transaction hash referencing the bridge intent
+///
+/// # Returns
+///
+/// - `200 OK`: Request is valid and can proceed to the next step of bridge-in workflow
+/// - Response body currently acts as an acknowledgment placeholder for future metadata
+///
+/// # Example
+///
+/// ```http
+/// PUT /v1/instances/bridge-in-request-tag
+/// {
+///   "instance_id": "123e4567-e89b-12d3-a456-426614174000",
+///   "network": "testnet",
+///   "from_addr": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+///   "to_addr": "0x1234567890abcdef1234567890abcdef12345678",
+///   "bridge_request_tx_hash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e"
+/// }
+/// ```
+///
+/// Response example:
+/// ```json
+/// {}
+/// ```
+#[axum::debug_handler]
+pub async fn bridge_in_request_tag(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<BridgeInPrepareRequest>,
+) -> ApiResult<BridgeInPrepareResponse> {
+    InputValidator::validate_btc_address(&payload.from_addr, "from_addr")?;
+    InputValidator::validate_goat_address(&payload.to_addr, "goat_addr")?;
+    let instance_id = InputValidator::validate_uuid(&payload.instance_id, "btc_addr")?;
+    let mut storage_process =
+        app_state.local_db.acquire().await.api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
+    let current_time = current_time_secs();
+    storage_process
+        .upsert_instance(&Instance {
+            instance_id,
+            is_bridge_in: true,
+            network: payload.network,
+            from_addr: payload.from_addr,
+            to_addr: payload.to_addr,
+            amount: 0,
+            fees: Default::default(),
+            input_utxos: "[]".to_string(),
+            status: InstanceBridgeInStatus::UserIniting.to_string(),
+            goat_tx_hash: "".to_string(),
+            goat_tx_height: 0,
+            user_xonly_pubkey: Default::default(),
+            user_change_addr: "".to_string(),
+            user_refund_addr: "".to_string(),
+            btc_txid: None,
+            btc_height: 0,
+            pegin_confirm_txid: None,
+            pegin_cancel_txid: None,
+            committees_answers: Default::default(),
+            pegin_data_tx_hash: "".to_string(),
+            parameters: None,
+            status_updated_at: current_time,
+            created_at: current_time,
+            updated_at: current_time,
+        })
+        .await
+        .api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
+    Ok((StatusCode::OK, Json(BridgeInPrepareResponse {})))
 }
 
 /// Get instance list
@@ -102,7 +182,7 @@ pub async fn instance_settings(
 ///         "status": "CommitteesAnswered",
 ///         "goat_tx_hash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
 ///         "goat_tx_height": 8509060,
-///         "user_xonly_pubkey": "02abc123...",
+///         "user_xonly_pubkey": [2, 171, 193, 35, ...],
 ///         "user_change_addr": "tb1q...",
 ///         "user_refund_addr": "tb1q...",
 ///         "btc_txid": "f6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
@@ -112,22 +192,23 @@ pub async fn instance_settings(
 ///         "committees_answers": {},
 ///         "pegin_data_tx_hash": "0x...",
 ///         "parameters": null,
+///         "status_updated_at": 1699123456,
 ///         "created_at": 1699123456,
 ///         "updated_at": 1699123456
 ///       },
 ///       "utxo": [
 ///         {
-///           "txid": "abc123...",
+///           "txid": [171, 193, 35, ...],
 ///           "vout": 0,
-///           "value": 100000000,
-///           "script_pubkey": "0014..."
+///           "amount_sats": 100000000
 ///         }
 ///       ],
 ///       "confirmations": 0,
 ///       "target_confirmations": 6,
 ///       "waiting_time_in_secs": 60,
+///       "current_status_waiting_time_in_secs": 30,
 ///       "status_extra": {
-///         "user_action": "Submit",
+///         "user_action": "None",
 ///         "is_failed": false,
 ///         "error": null
 ///       }
@@ -167,14 +248,19 @@ pub async fn get_instances(
         warn!("get_instances instance is empty: total {}", total);
         return Ok((StatusCode::OK, Json(InstanceListResponse::default())));
     }
-
-    let current_height = app_state.btc_client.get_height().await.api_error("GET_INSTANCE_ERROR")?;
-
+    let btc_current_height =
+        app_state.btc_client.get_height().await.api_error("GET_INSTANCE_ERROR")?;
+    let response_window_blocks = app_state
+        .goat_client
+        .gateway_get_response_window_blocks()
+        .await
+        .api_error("GET_INSTANCE_ERROR")?;
     let mut items = vec![];
     for instance in instances {
         let item = InstanceExtended::convert_from_instance(
             &app_state.btc_client,
-            current_height,
+            btc_current_height,
+            response_window_blocks as i64,
             instance,
         )
         .await
@@ -227,7 +313,7 @@ pub async fn get_instances(
 ///       "status": "CommitteesAnswered",
 ///       "goat_tx_hash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
 ///       "goat_tx_height": 8509060,
-///       "user_xonly_pubkey": "02abc123...",
+///       "user_xonly_pubkey": [2, 171, 193, 35, ...],
 ///       "user_change_addr": "tb1q...",
 ///       "user_refund_addr": "tb1q...",
 ///       "btc_txid": "f6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
@@ -237,22 +323,23 @@ pub async fn get_instances(
 ///       "committees_answers": {},
 ///       "pegin_data_tx_hash": "0x...",
 ///       "parameters": null,
+///       "status_updated_at": 1699123456,
 ///       "created_at": 1699123456,
 ///       "updated_at": 1699123456
 ///     },
 ///     "utxo": [
 ///       {
-///         "txid": "abc123...",
+///         "txid": [171, 193, 35, ...],
 ///         "vout": 0,
-///         "value": 100000000,
-///         "script_pubkey": "0014..."
+///         "amount_sats": 100000000
 ///       }
 ///     ],
 ///     "confirmations": 0,
 ///     "target_confirmations": 6,
 ///     "waiting_time_in_secs": 60,
+///     "current_status_waiting_time_in_secs": 30,
 ///     "status_extra": {
-///       "user_action": "Submit",
+///       "user_action": "None",
 ///       "is_failed": false,
 ///       "error": null
 ///     }
@@ -272,23 +359,28 @@ pub async fn get_instance(
     if let Some(instance) =
         storage_process.find_instance(&instance_id_uuid).await.api_error("GET_INSTANCE_ERROR")?
     {
-        let current_height =
+        let btc_current_height =
             app_state.btc_client.get_height().await.api_error("GET_INSTANCE_ERROR")?;
-        let instance_wrap = InstanceExtended::convert_from_instance(
-            &app_state.btc_client,
-            current_height,
-            instance,
-        )
-        .await
-        .api_error("GET_INSTANCE_ERROR")?;
+        let response_window_blocks = app_state
+            .goat_client
+            .gateway_get_response_window_blocks()
+            .await
+            .api_error("GET_INSTANCE_ERROR")?;
+        let instance_wrap = Some(
+            InstanceExtended::convert_from_instance(
+                &app_state.btc_client,
+                btc_current_height,
+                response_window_blocks as i64,
+                instance,
+            )
+            .await
+            .api_error("GET_INSTANCE_ERROR")?,
+        );
 
         Ok((StatusCode::OK, Json(InstanceGetResponse { instance_wrap })))
     } else {
         tracing::info!("instance_id {} has no record in database", instance_id);
-        Ok((
-            StatusCode::OK,
-            Json(InstanceGetResponse { instance_wrap: InstanceExtended::default() }),
-        ))
+        Ok((StatusCode::OK, Json(InstanceGetResponse { instance_wrap: None })))
     }
 }
 
@@ -434,11 +526,13 @@ pub async fn get_instances_overview(
 ///       "init_withdraw_tx_hash": null,
 ///       "bridge_out_start_at": 1699123456,
 ///       "zkm_version": "zkm1.0.0",
+///       "status_updated_at": 1699123456,
 ///       "created_at": 1699123456,
 ///       "updated_at": 1699123456
 ///     },
 ///     "challenge_sub_status": "Assert",
-///     "waiting_time_in_secs": 1000
+///     "waiting_time_in_secs": 1000,
+///     "proof_status": "Pending"
 /// }
 /// ```
 #[axum::debug_handler]
@@ -526,11 +620,13 @@ pub async fn get_graph(
 ///         "init_withdraw_tx_hash": null,
 ///         "bridge_out_start_at": 1699123456,
 ///         "zkm_version": "zkm1.0.0",
+///         "status_updated_at": 1699123456,
 ///         "created_at": 1699123456,
 ///         "updated_at": 1699123456
 ///       },
 ///       "challenge_sub_status": "Assert",
-///       "waiting_time_in_secs": 1000
+///       "waiting_time_in_secs": 1000,
+///       "proof_status": "Pending"
 ///     }
 ///   ],
 ///   "total": 1
@@ -628,6 +724,7 @@ pub async fn get_graphs(
 ///     "init_withdraw_tx_hash": null,
 ///     "bridge_out_start_at": 0,
 ///     "zkm_version": "zkm1.0.0",
+///     "status_updated_at": 1699123456,
 ///     "created_at": 1699123456,
 ///     "updated_at": 1699123456
 ///   },
@@ -642,6 +739,7 @@ pub async fn get_ready_to_kickoff_graph(
     let mut graph_query = GraphQuery::default()
         .with_status(GraphStatus::OperatorDataPushed.to_string())
         .with_order("kickoff_index ASC".to_string())
+        .with_raw_condition("init_withdraw_tx_hash IS NULL".to_string())
         .with_limit(1);
     if params.btc_pub_key.is_none() && params.goat_addr.is_none() {
         return Err((
@@ -676,10 +774,7 @@ pub async fn get_ready_to_kickoff_graph(
     if graphs.is_empty() {
         return Ok((
             StatusCode::OK,
-            Json(GraphReadyToKickoffResponse {
-                graph: None,
-                no_ready_reason: Some("No graph is ready".to_string()),
-            }),
+            Json(GraphReadyToKickoffResponse { graph: None, no_ready_reason: None }),
         ));
     }
 
@@ -695,14 +790,18 @@ pub async fn get_ready_to_kickoff_graph(
             .api_error("GET_READY_KICKOFF_GRAPHS_ERROR")?;
 
         if !pre_graphs.is_empty()
-            && [GraphStatus::OperatorKickOff.to_string(), GraphStatus::Challenge.to_string()]
-                .contains(&pre_graphs[0].status)
+            && [
+                GraphStatus::OperatorDataPushed.to_string(),
+                GraphStatus::OperatorKickOff.to_string(),
+                GraphStatus::Challenge.to_string(),
+            ]
+            .contains(&pre_graphs[0].status)
         {
             return Ok((
                 StatusCode::OK,
                 Json(GraphReadyToKickoffResponse {
                     graph: None,
-                    no_ready_reason: Some("Pre graph not finish Pegout".to_string()),
+                    no_ready_reason: Some(pre_graphs[0].graph_id.to_string()),
                 }),
             ));
         }
@@ -1317,6 +1416,71 @@ pub async fn get_graph_neighbor_ids(
         if i > 0 && *graph_id != current_id {
             res.next_id = Some(*graph_id);
         }
+    }
+    Ok((StatusCode::OK, Json(res)))
+}
+
+/// Get unsigned pegin transactions
+///
+/// Returns the unsigned pegin deposit transaction (prepare) and pegin refund transaction (cancel)
+/// for a given instance, which allows users to sign and broadcast these transactions for pegin operations.
+///
+/// # Path Parameters
+///
+/// - `instance_id`: UUID of the BitVM2 instance
+///
+/// # Returns
+///
+/// - `200 OK`: Successfully returns the unsigned pegin transactions (if instance exists)
+/// - `500 Internal Server Error`: Parameter validation failed or database query failed
+///
+/// # Use Case
+///
+/// Frontend can call this endpoint to get the unsigned pegin transactions for an instance,
+/// allowing users to sign and broadcast the `pegin_prepare` transaction to deposit funds,
+/// or the `pegin_cancel` transaction to refund if needed.
+///
+/// # Example
+///
+/// ```http
+/// GET /v1/instances/123e4567-e89b-12d3-a456-426614174000/unsigned-pegin-txn
+/// ```
+///
+/// Response example:
+/// ```json
+/// {
+///   "pegin_prepare": "0200000001...",
+///   "pegin_cancel_psbt": "0200000001..."
+/// }
+/// ```
+#[axum::debug_handler]
+pub async fn get_unsigned_pegin_txn(
+    Path(instance_id): Path<String>,
+    State(app_state): State<Arc<AppState>>,
+) -> ApiResult<UnsignPeginTxnResponse> {
+    let current_id = InputValidator::validate_uuid(&instance_id, "instance_id")?;
+    let mut storage_processor =
+        app_state.local_db.acquire().await.api_error("GET_UNSIGNED_PEGIN_ERROR")?;
+    let mut res = UnsignPeginTxnResponse::default();
+    if let Some(instance) =
+        storage_processor.find_instance(&current_id).await.api_error("GET_UNSIGNED_PEGIN_ERROR")?
+        && instance.status == InstanceBridgeInStatus::CommitteesAnswered.to_string()
+    {
+        let instance_parameters =
+            gen_instance_parameters_local(&instance).api_error("GET_UNSIGNED_PEGIN_ERROR")?;
+        let (pegin_deposit_tx, _, _) =
+            instance_parameters.build_pegin_tx().api_error("GET_UNSIGNED_PEGIN_ERROR")?;
+        res.pegin_prepare = Some(serialize_hex(pegin_deposit_tx.tx()));
+        res.pegin_cancel_psbt = Some(hex::encode(
+            instance_parameters
+                .build_pegin_cancel_psbt()
+                .api_error("GET_UNSIGNED_PEGIN_ERROR")?
+                .serialize(),
+        ));
+    } else {
+        warn!(
+            "instance:{instance_id} is not record in db or instance status neq CommitteesAnswered"
+        );
     }
     Ok((StatusCode::OK, Json(res)))
 }

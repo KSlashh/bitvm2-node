@@ -2,10 +2,9 @@ use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     AssertCommitStatus, ChallengeSubStatus, WatchtowerChallengeStatus,
 };
-use crate::utils::reflect_goat_address;
+use crate::utils::{check_bridge_in_uxto_available_or_self_spent, reflect_goat_address};
 use alloy::hex::ToHexExt;
 use bitcoin::Txid;
-use bitcoin::hashes::Hash;
 use client::Utxo;
 use client::btc_chain::BTCClient;
 use serde::{Deserialize, Serialize};
@@ -13,7 +12,8 @@ use std::default::Default;
 use std::str::FromStr;
 use store::localdb::GraphQuery;
 use store::{
-    Graph, GraphStatus, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus, SerializableTxid,
+    Graph, GraphStatus, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus, ProofStatus,
+    SerializableTxid,
 };
 use strum::{Display, EnumString};
 use tracing::warn;
@@ -40,7 +40,27 @@ const _BRIDGE_OUT_FAIL_AS_CLAIM_TIMEOUT: &str =
     "Claim timed out. Please initiate a new transaction.";
 const _BRIDGE_IN_FAIL_AS_L1_LOCK_TIMEOUT: &str =
     "The operator timed out and failed to lock BTC. Please cancel the transaction.";
-pub const BRIDGE_IN_AMOUNTS: [f32; 4] = [0.1, 0.05, 0.02, 0.01];
+pub const BRIDGE_IN_AMOUNTS: [f32; 2] = [0.1, 0.01];
+
+const GOAT_BLOCK_INTERVAL_SECS: i64 = 3;
+
+const INSTANCE_USER_BROADCAST_PREPARE_STATUS_DURATION_SECS: i64 = 3600 * 3;
+const INSTANCE_RELAYER_L1_BROADCAST_STATUS_DURATION_SECS: i64 = 3600 * 3;
+const GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS: i64 = 1800;
+const GRAPH_OPERATOR_KICKOFF_STATUS_DURATION_SECS: i64 = 3600 * 3;
+const GRAPH_OPERATOR_CHALLENGE_STATUS_DURATION_SECS: i64 = 3600 * 9;
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BridgeInPrepareRequest {
+    pub instance_id: String,            // UUID
+    pub network: String,                // testnet | mainnet
+    pub from_addr: String,              // BTC /charge
+    pub to_addr: String,                // BTC /charge
+    pub bridge_request_tx_hash: String, // goat tx hash
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BridgeInPrepareResponse {}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct InstanceSettingResponse {
     pub bridge_in_amount: Vec<f32>,
@@ -83,6 +103,7 @@ pub struct InstanceExtended {
     pub instance: Instance,
     pub utxo: Vec<Utxo>,
     pub waiting_time_in_secs: i64,
+    pub current_status_waiting_time_in_secs: i64,
     pub confirmations: u32,
     pub target_confirmations: u32,
     pub status_extra: StatusExtra,
@@ -91,14 +112,15 @@ pub struct InstanceExtended {
 impl InstanceExtended {
     pub async fn convert_from_instance(
         btc_client: &BTCClient,
-        current_height: u32,
-        mut instance: Instance,
+        btc_current_height: u32,
+        response_window_blocks: i64,
+        instance: Instance,
     ) -> anyhow::Result<Self> {
-        let utxo: Vec<Utxo> = serde_json::from_str(&instance.input_utxos)
+        let utxos: Vec<Utxo> = serde_json::from_str(&instance.input_utxos)
             .map_err(|e| anyhow::Error::msg(e.to_string()))?;
         let (confirmations, target_confirmations) = get_instance_block_confirm_progress(
             btc_client,
-            current_height,
+            btc_current_height,
             instance.is_bridge_in,
             instance.btc_txid.clone(),
         )
@@ -108,67 +130,75 @@ impl InstanceExtended {
             instance.instance_id,
             instance.is_bridge_in,
             instance.status.clone(),
-            &utxo,
+            instance.btc_txid.clone().map(|v| v.0.to_string()),
+            &utxos,
         )
         .await?;
-        instance.status = instance.convert_to_display_status();
-        Ok(Self {
-            waiting_time_in_secs: get_instance_waiting_time_in_secs(
+        let (current_status_waiting_time_in_secs, waiting_time_in_secs) =
+            get_instance_waiting_times(
                 instance.is_bridge_in,
                 &instance.status,
-                instance.updated_at,
-            ),
+                instance.created_at,
+                instance.status_updated_at,
+                response_window_blocks,
+            );
+
+        // instance.status = instance.convert_to_display_status();
+        Ok(Self {
+            waiting_time_in_secs,
+            current_status_waiting_time_in_secs,
             confirmations,
             target_confirmations,
             status_extra,
-            utxo,
+            utxo: utxos,
             instance,
         })
     }
 }
 
-async fn check_bridge_in_uxto_avaliable(
-    btc_client: &BTCClient,
-    utxos: &[Utxo],
-) -> anyhow::Result<bool> {
-    for utxo in utxos {
-        if let Ok(txid) = Txid::from_slice(&utxo.txid)
-            && let Ok(Some(status)) = btc_client.get_output_status(&txid, utxo.vout as u64).await
-            && status.spent
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
 async fn get_instance_status_extra(
     btc_client: &BTCClient,
     instance_id: Uuid,
     is_bridge_in: bool,
     status: String,
+    target_txid: Option<String>,
     utxos: &[Utxo],
 ) -> anyhow::Result<StatusExtra> {
     let mut status_extra = StatusExtra::default();
     if is_bridge_in && let Ok(bridge_in_status) = InstanceBridgeInStatus::from_str(&status) {
         match bridge_in_status {
             InstanceBridgeInStatus::UserInited => {
-                if !check_bridge_in_uxto_avaliable(btc_client, utxos).await? {
+                if !check_bridge_in_uxto_available_or_self_spent(btc_client, target_txid, utxos)
+                    .await?
+                {
                     status_extra.is_failed = true;
                     status_extra.error = Some(BRIDGE_IN_FAIL_AS_UTXO_BEEN_SPENT.to_string());
                     status_extra.user_action = StatusUserAction::Cancel;
                 }
             }
+            InstanceBridgeInStatus::UserDiscarded => {
+                status_extra.is_failed = true;
+                status_extra.error = Some(BRIDGE_IN_FAIL_AS_UTXO_BEEN_SPENT.to_string());
+                status_extra.user_action = StatusUserAction::Cancel;
+            }
             InstanceBridgeInStatus::CommitteesAnswered => {
-                status_extra.is_failed = false;
-                status_extra.error = None;
-                status_extra.user_action = StatusUserAction::BroadcastPreparePegin;
+                if !check_bridge_in_uxto_available_or_self_spent(btc_client, target_txid, utxos)
+                    .await?
+                {
+                    status_extra.is_failed = true;
+                    status_extra.error = Some(BRIDGE_IN_FAIL_AS_UTXO_BEEN_SPENT.to_string());
+                    status_extra.user_action = StatusUserAction::Cancel;
+                } else {
+                    status_extra.is_failed = false;
+                    status_extra.error = None;
+                    status_extra.user_action = StatusUserAction::BroadcastPreparePegin;
+                }
             }
             InstanceBridgeInStatus::NoEnoughCommitteesAnswered => {
                 status_extra.is_failed = true;
                 status_extra.error = Some(BRIDGE_IN_FAIL_AS_NO_ENOUGH_COMMITTEES.to_string());
                 status_extra.user_action = StatusUserAction::Cancel;
             }
-
             InstanceBridgeInStatus::PresignedFailed => {
                 status_extra.is_failed = true;
                 status_extra.error = Some(BRIDGE_IN_FAIL_AS_PRESIGNED_FAILED.to_string());
@@ -215,29 +245,53 @@ async fn get_instance_block_confirm_progress(
     }
 }
 
-fn get_bridge_in_status_time_window_secs(status: &str) -> i64 {
+fn get_bridge_in_status_time_window_secs(status: &str, response_window_blocks: i64) -> (i64, i64) {
+    let total_time = response_window_blocks * GOAT_BLOCK_INTERVAL_SECS
+        + INSTANCE_USER_BROADCAST_PREPARE_STATUS_DURATION_SECS
+        + INSTANCE_RELAYER_L1_BROADCAST_STATUS_DURATION_SECS;
+
     match InstanceBridgeInStatus::from_str(status) {
-        Ok(InstanceBridgeInStatus::Initiated) => 120,
-        Ok(InstanceBridgeInStatus::Submitted) => 3600 * 24,
-        Ok(InstanceBridgeInStatus::Processing) => 3600 * 3,
-        Ok(_) | Err(_) => 0,
+        Ok(InstanceBridgeInStatus::UserIniting)
+        | Ok(InstanceBridgeInStatus::Initiated)
+        | Ok(InstanceBridgeInStatus::UserInited) => {
+            (response_window_blocks * GOAT_BLOCK_INTERVAL_SECS, total_time)
+        }
+        Ok(InstanceBridgeInStatus::CommitteesAnswered) | Ok(InstanceBridgeInStatus::Verified) => {
+            (0, total_time - response_window_blocks * GOAT_BLOCK_INTERVAL_SECS)
+        }
+        Ok(InstanceBridgeInStatus::Submitted)
+        | Ok(InstanceBridgeInStatus::UserBroadcastPeginPrepare) => (
+            INSTANCE_USER_BROADCAST_PREPARE_STATUS_DURATION_SECS,
+            total_time - response_window_blocks * GOAT_BLOCK_INTERVAL_SECS,
+        ),
+        Ok(InstanceBridgeInStatus::Processing)
+        | Ok(InstanceBridgeInStatus::Presigned)
+        | Ok(InstanceBridgeInStatus::RelayerL1Broadcasted) => (
+            INSTANCE_RELAYER_L1_BROADCAST_STATUS_DURATION_SECS,
+            total_time
+                - response_window_blocks * GOAT_BLOCK_INTERVAL_SECS
+                - INSTANCE_USER_BROADCAST_PREPARE_STATUS_DURATION_SECS,
+        ),
+        Ok(_) | Err(_) => (0, 0),
     }
 }
 
-fn get_bridge_out_status_time_window_secs(status: &str) -> i64 {
-    let _ = InstanceBridgeOutStatus::from_str(status);
-    0
-}
-
-fn get_instance_waiting_time_in_secs(is_bridge_in: bool, status: &str, last_updated: i64) -> i64 {
-    let time_past = current_time_secs() - last_updated;
-    let time_left = if is_bridge_in {
-        get_bridge_in_status_time_window_secs(status) - time_past
+fn get_instance_waiting_times(
+    is_bridge_in: bool,
+    status: &str,
+    created_at: i64,
+    last_updated: i64,
+    response_window_blocks: i64,
+) -> (i64, i64) {
+    let current_state_past = current_time_secs() - last_updated;
+    let total_past = current_time_secs() - created_at;
+    if is_bridge_in {
+        let (current_status_window, total_window) =
+            get_bridge_in_status_time_window_secs(status, response_window_blocks);
+        ((current_status_window - current_state_past).max(0), (total_window - total_past).max(0))
     } else {
-        get_bridge_out_status_time_window_secs(status) - time_past
-    };
-
-    time_left.max(0)
+        (0, 0)
+    }
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -248,7 +302,7 @@ pub struct InstanceListResponse {
 
 #[derive(Deserialize, Serialize)]
 pub struct InstanceGetResponse {
-    pub instance_wrap: InstanceExtended,
+    pub instance_wrap: Option<InstanceExtended>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -272,11 +326,8 @@ pub type GraphGetResponse = GraphExtended;
 
 #[derive(Deserialize, Serialize, Default)]
 pub struct GraphTxnGetResponse {
-    #[serde(rename = "assert-init")]
     pub assert_init: BtcTxData,
-    #[serde(rename = "watchtower-challenge-init")]
     pub watchtower_challenge_init: BtcTxData,
-    #[serde(rename = "pre-kickoff")]
     pub pre_kickoff: BtcTxData,
     pub challenge: BtcTxData,
     pub disprove: BtcTxData,
@@ -419,8 +470,8 @@ pub struct GraphExtended {
     pub graph: Option<Graph>,
     pub challenge_sub_status: SimpleChallengeSubStatus,
     pub waiting_time_in_secs: i64,
-    // pub proof_height: Option<i64>,
-    // pub proof_query_url: Option<String>,
+    pub current_status_waiting_time_in_secs: i64,
+    pub proof_status: ProofStatus,
 }
 
 impl GraphExtended {
@@ -428,7 +479,12 @@ impl GraphExtended {
         _btc_client: &BTCClient,
         mut graph: Graph,
     ) -> anyhow::Result<Self> {
-        let waiting_time_in_secs = get_graph_waiting_time_in_secs(graph.updated_at, &graph.status);
+        let (current_status_waiting_time_in_secs, waiting_time_in_secs) = get_graph_waiting_times(
+            graph.created_at,
+            graph.status_updated_at,
+            &graph.status,
+            graph.init_withdraw_tx_hash.is_some(),
+        );
         graph.status = graph.convert_to_display_status();
         let challenge_sub_status =
             match serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status) {
@@ -449,16 +505,46 @@ impl GraphExtended {
                     SimpleChallengeSubStatus::None
                 }
             };
-
-        Ok(GraphExtended { challenge_sub_status, waiting_time_in_secs, graph: Some(graph) })
+        // todo update proof status
+        Ok(GraphExtended {
+            current_status_waiting_time_in_secs,
+            challenge_sub_status,
+            waiting_time_in_secs,
+            proof_status: ProofStatus::Pending,
+            graph: Some(graph),
+        })
     }
 }
 
-fn get_graph_waiting_time_in_secs(last_updated: i64, status: &str) -> i64 {
-    let _ = GraphStatus::from_str(status);
-    let time_window = 0;
-    let time_left = time_window - (current_time_secs() - last_updated);
-    time_left.max(0)
+fn get_graph_waiting_times(
+    created_at: i64,
+    last_updated: i64,
+    status: &str,
+    is_start_kickoff: bool,
+) -> (i64, i64) {
+    let total_time = GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS
+        + GRAPH_OPERATOR_KICKOFF_STATUS_DURATION_SECS
+        + GRAPH_OPERATOR_CHALLENGE_STATUS_DURATION_SECS;
+    let (current_status_window, total_window) = match GraphStatus::from_str(status) {
+        Ok(GraphStatus::OperatorDataPushed) if is_start_kickoff => {
+            (GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS, total_time)
+        }
+        Ok(GraphStatus::OperatorKickOff) => (
+            GRAPH_OPERATOR_KICKOFF_STATUS_DURATION_SECS,
+            total_time - GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS,
+        ),
+        Ok(GraphStatus::Challenge) => (
+            GRAPH_OPERATOR_CHALLENGE_STATUS_DURATION_SECS,
+            total_time
+                - GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS
+                - GRAPH_OPERATOR_KICKOFF_STATUS_DURATION_SECS,
+        ),
+
+        _ => (0, 0),
+    };
+    let current_state_past = current_time_secs() - last_updated;
+    let total_past = current_time_secs() - created_at;
+    ((current_status_window - current_state_past).max(0), (total_window - total_past).max(0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +557,12 @@ pub struct GraphReadyToKickoffRequest {
 pub struct GraphReadyToKickoffResponse {
     pub graph: Option<Graph>,
     pub no_ready_reason: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+pub struct UnsignPeginTxnResponse {
+    pub pegin_prepare: Option<String>,
+    pub pegin_cancel_psbt: Option<String>,
 }
 trait DisplayStatusConvert {
     fn convert_to_display_status(&self) -> String;

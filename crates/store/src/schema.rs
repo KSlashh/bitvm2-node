@@ -174,14 +174,14 @@ pub struct Node {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct NodesOverview {
     pub total: i64,
-    pub online_operator: i64,
-    pub offline_operator: i64,
-    pub online_challenger: i64,
-    pub offline_challenger: i64,
-    pub online_committee: i64,
-    pub offline_committee: i64,
-    pub online_watchtower: i64,
-    pub offline_watchtower: i64,
+    pub online_operators: i64,
+    pub offline_operators: i64,
+    pub online_challengers: i64,
+    pub offline_challengers: i64,
+    pub online_committees: i64,
+    pub offline_committees: i64,
+    pub online_watchtowers: i64,
+    pub offline_watchtowers: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -194,6 +194,7 @@ pub struct CommitteeSignatures {
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
 pub enum InstanceBridgeInStatus {
     #[default]
+    UserIniting, // front has call contract, but node not get event
     UserInited, // from contract event request
     // committee won't answer if userRequest is invalid(e.g. insufficient fee)
     CommitteesAnswered,        // enough committee responsed & window expired
@@ -206,12 +207,13 @@ pub enum InstanceBridgeInStatus {
     Timeout,                    // time to cancle bridgein
     UserCanceled,               // user broadcast Pegin-cancel tx
     NoEnoughCommitteesAnswered, // no enough committee responsed & window expired
+    UserDiscarded,              // pegin prepare tx input uxto been spent in other tx
 
     // for front end display
     Initiated,  // UserInited
     Verified,   // CommitteesAnswered
     Submitted,  // UserBroadcastPeginPrepare
-    Failed,     // PresignedFailed, RelayerL2MintedFailed, NoEnoughCommitteesAnswered
+    Failed,     // PresignedFailed, RelayerL2MintedFailed, NoEnoughCommitteesAnswered, UserDiscarded
     Processing, // Presigned, RelayerL1Broadcasted
     Success,    // RelayerL2Minted
     Canceled,   // UserCanceled
@@ -255,6 +257,7 @@ pub struct Instance {
     pub committees_answers: IndexMap<String, Vec<u8>>,
     pub pegin_data_tx_hash: String,
     pub parameters: Option<String>,
+    pub status_updated_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -409,6 +412,7 @@ pub struct Graph {
     pub init_withdraw_tx_hash: Option<String>,
     pub bridge_out_start_at: i64,
     pub zkm_version: String,
+    pub status_updated_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }

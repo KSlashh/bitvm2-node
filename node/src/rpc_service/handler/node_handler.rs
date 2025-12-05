@@ -8,9 +8,9 @@ use crate::rpc_service::{AppState, current_time_secs};
 use crate::utils::reflect_goat_address;
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use bitvm2_lib::actors::Actor;
 use http::StatusCode;
 use std::sync::Arc;
-
 use store::Node;
 use store::localdb::NodeQuery;
 
@@ -53,13 +53,13 @@ use store::localdb::NodeQuery;
 ///       "actor": "Operator",
 ///       "name": "zkm",
 ///       "service_fee_rate": 0.001,
-///       "updated_at": 1699123456,
-///       "status": "online",
+///       "available_peg_btc": 0,
 ///       "goat_addr": "0x1234567890abcdef1234567890abcdef12345678",
 ///       "btc_pub_key": "02abc123def456...",
 ///       "socket_addr": "127.0.0.1:8080",
 ///       "reward": 1000000,
-///       "available_peg_btc": 0
+///       "updated_at": 1699123456,
+///       "status": "online"
 ///     }
 ///   ],
 ///   "total": 1
@@ -90,17 +90,16 @@ pub async fn get_nodes(
         .update_node_timestamp(&app_state.peer_id, current_time_secs())
         .await
         .api_error("GET_NODES_ERROR")?;
-
     let time_threshold = current_time_secs() - ALIVE_TIME_JUDGE_THRESHOLD;
     let (_, goat_addr) = reflect_goat_address(query_params.goat_addr);
     let (nodes, total) = storage_process
         .find_nodes(&NodeQuery {
-            actor: query_params.actor,
+            actor: query_params.actor.filter(|actor| actor != Actor::All.to_string().as_str()),
             goat_addr,
             time_threshold: query_params.status.clone().map(|_| time_threshold),
             is_in_time_threshold: query_params
                 .status
-                .map(|status| status == NODE_STATUS_OFFLINE)
+                .map(|status| status != NODE_STATUS_OFFLINE)
                 .unwrap_or(true),
             order: None,
             offset: Some(offset),
@@ -141,14 +140,15 @@ pub async fn get_nodes(
 /// ```json
 /// {
 ///   "nodes_overview": {
-///     "total_operators": 10,
+///     "total": 18,
 ///     "online_operators": 8,
-///     "total_watchtowers": 5,
-///     "online_watchtowers": 4,
-///     "total_verifiers": 3,
-///     "online_verifiers": 2,
-///     "total_nodes": 18,
-///     "online_nodes": 14
+///     "offline_operators": 2,
+///     "online_challengers": 3,
+///     "offline_challengers": 1,
+///     "online_committees": 2,
+///     "offline_committees": 0,
+///     "online_watchtowers": 2,
+///     "offline_watchtowers": 0
 ///   }
 /// }
 /// ```
@@ -202,10 +202,13 @@ pub async fn get_nodes_overview(
 /// {
 ///   "peer_id": "QmPeerId...",
 ///   "actor": "Operator",
-///   "btc_pub_key": "02abc...",
+///   "node_name": "zkm",
 ///   "goat_addr": "0x123...",
+///   "btc_pub_key": "02abc...",
 ///   "socket_addr": "127.0.0.1:8080",
 ///   "reward": 1000000,
+///   "service_fee_rate": 0.001,
+///   "available_peg_btc": 0,
 ///   "updated_at": 1640995200,
 ///   "created_at": 1640995200
 /// }

@@ -7,21 +7,24 @@ mod response;
 pub mod routes;
 pub mod validation;
 
-use crate::env::get_network;
+use crate::env::{get_goat_network, get_network, goat_config_from_env};
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::cors_config::CorsConfig;
 use crate::rpc_service::handler::{
-    get_blocks_desc, get_graph, get_graph_neighbor_ids, get_graph_tx, get_graph_txn, get_graphs,
-    get_instance, get_instances, get_instances_overview, get_node, get_nodes, get_nodes_overview,
-    get_proof, get_ready_to_kickoff_graph, instance_settings,
+    bridge_in_request_tag, get_commit_chain_blocks_desc, get_graph, get_graph_neighbor_ids,
+    get_graph_tx, get_graph_txn, get_graphs, get_header_chain_blocks_desc, get_instance,
+    get_instances, get_instances_overview, get_node, get_nodes, get_nodes_overview, get_proof,
+    get_ready_to_kickoff_graph, get_unsigned_pegin_txn, instance_settings,
 };
 use axum::body::Body;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
+use axum::routing::put;
 use axum::{Router, middleware, routing::get};
 use bitvm2_lib::actors::Actor;
 use client::btc_chain::BTCClient;
+use client::goat_chain::GOATClient;
 use client::http_client::async_client::HttpAsyncClient;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
@@ -57,6 +60,7 @@ pub fn create_secure_cors_layer() -> CorsLayer {
 pub struct AppState {
     pub local_db: LocalDB,
     pub btc_client: BTCClient,
+    pub goat_client: GOATClient,
     pub http_client: HttpAsyncClient,
     pub metrics_state: MetricsState,
     pub actor: Actor,
@@ -71,9 +75,18 @@ impl AppState {
         registry: Arc<Mutex<Registry>>,
     ) -> anyhow::Result<Arc<AppState>> {
         let btc_client = BTCClient::new(get_network(), None);
+        let goat_client = GOATClient::new(goat_config_from_env().await, get_goat_network());
         let metrics_state = MetricsState::new(registry);
         let http_client = HttpAsyncClient::new(None);
-        Ok(Arc::new(AppState { local_db, btc_client, metrics_state, actor, peer_id, http_client }))
+        Ok(Arc::new(AppState {
+            local_db,
+            btc_client,
+            goat_client,
+            metrics_state,
+            actor,
+            peer_id,
+            http_client,
+        }))
     }
 }
 
@@ -112,16 +125,19 @@ pub async fn serve(
         .route(routes::v1::NODES_BY_ID, get(get_node))
         .route(routes::v1::NODES_OVERVIEW, get(get_nodes_overview))
         .route(routes::v1::INSTANCES_SETTINGS, get(instance_settings))
+        .route(routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG, put(bridge_in_request_tag))
         .route(routes::v1::INSTANCES_BASE, get(get_instances))
         .route(routes::v1::INSTANCES_BY_ID, get(get_instance))
         .route(routes::v1::INSTANCES_OVERVIEW, get(get_instances_overview))
+        .route(routes::v1::INSTANCES_UNSIGNED_PEGIN_TXN, get(get_unsigned_pegin_txn))
         .route(routes::v1::GRAPHS_BY_ID, get(get_graph))
         .route(routes::v1::GRAPHS_BASE, get(get_graphs))
         .route(routes::v1::GRAPHS_READY_TO_KICKOFF, get(get_ready_to_kickoff_graph))
         .route(routes::v1::GRAPHS_TXN_BY_ID, get(get_graph_txn))
         .route(routes::v1::GRAPHS_TX_BY_ID, get(get_graph_tx))
         .route(routes::v1::GRAPHS_NEIGHBOR_IDS, get(get_graph_neighbor_ids))
-        .route(routes::v1::PROOFS_BLOCKS_DESC, get(get_blocks_desc))
+        .route(routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_DESC, get(get_header_chain_blocks_desc))
+        .route(routes::v1::PROOFS_BLOCKS_COMMIT_CHAIN_CHAIN_DESC, get(get_commit_chain_blocks_desc))
         .route(routes::v1::PROOFS_BASE, get(get_proof))
         .route(routes::METRICS, get(metrics_handler))
         .layer(middleware::from_fn(print_req_and_resp_detail))
@@ -231,7 +247,7 @@ mod tests {
     use prometheus_client::registry::Registry;
     use reqwest::Client;
     use secp256k1::Secp256k1;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -429,8 +445,8 @@ mod tests {
                 resp_validation: Some(Box::new(|text| -> bool {
                     matches!(
                         serde_json::from_str::<NodeOverViewResponse>(&text),
-                        Ok(node_overview) if node_overview.nodes_overview.online_challenger == 1 &&
-                        node_overview.nodes_overview.online_committee == 1
+                        Ok(node_overview) if node_overview.nodes_overview.online_challengers == 1 &&
+                        node_overview.nodes_overview.online_committees == 1
                     )
                 })),
             },
@@ -454,7 +470,7 @@ mod tests {
         let utxo: Vec<Utxo> = vec![Utxo {
             txid: generate_random_bytes(32).try_into().unwrap(),
             vout: 1,
-            amount_stats: bridge_in_amount as u64,
+            amount_sats: bridge_in_amount as u64,
         }];
         let mut instances = Vec::<Instance>::new();
         let mut graphs = Vec::<Graph>::new();
@@ -480,6 +496,7 @@ mod tests {
             committees_answers: Default::default(),
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
+            status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
         });
@@ -506,6 +523,7 @@ mod tests {
             committees_answers: Default::default(),
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
+            status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
         });
@@ -546,6 +564,7 @@ mod tests {
             init_withdraw_tx_hash: Some(format!("0x{}", hex::encode(generate_random_bytes(32)))),
             bridge_out_start_at: current_time_secs() + 100,
             zkm_version: "zkm_0.1.0".to_string(),
+            status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
         });
@@ -581,6 +600,7 @@ mod tests {
             init_withdraw_tx_hash: None,
             bridge_out_start_at: 0,
             zkm_version: "zkm_0.1.0".to_string(),
+            status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
         });
@@ -596,6 +616,8 @@ mod tests {
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(1)).await;
+
+        let bridge_in_request_tag_id = Uuid::new_v4();
 
         let target_instance_id = bridge_in_instance_id;
         let api_test_items = vec![
@@ -613,6 +635,41 @@ mod tests {
                 })),
             },
             ApiTestItem {
+                tag: routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG.to_string(),
+                url: format!("http://{addr}{}", routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG),
+                json_payload: Some(json!({
+                    "instance_id": bridge_in_request_tag_id,
+                    "network": "testnet",
+                    "bridge_request_tx_hash":  format!("0x{}", hex::encode(generate_random_bytes(32))),
+                    "from_addr": get_rand_btc_address_p2wpkh(get_network()),
+                    "to_addr": format!("0x{}", hex::encode(generate_random_bytes(20)))
+                })),
+                method: Method::PUT,
+                expe_res: true,
+                resp_validation: None,
+            },
+            ApiTestItem {
+                tag: format!("{} for bridge in request tag", routes::v1::INSTANCES_BY_ID),
+                url: format!(
+                    "http://{addr}{}/{}",
+                    routes::v1::INSTANCES_BASE,
+                    bridge_in_request_tag_id
+                ),
+                json_payload: None,
+                method: Method::GET,
+                expe_res: true,
+                resp_validation: Some(Box::new(move |text| -> bool {
+                    if let Ok(instance_res) = serde_json::from_str::<InstanceGetResponse>(&text)
+                        && let Some(instance_wrap) = instance_res.instance_wrap
+                        && instance_wrap.instance.instance_id.eq(&bridge_in_request_tag_id)
+                    {
+                        true
+                    } else {
+                        false
+                    }
+                })),
+            },
+            ApiTestItem {
                 tag: routes::v1::INSTANCES_BY_ID.to_string(),
                 url: format!(
                     "http://{addr}{}/{}",
@@ -623,10 +680,14 @@ mod tests {
                 method: Method::GET,
                 expe_res: true,
                 resp_validation: Some(Box::new(move |text| -> bool {
-                    matches!(
-                        serde_json::from_str::<InstanceGetResponse>(&text),
-                        Ok(instanes_res) if instanes_res.instance_wrap.instance.instance_id.eq(&target_instance_id)
-                    )
+                    if let Ok(instance_res) = serde_json::from_str::<InstanceGetResponse>(&text)
+                        && let Some(instance_wrap) = instance_res.instance_wrap
+                        && instance_wrap.instance.instance_id.eq(&target_instance_id)
+                    {
+                        true
+                    } else {
+                        false
+                    }
                 })),
             },
             ApiTestItem {
@@ -729,8 +790,11 @@ mod tests {
         let client = reqwest::Client::new();
 
         let api_test_items = [ApiTestItem {
-            tag: format!("{} get proofs desc", routes::v1::PROOFS_BLOCKS_DESC),
-            url: format!("http://{addr}{}?proof_type=header_chain", routes::v1::PROOFS_BLOCKS_DESC),
+            tag: format!("{} get proofs desc", routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_DESC),
+            url: format!(
+                "http://{addr}{}?proof_type=header_chain",
+                routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_DESC
+            ),
             json_payload: None,
             method: Method::GET,
             expe_res: true,

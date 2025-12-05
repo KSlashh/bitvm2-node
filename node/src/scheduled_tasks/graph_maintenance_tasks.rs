@@ -446,15 +446,6 @@ pub async fn detect_init_withdraw_call(local_db: &LocalDB) -> anyhow::Result<()>
                 );
                 continue;
             }
-
-            trace!("{graph_id} on need to send KickoffReady");
-            tx.update_goat_tx_record_processing_status(
-                &graph_id,
-                &instance_id,
-                &GoatTxType::InitWithdraw.to_string(),
-                &GoatTxProcessingStatus::Processed.to_string(),
-            )
-            .await?;
             upsert_message(
                 &mut tx,
                 false,
@@ -467,12 +458,19 @@ pub async fn detect_init_withdraw_call(local_db: &LocalDB) -> anyhow::Result<()>
                 0,
             )
             .await?;
-            tx.commit().await?;
         } else {
             warn!(
                 "instance_id: {instance_id} graph_id: {graph_id} fail to get graph from db or kickoff txid is none"
             );
         }
+        tx.update_goat_tx_record_processing_status(
+            &graph_id,
+            &instance_id,
+            &GoatTxType::InitWithdraw.to_string(),
+            &GoatTxProcessingStatus::Processed.to_string(),
+        )
+        .await?;
+        tx.commit().await?;
     }
     Ok(())
 }
@@ -751,9 +749,7 @@ async fn handle_operator_withdraw_completion(
                 })
                 .await?;
 
-            storage_processor
-                .update_graph_fields(GraphUpdate::new(graph_id).with_status(status))
-                .await?;
+            storage_processor.update_graph(&GraphUpdate::new(graph_id).with_status(status)).await?;
             info!(
                 "successfully updated database for graph_id: {graph_id} to operator withdraw {withdraw_type}",
             );
@@ -777,8 +773,8 @@ async fn handle_challenge_detected(
     let sub_status = serde_json::to_string(&ChallengeSubStatus::default())?;
     let mut storage_processor = local_db.acquire().await?;
     storage_processor
-        .update_graph_fields(
-            GraphUpdate::new(graph_id)
+        .update_graph(
+            &GraphUpdate::new(graph_id)
                 // .with_status(GraphStatus::Challenge.to_string())
                 .with_challenge_txid(challenge_txid.into())
                 .with_sub_status(sub_status),
@@ -1230,8 +1226,8 @@ async fn process_watchtower_challenge_monitoring(
         }
         if data_change {
             let mut tx = local_db.start_transaction().await?;
-            tx.update_graph_fields(
-                GraphUpdate::new(graph.graph_id)
+            tx.update_graph(
+                &GraphUpdate::new(graph.graph_id)
                     .with_sub_status(serde_json::to_string(sub_status).unwrap()),
             )
             .await?;
@@ -1297,8 +1293,8 @@ async fn process_watchtower_challenge_monitoring(
             {
                 sub_status.watchtower_challenge_status = WatchtowerChallengeStatus::OperatorInit;
                 let mut tx = local_db.start_transaction().await?;
-                tx.update_graph_fields(
-                    GraphUpdate::new(graph.graph_id)
+                tx.update_graph(
+                    &GraphUpdate::new(graph.graph_id)
                         .with_sub_status(serde_json::to_string(sub_status).unwrap()),
                 )
                 .await?;
@@ -1449,8 +1445,8 @@ async fn process_assert_commit_monitoring(
         }
         if data_change {
             let mut tx = local_db.start_transaction().await?;
-            tx.update_graph_fields(
-                GraphUpdate::new(graph.graph_id)
+            tx.update_graph(
+                &GraphUpdate::new(graph.graph_id)
                     .with_sub_status(serde_json::to_string(sub_status).unwrap()),
             )
             .await?;
@@ -1498,8 +1494,8 @@ async fn process_assert_commit_monitoring(
             {
                 sub_status.assert_commit_status = AssertCommitStatus::OperatorInit;
                 let mut tx = local_db.start_transaction().await?;
-                tx.update_graph_fields(
-                    GraphUpdate::new(graph.graph_id)
+                tx.update_graph(
+                    &GraphUpdate::new(graph.graph_id)
                         .with_sub_status(serde_json::to_string(sub_status).unwrap()),
                 )
                 .await?;
@@ -1722,7 +1718,7 @@ async fn fetch_challenge_txid(
         } else {
             info!("graph:{graph_id} detected challenge txid :{txid}");
             storage_processor
-                .update_graph_fields(GraphUpdate::new(graph_id).with_challenge_txid(txid.into()))
+                .update_graph(&GraphUpdate::new(graph_id).with_challenge_txid(txid.into()))
                 .await?;
             Ok(Some(txid.into()))
         }
@@ -1865,8 +1861,8 @@ async fn process_graph_watchtower_assert_disproved(
         Some((disprove_type, start_txid, finish_txid, tx_index)) => {
             if graph.disprove_txid.is_none() {
                 sub_status.disprove_index = tx_index;
-                tx.update_graph_fields(
-                    GraphUpdate::new(graph.graph_id)
+                tx.update_graph(
+                    &GraphUpdate::new(graph.graph_id)
                         .with_disprove_txid(finish_txid.into())
                         .with_sub_status(serde_json::to_string(sub_status).unwrap()),
                 )
