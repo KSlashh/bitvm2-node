@@ -98,12 +98,14 @@ zkm-verifier = { workspace = true }
 stun-client = "0.1.4"
 strum = { version = "0.26", features = ["derive"] }
 borsh = {version = "1.5.3", features = ["derive"] }
-commit-chain-rpc = { workspace = true }
+cbft-rpc = { workspace = true }
 
 # bin
 tempfile = "3.19.1"
 proofs = { path = "../crates/proofs" }
 tokio-util = "0.7.15"
+
+tendermint = { git = "https://github.com/ProjectZKM/tendermint-rs", branch = "patch-0.40.3", default-features = false, features = ["secp256k1"] }
 
 [features]
 default = []

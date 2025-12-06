@@ -22,7 +22,7 @@ pub struct Args {
     #[arg(long, default_value = "http://127.0.0.1:3002")]
     esplora_url: String,
 
-    #[arg(long, default_value = "../node/tests_data/commit_info.json")]
+    #[arg(long, env)]
     commit_info: String,
 
     #[arg(long, default_value = "commits.bin")]
@@ -45,13 +45,22 @@ async fn fetch_commit_chain(args: &Args) {
     let mut commits: Vec<CircuitCommit> = vec![];
 
     let rdr = std::fs::File::open(&args.commit_info).unwrap();
-    let commit_info: Vec<CommitInfo> = serde_json::from_reader(rdr).unwrap();
-    for ci in &commit_info {
-        let tx = btc_client.get_tx(&Txid::from_str(&ci.txid).unwrap()).await.unwrap().unwrap();
+    let commit_info: CommitInfo = serde_json::from_reader(rdr).unwrap();
+    for ci in &[commit_info] {
+        let txid = Txid::from_str(&ci.txid).unwrap();
+        let commit_txn = btc_client.get_tx(&txid).await.unwrap().unwrap();
+        let proof = btc_client.get_merkle_proof_extend(&txid).await.unwrap();
+        let block_height = proof.height;
 
-        let op_return_data = extract_op_return_data(&tx);
+        let op_return_data = extract_op_return_data(&commit_txn.output);
         let mut sequencer_set_hash: [u8; 32] = [0u8; 32];
         sequencer_set_hash.copy_from_slice(&op_return_data);
+
+        if let tendermint::Hash::Sha256(expected_hash) = sequencer_hash(&ci.sequencers) {
+            assert_eq!(expected_hash, sequencer_set_hash);
+        } else {
+            panic!("Invalid sequencer set hash");
+        }
 
         let publisher_public_keys = ci
             .publisher_public_keys
@@ -59,11 +68,12 @@ async fn fetch_commit_chain(args: &Args) {
             .map(|compressed_pk| PublicKey::from_str(compressed_pk).unwrap())
             .collect();
         let commit = CircuitCommit {
-            commit_txn: tx,
-            sequencer_set_hash,
+            commit_txn,
+            sequencers: ci.sequencers.clone(),
             publisher_public_keys,
             threshold: ci.threshold,
             genesis_txid: Txid::from_str(&ci.genesis_txid).unwrap().as_raw_hash().to_byte_array(),
+            block_height,
         };
         commits.push(commit);
     }
@@ -109,18 +119,31 @@ async fn main() {
 
     let input: CommitChainCircuitInput =
         CommitChainCircuitInput { vk_hash, pv_hash, prev_proof, commits };
+
+    let aaa = bincode::serialize(&input).unwrap();
+    println!("input aaa size: {}", aaa.len());
+    let bbb = bincode::deserialize::<CommitChainCircuitInput>(&aaa).unwrap();
+    assert_eq!(input, bbb);
+
+    //let output = commit_chain_circuit(input.clone());
+    //println!("Commit chain circuit output: {:?}", output);
     // Generate the proofs.
     let proof = tracing::info_span!("generate proof").in_scope(|| {
         let mut stdin = ZKMStdin::new();
         stdin.write(&input);
+
         if let Some(proof) = prev_receipt {
             let ZKMProof::Compressed(compressed_proof) = proof.proof else { panic!() };
             stdin.write_proof(*compressed_proof, commit_chain_proof_vk.vk.clone());
+            println!("Write prev proof into stdin");
         } else {
             println!("Skip writing proof for genesis commit");
         }
         client.prove(&commit_chain_proof_pk, stdin).compressed().run().expect("proving failed")
     });
+    if let Err(e) = client.verify(&proof, &commit_chain_proof_vk) {
+        panic!("{}", e);
+    }
 
     fs::write(&args.output_proof, bincode::serialize(&proof).unwrap()).unwrap();
     fs::write(

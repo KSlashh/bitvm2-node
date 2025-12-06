@@ -200,10 +200,9 @@ sol!(
     interface ISequencerSetPublisher {
         struct SequencerSet {
             bytes32 sequencerSetHash; // validator_hash
-            bytes32 nextSequencerSetHash; // next_validator_hash
             bytes32 publishersHash;
             bytes32 nextPublishersHash;
-            bytes32 p2wshSigHash;
+            bytes32 p2wshSigHash; // anchor the BTC txn
             uint256 goatBlockNumber;
         }
         address public multiSigVerifier;
@@ -251,6 +250,7 @@ sol!(
     }
 );
 
+#[derive(Clone, Debug)]
 pub struct GoatInitConfig {
     pub rpc_url: Url,
     pub private_key: Option<String>,
@@ -443,9 +443,12 @@ impl GoatAdaptor {
     ) -> anyhow::Result<TxHash> {
         // update  gas price nonce gas_limit
         tx_request.gas_price = Some(self.provider.clone().get_gas_price().await?);
+        tracing::info!("gas price: {}", tx_request.gas_price.unwrap());
         tx_request.nonce =
             Some(self.provider.clone().get_transaction_count(tx_request.from.unwrap()).await?);
+        tracing::info!("tx: {:?}", tx_request);
         tx_request.gas = Some(self.provider.clone().estimate_gas(tx_request.clone()).await?);
+        tracing::info!("estimated gas: {:?}", tx_request.gas);
 
         // change into unsigned tx
         let unsigned_tx =
@@ -668,7 +671,6 @@ impl From<&SequencerSet> for ISequencerSetPublisher::SequencerSet {
     fn from(value: &SequencerSet) -> Self {
         Self {
             sequencerSetHash: FixedBytes::from_slice(&value.sequencer_set_hash),
-            nextSequencerSetHash: FixedBytes::from_slice(&value.next_sequencer_set_hash),
             publishersHash: FixedBytes::from_slice(&value.publishers_hash),
             nextPublishersHash: FixedBytes::from_slice(&value.next_publishers_hash),
             p2wshSigHash: FixedBytes::from_slice(&value.p2wsh_sig_hash),
