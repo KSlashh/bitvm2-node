@@ -132,6 +132,10 @@ async fn main() {
             .collect::<Vec<CircuitBlockHeader>>()
     };
     println!("block headers: {:?}", bitcoin_block_headers.len());
+    let found = bitcoin_block_headers
+        .iter()
+        .position(|h| h.compute_block_hash() == *target_block.block_hash().as_byte_array());
+    println!("block found: {:?}", found);
 
     println!("construct spv");
     let spv = build_spv(&tx, block_pos, target_block, &bitcoin_block_headers);
@@ -167,8 +171,11 @@ async fn main() {
         client.prove(&watchtower_proof_pk, stdin).groth16().run().expect("proving failed")
     });
 
+    use alloy_primitives::U256;
     let total_work: [u8; 32] = proof.public_values.read();
-    println!("total work: {total_work:?}");
+    println!("total work: {total_work:?}, {}", U256::from_be_bytes(total_work));
+    let btc_best_block_height: u32 = proof.public_values.read();
+    println!("btc_best_block_height: {btc_best_block_height:?}");
 
     std::fs::write(&format!("{}.proof.bin", args.output), proof.bytes()).unwrap();
     std::fs::write(&format!("{}.public_inputs.bin", args.output), proof.public_values.to_vec())

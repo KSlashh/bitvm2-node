@@ -42,7 +42,7 @@ pub struct CircuitCommit {
     pub publisher_public_keys: Vec<PublicKey>,
     pub threshold: u16,
     pub sequencers: Vec<SequencerInfo>,
-    pub block_height: u64, // Bitcoin block height of current commitment
+    pub block_height: u32, // Bitcoin block height of current commitment
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -55,19 +55,6 @@ pub struct SequencerInfo {
     /// Validator name
     pub name: Option<String>,
 }
-
-/*
-impl Into<Info> for SequencerInfo {
-    fn into(self) -> Info {
-        Info {
-            address: account::Id::try_from(hex::decode(&self.address).unwrap()).unwrap(),
-            pub_key: TPublicKey::from_raw_secp256k1(&self.pub_key).unwrap(),
-            power: self.power.try_into().unwrap(),
-            name: self.name,
-            proposer_priority: ProposerPriority::default(),
-        }
-    }
-} */
 
 impl From<SequencerInfo> for Info {
     fn from(val: SequencerInfo) -> Self {
@@ -95,7 +82,7 @@ impl From<Info> for SequencerInfo {
 /// The latest seqeuncer set
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct CommitChainState {
-    pub block_height: u64,
+    pub block_height: u32,
     pub commit_txn: Transaction,
     pub genesis_txid: [u8; 32],
     pub sequencers: Vec<SequencerInfo>,
@@ -126,7 +113,7 @@ pub fn sequencer_hash(sequencers: &[SequencerInfo]) -> Hash {
 impl CommitChainState {
     pub fn new(genesis_txid: [u8; 32], commit_txn: Transaction) -> Self {
         CommitChainState {
-            block_height: u64::MAX,
+            block_height: u32::MAX,
             commit_txn,
             genesis_txid,
             sequencers: Vec::new(),
@@ -140,7 +127,7 @@ impl CommitChainState {
         let mut prev_commit_txn = self.commit_txn.clone();
         let mut prev_publisher_public_keys: Vec<PublicKey> = vec![];
         let mut prev_threshold: u16 = u16::MAX;
-        let mut commit_block_height: u64 = self.block_height;
+        let mut commit_block_height: u32 = self.block_height;
         for commit in &commits {
             let latest_commit_txn_with_wtns = &commit.commit_txn;
             println!("commit tx: {:?}", latest_commit_txn_with_wtns.compute_txid());
@@ -197,6 +184,9 @@ impl CommitChainState {
             }
             prev_sequencers = latest_sequencers;
 
+            println!("[apply_commit]: prev_sequencer: {prev_sequencers:?}");
+            println!("[apply_commit]: sequencer_hash: {:?}", sequencer_hash(prev_sequencers));
+
             // remove witness
             prev_commit_txn = latest_commit_txn_with_wtns.clone();
             prev_commit_txn.input.iter_mut().for_each(|input| {
@@ -222,6 +212,11 @@ pub fn extract_data_from_commitment_outputs(txouts: &[TxOut]) -> Vec<u8> {
         let instructions = script.instructions_minimal().collect::<Result<Vec<_>, _>>().unwrap();
         if let bitcoin::blockdata::script::Instruction::PushBytes(bytes) = &instructions[1] {
             data.extend_from_slice(bytes.as_bytes());
+        }
+        if let bitcoin::script::Instruction::Op(op) = instructions[0]
+            && op == bitcoin::opcodes::all::OP_RETURN
+        {
+            break;
         }
     }
     data
