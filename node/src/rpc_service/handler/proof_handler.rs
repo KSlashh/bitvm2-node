@@ -9,7 +9,9 @@ use crate::rpc_service::{AppState, current_time_secs};
 use crate::utils::generate_random_bytes;
 use axum::Json;
 use axum::extract::{Query, State};
-use client::btc_chain::mempool_v1_type::{V1Blocks, get_v1_blocks_url};
+use client::btc_chain::mempool_v1_type::{
+    MempoolBlocks, V1Blocks, get_v1_blocks_url, get_v1_mempool_blocks_url,
+};
 use http::{StatusCode, Uri};
 use std::sync::Arc;
 use store::ProofStatus;
@@ -84,6 +86,91 @@ pub async fn get_header_chain_blocks_desc(
         StatusCode::OK,
         Json(HeaderChainBlockDescListResponse {
             start: blocks_desc[0].height,
+            range: blocks_desc.len() as u64,
+            blocks_desc,
+        }),
+    ))
+}
+
+/// Fetch a list of Header chain mempool block descriptors
+///
+/// Queries the mempool.space V1 Mempool Blocks endpoint to retrieve blocks currently in the mempool.
+/// Each mempool block is enriched with estimated height (based on current blockchain height),
+/// projected timestamp, and proof status. The height is calculated as current_height + index + 1,
+/// and timestamps are projected forward with offsets based on block position.
+///
+/// # Returns
+///
+/// - `200 OK`: Successfully returns a list of mempool block descriptors.
+/// - `500 Internal Server Error`: Failed to call or parse the mempool API, or failed to get current blockchain height.
+/// - The payload includes `start` (height of the first mempool block), `range` (number of blocks),
+///   and a `blocks_desc` array containing fee stats, size, tx count, projected timestamp,
+///   estimated height, and proof status for each mempool block.
+///
+/// # Use Case
+///
+/// Dashboards, monitoring services, or explorers can use this endpoint to track
+/// pending blocks in the mempool and their projected inclusion in the header chain.
+///
+/// # Example
+///
+/// ```http
+/// GET /v1/proofs/blocks-desc/header-chain/mempool-blocks
+/// ```
+///
+/// Response example:
+/// ```json
+/// {
+///   "start": 800001,
+///   "range": 5,
+///   "blocks_desc": [
+///     {
+///       "height": 800001,
+///       "median_fee": 50000,
+///       "fee_range": [10000.0, 20000.0, 50000.0, 100000.0, 200000.0],
+///       "total_fees": 5000000,
+///       "size": 1500000,
+///       "tx_count": 2500,
+///       "timestamp": 1640995800,
+///       "proof_status": "Pending"
+///     }
+///   ]
+/// }
+/// ```
+#[axum::debug_handler]
+pub async fn get_header_chain_mempool_blocks_desc(
+    _uri: Uri,
+    State(app_state): State<Arc<AppState>>,
+) -> ApiResult<HeaderChainBlockDescListResponse> {
+    let current_height =
+        app_state.btc_client.get_height().await.api_error("GET_MEMPOOL_BLOCKS_DESC")? as u64;
+    let mempool_blocks_url = get_v1_mempool_blocks_url(env::get_network());
+    let mempool_blocks: MempoolBlocks = app_state
+        .http_client
+        .get_response_json(&mempool_blocks_url)
+        .await
+        .api_error("GET_MEMPOOL_BLOCKS_DESC")?;
+
+    let current_time = current_time_secs() as u64;
+    let blocks_desc: Vec<HeaderChainBlockDesc> = mempool_blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let time_offset = match index {
+                0..=1 => (index as u64 + 1) * 600,
+                2..=4 => (index as u64 + 1) * 600 + 60,
+                _ => (index as u64 + 1) * 600 + 120,
+            };
+            let mut block_desc: HeaderChainBlockDesc = block.into();
+            block_desc.timestamp = current_time + time_offset;
+            block_desc.height = current_height + index as u64 + 1;
+            block_desc
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        Json(HeaderChainBlockDescListResponse {
+            start: blocks_desc.first().map_or(0, |block| block.height),
             range: blocks_desc.len() as u64,
             blocks_desc,
         }),
@@ -201,7 +288,7 @@ pub async fn get_commit_chain_blocks_desc(
 /// # Example
 ///
 /// ```http
-/// GET /v1/proofs/proof?height=800000&proof_type=header_chain
+/// GET /v1/proofs?height=800000&proof_type=header_chain
 /// ```
 ///
 /// Response example:
@@ -226,16 +313,25 @@ pub async fn get_commit_chain_blocks_desc(
 #[axum::debug_handler]
 pub async fn get_proof(
     _uri: Uri,
-    Query(_params): Query<ProofsQueryParams>,
+    Query(params): Query<ProofsQueryParams>,
     State(_app_state): State<Arc<AppState>>,
 ) -> ApiResult<ProofResponse> {
     // todo update
+    let pub_inputs = match params.proof_type {
+        ProofType::HeaderChain => {
+            r#"{"vk_hash":[0,0,0,0,0,0,0,0],"pv_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"prev_proof":"GenesisBlock","block_headers":[{"version":874340352,"prev_block_hash":[85,187,159,189,150,107,62,162,220,66,208,194,39,34,228,192,193,114,159,173,23,33,1,0,0,0,0,0,0,0,0,0],"merkle_root":[85,8,127,171,12,143,63,137,248,188,253,77,242,108,80,77,129,176,168,142,4,144,113,97,131,140,12,83,0,26,240,145],"time":1690168629,"bits":386218132,"nonce":106861918},{"version":536977408,"prev_block_hash":[84,160,40,39,215,168,183,86,1,39,90,22,2,121,163,197,118,141,228,193,196,167,2,0,0,0,0,0,0,0,0,0],"merkle_root":[57,77,220,106,93,224,53,135,76,250,34,22,123,254,146,57,83,24,123,90,25,251,184,78,24,109,234,60,120,253,135,28],"time":1690168731,"bits":386218132,"nonce":2352794101}]}"#
+        }
+        ProofType::CommitChain => {
+            r#"{"vk_hash":[0,0,0,0,0,0,0,0],"pv_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"prev_proof":"GenesisBlock","commits":[{"commit_txn":{"version":1,"lock_time":0,"input":[{"previous_output":"0000000000000000000000000000000000000000000000000000000000000000:4294967295","script_sig":"0393384400fe20e13100fe214f07000963676d696e6572343208760000000000000000","sequence":4294967295,"witness":["0000000000000000000000000000000000000000000000000000000000000000"]}],"output":[{"value":6106,"script_pubkey":"76a914349514f43295c41764ee036aaa8520dac4b1468c88ac"},{"value":0,"script_pubkey":"6a24aa21a9ed6229b05f1985ef7852e32d53f8a2a6e1f2c2b973ebf2b8aa53ec2cf157078122"}]},"genesis_txid":[85,110,218,173,174,159,216,250,98,250,2,152,245,160,242,16,136,221,5,151,207,214,0,169,238,243,136,233,24,75,67,203],"sequencer_set_hash":[119,143,242,6,41,98,189,153,210,117,109,34,4,251,217,57,27,151,214,24,218,251,238,29,134,228,62,100,48,52,68,248],"publisher_public_keys":["0277d8bae5febdabb96e9b5e5788556cdd39755936027721df39b8a339b9f0c982"],"threshold":0}]}"#
+        }
+    };
+
     Ok((
         StatusCode::OK,
         Json(ProofResponse {
             proof: Some(ProofDesc {
                 block_number: 800000,
-                proof_type: ProofType::HeaderChain,
+                proof_type: params.proof_type,
                 state: "proved".to_string(),
                 proving_cycles: 1000000,
                 proving_time: 120,
@@ -243,7 +339,7 @@ pub async fn get_proof(
                 total_time_to_proof: 180,
                 proof_size: 2048.5,
                 zkm_version: "1.0.0".to_string(),
-                pub_inputs: "0x1234".to_string(),
+                pub_inputs: pub_inputs.to_string(),
                 started_at: current_time_secs(),
                 updated_at: current_time_secs(),
             }),

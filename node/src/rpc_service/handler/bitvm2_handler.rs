@@ -454,10 +454,10 @@ pub async fn get_instances_overview(
             instances_overview: InstanceOverview {
                 total_bridge_in_amount: pegin_sum,
                 total_bridge_in_txn: pegin_count,
-                total_bridge_out_amount: pegout_sum,
-                total_bridge_out_txn: pegout_count,
-                total_peg_out_amount: 0,
-                total_peg_out_txn: 0,
+                total_bridge_out_amount: 0,
+                total_bridge_out_txn: 0,
+                total_peg_out_amount: pegout_sum,
+                total_peg_out_txn: pegout_count,
                 online_nodes: alive,
                 total_nodes: total,
             },
@@ -1464,7 +1464,14 @@ pub async fn get_unsigned_pegin_txn(
     let mut res = UnsignPeginTxnResponse::default();
     if let Some(instance) =
         storage_processor.find_instance(&current_id).await.api_error("GET_UNSIGNED_PEGIN_ERROR")?
-        && instance.status == InstanceBridgeInStatus::CommitteesAnswered.to_string()
+        && [
+            InstanceBridgeInStatus::CommitteesAnswered.to_string(),
+            InstanceBridgeInStatus::UserBroadcastPeginPrepare.to_string(),
+            InstanceBridgeInStatus::Presigned.to_string(),
+            InstanceBridgeInStatus::PresignedFailed.to_string(),
+            InstanceBridgeInStatus::Timeout.to_string(),
+        ]
+        .contains(&instance.status)
     {
         let instance_parameters =
             gen_instance_parameters_local(&instance).api_error("GET_UNSIGNED_PEGIN_ERROR")?;
