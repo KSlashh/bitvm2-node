@@ -34,7 +34,9 @@ primitives.workspace = true
 provider.workspace = true
 bitcoin-script.workspace = true
 alloy-provider = { workspace = true, default-features = false }
-serde_cbor.workspace = true
+#serde_cbor.workspace = true
+
+util.workspace = true
 
 borsh = { workspace = true }
 bitcoin-light-client-circuit = { workspace = true }
@@ -44,6 +46,7 @@ state-chain = { workspace = true }
 cbft-rpc = { workspace = true }
 bitcoin = { workspace = true }
 client = { workspace = true }
+proof-builder.workspace = true
 
 # Ziren
 zkm-sdk.workspace = true

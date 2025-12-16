@@ -85,12 +85,12 @@ Generate the proof:
 
 ```
 # Genesis
-RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --init-input --output-proof "data/commit-chain/commit-proof.bin" --commits data/commit-chain/commits.bin --commit-info ../node/tests_data/commit_info.json
+RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --init-input --output-proof "data/commit-chain/commit-proof.bin" --commit-info ../node/tests_data/commit_info.json --start 0 --commits data/commit-chain/commits.bin
 
 # Regular proof
-RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --input-proof "data/commit-chain/commit-proof.bin" --output-proof "data/commit-chain/commit-proof2.bin" --commit-info ../node/tests_data/commit_info2.json --commits data/commit-chain/commits.bin
+RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --input-proof "data/commit-chain/commit-proof.bin" --output-proof "data/commit-chain/commit-proof2.bin" --commit-info ../node/tests_data/commit_info.json --start 1 --commits data/commit-chain/commits.bin
 
-RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --input-proof "data/commit-chain/commit-proof2.bin" --output-proof "data/commit-chain/commit-proof3.bin" --commit-info ../node/tests_data/commit_info3.json --commits data/commit-chain/commits.bin
+RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --input-proof "data/commit-chain/commit-proof2.bin" --output-proof "data/commit-chain/commit-proof3.bin" --commit-info ../node/tests_data/commit_info.json --start 2 --commits data/commit-chain/commits.bin
 ```
 
 ## State Chain
@@ -103,10 +103,6 @@ We generate `state-chain-proof` periodically, like by 5 GOAT EVM blocks. Optiona
 * Generate state-chain proof. If there are some `proceedWithdraw` transactions, configure `GRAPH_IDS` and `GRAPH_BLOCK_NUMBERS` by sparating them by comma. 
 
 ```
-# Required if applied
-export GRAPH_IDS="0x00112233445566778899aabbccddeeff"
-export GRAPH_BLOCK_NUMBERS=9511055
-
 export EL_START_BLOCK_NUMBER=9511050
 export BATCH_SIZE=10
 export L2_CONTRACT_ADDRESS=0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f
@@ -123,24 +119,20 @@ If a challenge is happened, each watchtower should broadcast a `watchtower-chall
 
 ```
 export BITCOIN_NETWORK=regtest
-export GENESIS_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json | jq -r .genesis_txid)
-export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json | jq -r .txid)
+export GENESIS_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json.0 | jq -r .genesis_txid)
+export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json.0 | jq -r .txid)
 export HEADER_CHAIN_INPUT_PROOF="data/header-chain/503050-10.bin"
 export COMMIT_CHAIN_INPUT_PROOF="data/commit-chain/commit-proof.bin"
 export LATEST_STATE_BLOCK_HASH="0x7908184bce067fa5a4508d309cbaf22dd1e0b586ad2dd42c0e51a5308a7bd815"
 export STATE_CHAIN_INPUT_PROOF="data/state-chain/9511050-10.bin"
 
-# optional
-export GRAPH_IDS="0x00112233445566778899aabbccddeeff"
-export GRAPH_BLOCK_NUMBERS=9511055
-
 RUST_LOG=info cargo run --package watchtower-proof --bin watchtower-proof -r -- --output "data/watchtower/output.bin" --block-headers data/header-chain/block_headers.bin
 
-export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info2.json | jq -r .txid)
+export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json.1 | jq -r .txid)
 export COMMIT_CHAIN_INPUT_PROOF="data/commit-chain/commit-proof2.bin"
 RUST_LOG=info cargo run --package watchtower-proof --bin watchtower-proof -r -- --output "data/watchtower/output2.bin"
 
-export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info3.json | jq -r .txid)
+export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json.2 | jq -r .txid)
 export COMMIT_CHAIN_INPUT_PROOF="data/commit-chain/commit-proof3.bin"
 RUST_LOG=info cargo run --package watchtower-proof --bin watchtower-proof -r -- --output "data/watchtower/output3.bin"
 ```
@@ -171,8 +163,8 @@ After calling the [`proceedWithdraw`](https://github.com/GOATNetwork/bitvm2-L2-c
 
 ```
 export BITCOIN_NETWORK=regtest
-export GENESIS_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json | jq -r .genesis_txid)
-export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info3.json | jq -r .txid)
+export GENESIS_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json.0 | jq -r .genesis_txid)
+export LATEST_SEQUENCER_COMMIT_TXID=$(cat ../node/tests_data/commit_info.json.2 | jq -r .txid)
 export HEADER_CHAIN_INPUT_PROOF="data/header-chain/503050-10.bin"
 export COMMIT_CHAIN_INPUT_PROOF="data/commit-chain/commit-proof3.bin"
 export STATE_CHAIN_INPUT_PROOF="data/state-chain/9511050-10.bin"
