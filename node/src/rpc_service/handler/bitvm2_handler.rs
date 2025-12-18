@@ -1,13 +1,15 @@
 use crate::env::GraphBtcTxName;
 use crate::rpc_service::bitvm2::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;
-use crate::rpc_service::response::{ApiErrorExt, ApiResult, ErrorResponse};
+use crate::rpc_service::response::{ApiErrorExt, ApiResult, ErrorResponse, ok_response};
 use crate::rpc_service::validation::InputValidator;
 use crate::rpc_service::{AppState, current_time_secs};
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     AssertInitTxVoutMonitorData, ChallengeSubStatus, WTInitTxVoutMonitorData,
 };
-use crate::utils::{gen_instance_parameters_local, parse_graph_raw_data};
+use crate::utils::{
+    find_instances_by_escrow_hash, gen_instance_parameters_local, parse_graph_raw_data,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize_hex;
@@ -18,8 +20,11 @@ use http::StatusCode;
 use std::default::Default;
 use std::sync::Arc;
 use store::localdb::{GraphQuery, InstanceQuery, StorageProcessor};
-use store::{Graph, GraphStatus, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus};
+use store::{
+    GoatTxType, Graph, GraphStatus, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus,
+};
 use tracing::warn;
+use uuid::Uuid;
 
 /// Get instance settings
 ///
@@ -51,10 +56,7 @@ use tracing::warn;
 pub async fn instance_settings(
     State(_app_state): State<Arc<AppState>>,
 ) -> ApiResult<InstanceSettingResponse> {
-    Ok((
-        StatusCode::OK,
-        Json(InstanceSettingResponse { bridge_in_amount: BRIDGE_IN_AMOUNTS.to_vec() }),
-    ))
+    ok_response(InstanceSettingResponse { bridge_in_amount: BRIDGE_IN_AMOUNTS.to_vec() })
 }
 
 /// Prepare bridge-in request
@@ -99,9 +101,13 @@ pub async fn bridge_in_request_tag(
     State(app_state): State<Arc<AppState>>,
     Json(payload): Json<BridgeInPrepareRequest>,
 ) -> ApiResult<BridgeInPrepareResponse> {
-    InputValidator::validate_btc_address(&payload.from_addr, "from_addr")?;
-    InputValidator::validate_goat_address(&payload.to_addr, "goat_addr")?;
-    let instance_id = InputValidator::validate_uuid(&payload.instance_id, "btc_addr")?;
+    InputValidator::validate_btc_address(
+        &payload.from_addr,
+        Some(payload.network.clone()),
+        "from_addr",
+    )?;
+    let to_addr = InputValidator::validate_goat_address(&payload.to_addr, "to_addr")?;
+    let instance_id = InputValidator::validate_uuid(&payload.instance_id, "instance_id")?;
     let mut storage_process =
         app_state.local_db.acquire().await.api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
     let current_time = current_time_secs();
@@ -111,31 +117,166 @@ pub async fn bridge_in_request_tag(
             is_bridge_in: true,
             network: payload.network,
             from_addr: payload.from_addr,
-            to_addr: payload.to_addr,
-            amount: 0,
-            fees: Default::default(),
-            input_utxos: "[]".to_string(),
+            to_addr,
             status: InstanceBridgeInStatus::UserIniting.to_string(),
-            goat_tx_hash: "".to_string(),
-            goat_tx_height: 0,
-            user_xonly_pubkey: Default::default(),
-            user_change_addr: "".to_string(),
-            user_refund_addr: "".to_string(),
-            btc_txid: None,
-            btc_height: 0,
-            pegin_confirm_txid: None,
-            pegin_cancel_txid: None,
-            committees_answers: Default::default(),
-            pegin_data_tx_hash: "".to_string(),
-            parameters: None,
-            escrow_hash: None,
             status_updated_at: current_time,
             created_at: current_time,
             updated_at: current_time,
+            ..Default::default()
         })
         .await
         .api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
-    Ok((StatusCode::OK, Json(BridgeInPrepareResponse {})))
+    ok_response(BridgeInPrepareResponse {})
+}
+
+/// Initialize bridge-out request
+///
+/// Validates user-provided bridge-out data and creates a bridge-out instance record. This is the first step
+/// in the bridge-out workflow, used to prepare bridging assets from L2 (GOAT) to L1 (Bitcoin). Clients should
+/// provide an escrow hash (`escrow_hash`) to associate with an escrow contract already created on the GOAT chain.
+///
+/// # Request Body
+///
+/// - `instance_id`: Unique identifier (UUID) for the bridge-out request
+/// - `network`: Target Bitcoin network (e.g., `testnet3`, `mainnet`)
+/// - `from_addr`: User's source address on the GOAT chain
+/// - `to_addr`: Bitcoin destination address that receives the bridged assets
+/// - `escrow_hash`: Hash of the escrow contract on the GOAT chain, referencing the escrow transaction for the bridge intent
+///
+/// # Returns
+///
+/// - `200 OK`: Request is valid and can proceed to the next step of bridge-out workflow
+/// - Response body currently acts as an acknowledgment placeholder for future metadata
+///
+/// # Use Case
+///
+/// Frontend applications use this endpoint to initiate the bridge-out flow, recording the user's intent to bridge
+/// from L2 to L1 into the system.
+///
+/// # Example
+///
+/// ```http
+/// PUT /v1/instances/bridge-out-init-tag
+/// {
+///   "instance_id": "123e4567-e89b-12d3-a456-426614174000",
+///   "network": "testnet",
+///   "from_addr": "0x1234567890abcdef1234567890abcdef12345678",
+///   "to_addr": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+///   "escrow_hash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e"
+/// }
+/// ```
+///
+/// Response example:
+/// ```json
+/// {}
+/// ```
+#[axum::debug_handler]
+pub async fn bridge_out_init_tag(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<BridgeOutInitTagRequest>,
+) -> ApiResult<BridgeOutInitTagResponse> {
+    let instance_id = InputValidator::validate_uuid(&payload.instance_id, "instance_id")?;
+    let from_addr = InputValidator::validate_goat_address(&payload.from_addr, "from_addr")?;
+    InputValidator::validate_btc_address(
+        &payload.to_addr,
+        Some(payload.network.clone()),
+        "network and to_addr",
+    )?;
+    let escrow_hash = InputValidator::validate_hex(&payload.escrow_hash, true, 32, "escrow_hash")?;
+    let mut storage_process =
+        app_state.local_db.acquire().await.api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
+    let current_time = current_time_secs();
+    let mut instance = match find_instances_by_escrow_hash(&mut storage_process, &escrow_hash)
+        .await
+        .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?
+    {
+        Some(instance) => instance,
+        None => Instance {
+            instance_id,
+            from_addr,
+            network: payload.network.clone(),
+            escrow_hash: Some(escrow_hash),
+            status: InstanceBridgeOutStatus::Initialize.to_string(),
+            status_updated_at: current_time,
+            created_at: current_time,
+            ..Default::default()
+        },
+    };
+    if instance.status == InstanceBridgeOutStatus::Initialize.to_string() {
+        instance.to_addr = payload.to_addr;
+        instance.network = payload.network;
+        storage_process
+            .upsert_instance(&instance)
+            .await
+            .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
+    }
+
+    ok_response(BridgeOutInitTagResponse {})
+}
+
+/// Get instance escrow data
+///
+/// Returns escrow hash information for a specified bridge instance. Escrow data is used in the bridge-out workflow,
+/// containing information about the escrow contract created on the GOAT chain. This endpoint allows clients to query
+/// the escrow hash associated with a specific instance for verification and tracking of bridge status.
+///
+/// # Path Parameters
+///
+/// - `instance_id`: UUID of the bridge instance to query
+///
+/// # Returns
+///
+/// - `200 OK`: Successfully returns escrow data information
+/// - `500 Internal Server Error`: Server internal error or database operation failed
+/// - Response includes instance ID, escrow hash (if present), and optional error information
+///
+/// # Use Case
+///
+/// Frontend applications use this endpoint to query the escrow hash for a bridge-out instance, to verify escrow
+/// contract status and track bridge progress.
+///
+/// # Example
+///
+/// ```http
+/// GET /v1/instances/123e4567-e89b-12d3-a456-426614174000/escrow-data
+/// ```
+///
+/// Response example:
+/// ```json
+/// {
+///   "instance_id": "123e4567-e89b-12d3-a456-426614174000",
+///   "escrow": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
+///   "error": null
+/// }
+/// ```
+#[axum::debug_handler]
+pub async fn get_instance_escrow_data(
+    State(app_state): State<Arc<AppState>>,
+    Path(instance_id): Path<String>,
+) -> ApiResult<EscrowDataResponse> {
+    let instance_id = InputValidator::validate_uuid(&instance_id, "instance_id")?;
+    let mut storage_process =
+        app_state.local_db.acquire().await.api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
+    match storage_process
+        .get_graph_goat_tx_record(
+            &instance_id,
+            &Uuid::nil(),
+            &GoatTxType::SwapInitialize.to_string(),
+        )
+        .await
+        .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?
+    {
+        Some(tx_record) => ok_response(EscrowDataResponse {
+            instance_id: instance_id.to_string(),
+            escrow: tx_record.extra,
+            error: None,
+        }),
+        None => ok_response(EscrowDataResponse {
+            instance_id: instance_id.to_string(),
+            escrow: None,
+            error: Some("no escrow record in db".to_string()),
+        }),
+    }
 }
 
 /// Get instance list
@@ -195,6 +336,7 @@ pub async fn bridge_in_request_tag(
 ///         "parameters": null,
 ///         "escrow_hash": null,
 ///         "status_updated_at": 1699123456,
+///         "bridge_out_lock_time": 0,
 ///         "created_at": 1699123456,
 ///         "updated_at": 1699123456
 ///       },
@@ -226,20 +368,18 @@ pub async fn get_instances(
 ) -> ApiResult<InstanceListResponse> {
     // Validate pagination parameters
     let (offset, limit) = InputValidator::validate_pagination(params.offset, params.limit)?;
-    // Validate from_addr format (if provided)
-    if let Some(ref from_addr) = params.from_addr {
-        if params.is_bridge_in {
-            InputValidator::validate_btc_address(from_addr, "bridge in from_addr")?;
-        } else {
-            InputValidator::validate_goat_address(from_addr, "Bridge out from_addr")?;
-        }
-    }
-
     // Database query
     let mut storage_process = app_state.local_db.acquire().await.api_error("GET_INSTANCE_ERROR")?;
 
     let mut query = InstanceQuery::default();
     if let Some(from_addr) = params.from_addr {
+        // Validate from_addr format (if provided)
+        let from_addr = if params.is_bridge_in {
+            InputValidator::validate_btc_address(&from_addr, None, "bridge in from_addr")?;
+            from_addr
+        } else {
+            InputValidator::validate_goat_address(&from_addr, "Bridge out from_addr")?.to_string()
+        };
         query = query.with_from_addr(from_addr);
     }
     query = query
@@ -252,7 +392,7 @@ pub async fn get_instances(
 
     if instances.is_empty() {
         warn!("get_instances instance is empty: total {}", total);
-        return Ok((StatusCode::OK, Json(InstanceListResponse::default())));
+        return ok_response(InstanceListResponse::default());
     }
     let btc_current_height =
         app_state.btc_client.get_height().await.api_error("GET_INSTANCE_ERROR")?;
@@ -274,7 +414,7 @@ pub async fn get_instances(
         items.push(item);
     }
 
-    Ok((StatusCode::OK, Json(InstanceListResponse { instance_wraps: items, total })))
+    ok_response(InstanceListResponse { instance_wraps: items, total })
 }
 
 /// Get instance by ID
@@ -330,6 +470,7 @@ pub async fn get_instances(
 ///       "pegin_data_tx_hash": "0x...",
 ///       "parameters": null,
 ///       "escrow_hash": null,
+///       "bridge_out_lock_time": 0,
 ///       "status_updated_at": 1699123456,
 ///       "created_at": 1699123456,
 ///       "updated_at": 1699123456
@@ -384,10 +525,10 @@ pub async fn get_instance(
             .api_error("GET_INSTANCE_ERROR")?,
         );
 
-        Ok((StatusCode::OK, Json(InstanceGetResponse { instance_wrap })))
+        ok_response(InstanceGetResponse { instance_wrap })
     } else {
         tracing::info!("instance_id {} has no record in database", instance_id);
-        Ok((StatusCode::OK, Json(InstanceGetResponse { instance_wrap: None })))
+        ok_response(InstanceGetResponse { instance_wrap: None })
     }
 }
 
@@ -460,21 +601,18 @@ pub async fn get_instances_overview(
         .await
         .api_error("INSTANCE_OVERVIEW_ERROR")?;
 
-    Ok((
-        StatusCode::OK,
-        Json(InstanceOverviewResponse {
-            instances_overview: InstanceOverview {
-                total_bridge_in_amount: bridge_in_sum,
-                total_bridge_in_txn: bridge_in_count,
-                total_bridge_out_amount: bridge_out_sum,
-                total_bridge_out_txn: bridge_out_count,
-                total_peg_out_amount: pegout_sum,
-                total_peg_out_txn: pegout_count,
-                online_nodes: alive,
-                total_nodes: total,
-            },
-        }),
-    ))
+    ok_response(InstanceOverviewResponse {
+        instances_overview: InstanceOverview {
+            total_bridge_in_amount: bridge_in_sum,
+            total_bridge_in_txn: bridge_in_count,
+            total_bridge_out_amount: bridge_out_sum,
+            total_bridge_out_txn: bridge_out_count,
+            total_peg_out_amount: pegout_sum,
+            total_peg_out_txn: pegout_count,
+            online_nodes: alive,
+            total_nodes: total,
+        },
+    })
 }
 
 /// Get graph by ID
@@ -564,10 +702,10 @@ pub async fn get_graph(
             .await
             .api_error("GET_GRAPH_ERROR")?;
 
-        Ok((StatusCode::OK, Json(graph_extended)))
+        ok_response(graph_extended)
     } else {
         tracing::warn!("graph:{} is not record in db", graph_id);
-        Ok((StatusCode::OK, Json(GraphExtended::default())))
+        ok_response(GraphExtended::default())
     }
 }
 
@@ -658,7 +796,7 @@ pub async fn get_graphs(
 
     resp.total = total;
     if graphs.is_empty() {
-        return Ok((StatusCode::OK, Json(resp)));
+        return ok_response(resp);
     }
 
     let mut converted_graphs = Vec::new();
@@ -670,7 +808,7 @@ pub async fn get_graphs(
     }
     resp.graphs = converted_graphs;
 
-    Ok((StatusCode::OK, Json(resp)))
+    ok_response(resp)
 }
 
 /// Get ready to kickoff graph
@@ -784,10 +922,7 @@ pub async fn get_ready_to_kickoff_graph(
         .api_error("GET_READY_KICKOFF_GRAPHS_ERROR")?;
 
     if graphs.is_empty() {
-        return Ok((
-            StatusCode::OK,
-            Json(GraphReadyToKickoffResponse { graph: None, no_ready_reason: None }),
-        ));
+        return ok_response(GraphReadyToKickoffResponse { graph: None, no_ready_reason: None });
     }
 
     let graph = graphs[0].clone();
@@ -809,20 +944,14 @@ pub async fn get_ready_to_kickoff_graph(
             ]
             .contains(&pre_graphs[0].status)
         {
-            return Ok((
-                StatusCode::OK,
-                Json(GraphReadyToKickoffResponse {
-                    graph: None,
-                    no_ready_reason: Some(pre_graphs[0].graph_id.to_string()),
-                }),
-            ));
+            return ok_response(GraphReadyToKickoffResponse {
+                graph: None,
+                no_ready_reason: Some(pre_graphs[0].graph_id.to_string()),
+            });
         }
     }
 
-    Ok((
-        StatusCode::OK,
-        Json(GraphReadyToKickoffResponse { graph: Some(graph), no_ready_reason: None }),
-    ))
+    ok_response(GraphReadyToKickoffResponse { graph: Some(graph), no_ready_reason: None })
 }
 
 /// Get graph Bitcoin transaction progress data
@@ -1120,12 +1249,9 @@ pub async fn get_graph_tx(
             }
         };
 
-        Ok((
-            StatusCode::OK,
-            Json(GraphTxGetResponse {
-                btc_tx_data: BtcTxData { raw_data, progresses, fail_reason },
-            }),
-        ))
+        ok_response(GraphTxGetResponse {
+            btc_tx_data: BtcTxData { raw_data, progresses, fail_reason },
+        })
     } else {
         tracing::warn!("graph:{} is not record in db", graph_id);
         Err((
@@ -1359,7 +1485,7 @@ pub async fn get_graph_txn(
             resp.disprove.raw_data = serialize_hex(&tx);
         }
 
-        Ok((StatusCode::OK, Json(resp)))
+        ok_response(resp)
     } else {
         warn!("graph:{} is not record in db", graph_id);
         Err((
@@ -1429,7 +1555,7 @@ pub async fn get_graph_neighbor_ids(
             res.next_id = Some(*graph_id);
         }
     }
-    Ok((StatusCode::OK, Json(res)))
+    ok_response(res)
 }
 
 /// Get unsigned pegin transactions
@@ -1501,7 +1627,7 @@ pub async fn get_unsigned_pegin_txn(
             "instance:{instance_id} is not record in db or instance status neq CommitteesAnswered"
         );
     }
-    Ok((StatusCode::OK, Json(res)))
+    ok_response(res)
 }
 
 // fn is_segwit_address(address: &str, network: &str) -> anyhow::Result<bool> {

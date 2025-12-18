@@ -11,10 +11,9 @@ use crate::env::{get_goat_network, get_network, goat_config_from_env};
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::cors_config::CorsConfig;
 use crate::rpc_service::handler::{
-    bridge_in_request_tag, get_commit_chain_blocks_desc, get_graph, get_graph_neighbor_ids,
-    get_graph_tx, get_graph_txn, get_graphs, get_header_chain_blocks_desc,
-    get_header_chain_mempool_blocks_desc, get_instance, get_instances, get_instances_overview,
-    get_node, get_nodes, get_nodes_overview, get_proof, get_ready_to_kickoff_graph,
+    bridge_in_request_tag, bridge_out_init_tag, get_chain_proof, get_graph, get_graph_neighbor_ids,
+    get_graph_tx, get_graph_txn, get_graphs, get_instance, get_instance_escrow_data, get_instances,
+    get_instances_overview, get_node, get_nodes, get_nodes_overview, get_ready_to_kickoff_graph,
     get_unsigned_pegin_txn, instance_settings,
 };
 use axum::body::Body;
@@ -127,23 +126,19 @@ pub async fn serve(
         .route(routes::v1::NODES_OVERVIEW, get(get_nodes_overview))
         .route(routes::v1::INSTANCES_SETTINGS, get(instance_settings))
         .route(routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG, put(bridge_in_request_tag))
+        .route(routes::v1::INSTANCES_BRIDGE_OUT_INIT_TAG, put(bridge_out_init_tag))
         .route(routes::v1::INSTANCES_BASE, get(get_instances))
         .route(routes::v1::INSTANCES_BY_ID, get(get_instance))
         .route(routes::v1::INSTANCES_OVERVIEW, get(get_instances_overview))
         .route(routes::v1::INSTANCES_UNSIGNED_PEGIN_TXN, get(get_unsigned_pegin_txn))
+        .route(routes::v1::INSTANCES_ESCROW_DATA, get(get_instance_escrow_data))
         .route(routes::v1::GRAPHS_BY_ID, get(get_graph))
         .route(routes::v1::GRAPHS_BASE, get(get_graphs))
         .route(routes::v1::GRAPHS_READY_TO_KICKOFF, get(get_ready_to_kickoff_graph))
         .route(routes::v1::GRAPHS_TXN_BY_ID, get(get_graph_txn))
         .route(routes::v1::GRAPHS_TX_BY_ID, get(get_graph_tx))
         .route(routes::v1::GRAPHS_NEIGHBOR_IDS, get(get_graph_neighbor_ids))
-        .route(routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_DESC, get(get_header_chain_blocks_desc))
-        .route(
-            routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_MEMPOOL_BLOCKS,
-            get(get_header_chain_mempool_blocks_desc),
-        )
-        .route(routes::v1::PROOFS_BLOCKS_COMMIT_CHAIN_CHAIN_DESC, get(get_commit_chain_blocks_desc))
-        .route(routes::v1::PROOFS_BASE, get(get_proof))
+        .route(routes::v1::PROOFS_CHAIN_PROOFS_DESC, get(get_chain_proof))
         .route(routes::METRICS, get(metrics_handler))
         .layer(middleware::from_fn(print_req_and_resp_detail))
         .layer(create_secure_cors_layer())
@@ -502,6 +497,7 @@ mod tests {
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
             escrow_hash: None,
+            bridge_out_lock_time: 0,
             status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
@@ -530,6 +526,7 @@ mod tests {
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
             escrow_hash: None,
+            bridge_out_lock_time: 0,
             status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
@@ -798,10 +795,10 @@ mod tests {
         let client = reqwest::Client::new();
 
         let api_test_items = [ApiTestItem {
-            tag: format!("{} get proofs desc", routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_DESC),
+            tag: format!("{} get proofs desc", routes::v1::PROOFS_CHAIN_PROOFS_DESC),
             url: format!(
                 "http://{addr}{}?proof_type=header_chain",
-                routes::v1::PROOFS_BLOCKS_HEADER_CHAIN_DESC
+                routes::v1::PROOFS_CHAIN_PROOFS_DESC
             ),
             json_payload: None,
             method: Method::GET,

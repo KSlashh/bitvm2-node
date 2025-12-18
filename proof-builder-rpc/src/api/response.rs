@@ -1,17 +1,17 @@
 use axum::Json;
-use http::StatusCode;
+use axum::http::StatusCode;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
-pub struct ErrorResponse {
+pub(super) struct ErrorResponse {
     pub error: String,
     pub message: String,
 }
 
-pub type ApiResult<T> = Result<(StatusCode, Json<T>), (StatusCode, Json<ErrorResponse>)>;
+pub(crate) type ApiResult<T> = Result<(StatusCode, Json<T>), (StatusCode, Json<ErrorResponse>)>;
 
 /// Trait extension for Result to easily convert errors to API error format
-pub trait ApiErrorExt<T> {
+pub(super) trait ApiErrorExt<T> {
     /// Convert error to API error format with the given error code
     fn api_error(self, error_code: &str) -> Result<T, (StatusCode, Json<ErrorResponse>)>;
 }
@@ -23,7 +23,7 @@ impl<T, E: std::fmt::Display> ApiErrorExt<T> for Result<T, E> {
 }
 
 /// Helper function to convert any error into ApiResult error format
-pub fn to_api_error<E: std::fmt::Display>(
+pub(crate) fn to_api_error<E: std::fmt::Display>(
     error_code: &str,
     error: E,
 ) -> (StatusCode, Json<ErrorResponse>) {
@@ -35,6 +35,6 @@ pub fn to_api_error<E: std::fmt::Display>(
 }
 
 /// Helper function to create a successful ApiResult response
-pub fn ok_response<T: Serialize>(data: T) -> ApiResult<T> {
+pub(crate) fn ok_response<T: Serialize>(data: T) -> ApiResult<T> {
     Ok((StatusCode::OK, Json(data)))
 }
