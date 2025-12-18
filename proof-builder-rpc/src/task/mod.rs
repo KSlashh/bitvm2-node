@@ -203,7 +203,10 @@ pub(crate) async fn fetch_on_demand_task(
         .await?
     {
         Some(d) => d,
-        None => anyhow::bail!("Header chain input proof is not ready"),
+        None => {
+            tracing::error!("Header chain input proof is not ready");
+            return Ok(None);
+        }
     };
     tracing::info!("header_chain_input_proof: {header_chain_input_proof:?}");
     let header_chain_input_proof = header_chain_input_proof.path_to_proof.unwrap();
@@ -214,7 +217,10 @@ pub(crate) async fn fetch_on_demand_task(
         .await?
     {
         Some(d) => d,
-        None => anyhow::bail!("Commit chain input proof is not ready"),
+        None => {
+            tracing::error!("Commit chain input proof is not ready");
+            return Ok(None);
+        }
     };
     tracing::info!("commit_chain_input_proof: {commit_chain_input_proof:?}");
     let start = commit_chain_input_proof.block_start;
@@ -223,8 +229,13 @@ pub(crate) async fn fetch_on_demand_task(
         .parent()
         .unwrap()
         .join(format!("commits.bin.{start}"));
-    println!("file: {file:?}");
-    let content = std::fs::read_to_string(&file)?;
+    let content = match std::fs::read_to_string(&file) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("read {file:?} error, {e}");
+            return Ok(None);
+        }
+    };
     let commits: Vec<CircuitCommit> = serde_json::from_str(&content)?;
     let latest_sequencer_commit_txid = commits[0].commit_txn.compute_txid().to_string();
 
@@ -312,7 +323,9 @@ pub(crate) async fn update_long_running_task(
     local_db: &LocalDB,
     start: u64,
     batch_size: u64,
-    path_to_proof: &str,
+    path_to_proof: String,
+    public_value_hex: String,
+    proof_size: i64,
     cycles: u64,
     chain_name: String,
     proving_duration: i64,
@@ -324,7 +337,9 @@ pub(crate) async fn update_long_running_task(
             block_start: start as i64,
             block_end: (start + batch_size) as i64,
             chain_name,
-            path_to_proof: Some(path_to_proof.to_string()),
+            path_to_proof: Some(path_to_proof),
+            public_value_hex: Some(public_value_hex),
+            proof_size,
             cycles: cycles as i64,
             proof_state: ProofState::Proven.to_i64(),
             proving_time: proving_duration,
@@ -371,15 +386,20 @@ pub(crate) async fn find_watchtower_task(
     local_db: &LocalDB,
     instance_id: Uuid,
     graph_id: Uuid,
-) -> anyhow::Result<Vec<WatchtowerProof>> {
+    public_key: &str,
+) -> anyhow::Result<Option<WatchtowerProof>> {
     let mut storage_processor = local_db.acquire().await?;
-    storage_processor.find_watchtower_proof_by_instance_and_graph(&instance_id, &graph_id).await
+    storage_processor
+        .find_watchtower_proof_by_instance_and_graph_and_pubkey(&instance_id, &graph_id, public_key)
+        .await
 }
 
 pub(crate) async fn update_watchtower_task(
     local_db: &LocalDB,
     index: usize,
-    path_to_proof: &str,
+    path_to_proof: String,
+    public_value_hex: String,
+    proof_size: i64,
     cycles: u64,
     proving_duration: i64,
     zkm_version: String,
@@ -389,6 +409,8 @@ pub(crate) async fn update_watchtower_task(
         .update_watchtower_proof_success(
             index as i64,
             path_to_proof,
+            public_value_hex,
+            proof_size,
             cycles as i64,
             proving_duration,
             &zkm_version,
@@ -417,6 +439,7 @@ pub(crate) async fn add_operator_task(
             proof_state: ProofState::New.to_i64(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
+            cycles: 0,
             ..Default::default()
         })
         .await?)
@@ -434,7 +457,9 @@ pub(crate) async fn find_operator_task(
 pub(crate) async fn update_operator_task(
     local_db: &LocalDB,
     index: usize,
-    path_to_proof: &str,
+    path_to_proof: String,
+    public_value_hex: String,
+    proof_size: i64,
     cycles: u64,
     proving_duration: i64,
     zkm_version: String,
@@ -444,6 +469,8 @@ pub(crate) async fn update_operator_task(
         .update_operator_proof_success(
             index as i64,
             path_to_proof,
+            public_value_hex,
+            proof_size,
             cycles as i64,
             proving_duration,
             &zkm_version,

@@ -3,6 +3,7 @@ use alloy_consensus::transaction::Transaction;
 use alloy_primitives::{Address, U256};
 use alloy_provider::Provider;
 use alloy_provider::{RootProvider, network::Ethereum};
+use anyhow::Context;
 use bitcoin_light_client_circuit::EthClientExecutorInput;
 use cbft_rpc::{fetch_cbft_tx_data, fetch_cbft_validator_info, fetch_cosmos_block};
 use host_executor::EthHostExecutor;
@@ -250,9 +251,8 @@ impl ProofBuilder for StateChainProofBuilder {
         let prev_receipt = if *init_input {
             None
         } else {
-            let proof_bytes = fs::read(input_proof).expect("Failed to read input proof file");
-            let proof: ZKMProofWithPublicValues =
-                bincode::deserialize(&proof_bytes).expect("failed to deserialize the proof");
+            let proof_bytes = fs::read(input_proof).context("Failed to read input proof file")?;
+            let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes)?;
             Some(proof)
         };
         let (prev_proof, pv_hash) = match prev_receipt.clone() {
@@ -308,17 +308,18 @@ impl ProofBuilder for StateChainProofBuilder {
         &self,
         ctx: &ProofRequest,
         input: &[u8],
-        cycles: u64,
+        _cycles: u64,
         proof: ZKMProofWithPublicValues,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(String, usize)> {
         let ProofRequest::StateChainProofRequest { output_proof, .. } = ctx else {
             anyhow::bail!("Invalid state chain inputs");
         };
         fs::write(output_proof, bincode::serialize(&proof)?)?;
+        let public_value_hex = hex::encode(proof.public_values.as_slice());
+        let proof_size = proof.bytes().len();
         fs::write(&format!("{}.vk", output_proof), bincode::serialize(&self.verifying_key)?)?;
         fs::write(&format!("{}.in", output_proof), input)?;
-        fs::write(&format!("{}.clk", output_proof), bincode::serialize(&cycles)?)?;
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
-        Ok(())
+        Ok((public_value_hex, proof_size))
     }
 }
