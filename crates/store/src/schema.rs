@@ -237,7 +237,7 @@ pub struct Instance {
     pub to_addr: String, // goat deposit addr
     pub amount: i64,
     pub fees: UInt64Array3,
-    pub input_utxos: String,
+    pub input_utxos: String,  // init should been []
     pub status: String,       // InstanceBridgeInStatus | InstanceBridgeOutStatus
     pub goat_tx_hash: String, // bridgeIn:pegin Request tx || bridgeOut goat tx
     pub goat_tx_height: i64,
@@ -515,13 +515,6 @@ pub struct MessageBroadcast {
     pub msg_type: String,
     pub msg_times: i64,
     pub updated_at: i64,
-    pub created_at: i64,
-}
-
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct VerifierKey {
-    pub verifier_id: String,
-    pub verifier_key: String,
     pub created_at: i64,
 }
 
