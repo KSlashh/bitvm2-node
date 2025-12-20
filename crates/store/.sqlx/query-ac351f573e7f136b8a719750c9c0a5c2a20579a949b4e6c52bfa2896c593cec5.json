@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                block_start,\n                block_end,\n                chain_name,\n                path_to_proof,\n                public_value_hex,\n                proof_size,\n                cycles,\n                proof_state,\n                proving_time,\n                zkm_version,\n                extra,\n                updated_at,\n                created_at\n            FROM long_running_task_proof\n            WHERE chain_name = ?\n            ORDER BY block_start DESC\n            LIMIT 1",
+  "query": "SELECT block_start, block_end, chain_name, path_to_proof, public_value_hex, proof_size, cycles, proof_state, total_time_to_proof, proving_time,\n                                           zkm_version, extra, updated_at, created_at FROM long_running_task_proof\n           \n             WHERE block_end > ? and block_start <= ? AND chain_name = ? LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -44,33 +44,38 @@
         "type_info": "Integer"
       },
       {
-        "name": "proving_time",
+        "name": "total_time_to_proof",
         "ordinal": 8,
         "type_info": "Integer"
       },
       {
-        "name": "zkm_version",
+        "name": "proving_time",
         "ordinal": 9,
-        "type_info": "Text"
+        "type_info": "Integer"
       },
       {
-        "name": "extra",
+        "name": "zkm_version",
         "ordinal": 10,
         "type_info": "Text"
       },
       {
-        "name": "updated_at",
+        "name": "extra",
         "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 12,
         "type_info": "Integer"
       },
       {
         "name": "created_at",
-        "ordinal": 12,
+        "ordinal": 13,
         "type_info": "Integer"
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 3
     },
     "nullable": [
       false,
@@ -83,10 +88,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "f3300026935d5a00dae3a9b7668ffdb3149a74364bf62874416e0c435ff959ee"
+  "hash": "ac351f573e7f136b8a719750c9c0a5c2a20579a949b4e6c52bfa2896c593cec5"
 }
