@@ -27,11 +27,17 @@ jobs:
           toolchain: nightly
           override: true
 
+      - name: "node-cleanup"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker builder prune -a
+
       - name: Install Ziren toolchain
         run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
 
       - name: Install Dependencies
-        run: sudo apt-get update && sudo apt install protobuf-compiler -y
+        run: sudo apt install protobuf-compiler -y
 
       - name: Build binarys
         run: export BITCOIN_NETWORK=regtest && source ~/.zkm-toolchain/env && cd proof-builder-rpc && cargo build --release
@@ -63,7 +69,7 @@ jobs:
       - name: Build and push Docker image (proof-builder-rpc)
         uses: docker/build-push-action@v5
         with:
-          context: ./proof-builder-rpc
+          context: .
           file: ./proof-builder-rpc/Dockerfile
           push: true
           tags: |

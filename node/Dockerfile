@@ -2,8 +2,12 @@
 FROM ubuntu:latest
 
 # Copies your code file from your action repository to the filesystem path `/` of the container
-COPY entrypoint.sh /entrypoint.sh
-COPY target/release/bitvm2-noded /usr/local/bin
+COPY target/release/sequencer-set-publish /usr/local/bin
+COPY target/release/pegin-request /usr/local/bin
+COPY target/release/send-rbf /usr/local/bin
+COPY target/release/challenge /usr/local/bin
+
+COPY node/entrypoint.sh /entrypoint.sh
 
 RUN apt update && apt install sqlite3 ca-certificates -y && update-ca-certificates
 
