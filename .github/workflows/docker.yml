@@ -37,8 +37,17 @@ jobs:
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt install protobuf-compiler -y
 
-      - name: Build binary
-        run: cargo build --release
+      - name: Build noded 
+        run: cargo build -r
+
+      - name: Build sequencer-set-publish 
+        run: cargo build -r --bin sequencer-set-publish
+      - name: Build challenge 
+        run: cargo build -r --bin challenge
+      - name: Build send-rbf 
+        run: cargo build -r --bin send-rbf 
+      - name: Build pengin-request 
+        run: cargo build -r --bin pegin-request 
 
       - name: Set lowercase repo name
         id: lowercase
@@ -57,7 +66,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./node
           push: true
           tags: |
             ghcr.io/${{ env.REPO_LOWER }}:latest
