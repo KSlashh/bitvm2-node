@@ -70,5 +70,5 @@ jobs:
           file: ./node/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ env.REPO_LOWER }}:latest
-            ghcr.io/${{ env.REPO_LOWER }}:${{ env.CARGO_VERSION }}
+            ghcr.io/${{ env.REPO_LOWER }}-node:latest
+            ghcr.io/${{ env.REPO_LOWER }}-node:${{ env.CARGO_VERSION }}

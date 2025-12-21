@@ -73,5 +73,5 @@ jobs:
           file: ./proof-builder-rpc/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ env.REPO_LOWER }}:proof-builder-rpc-latest
-            ghcr.io/${{ env.REPO_LOWER }}:proof-builder-rpc-${{ env.CARGO_VERSION }}
+            ghcr.io/${{ env.REPO_LOWER }}-proof-builder-rpc:latest
+            ghcr.io/${{ env.REPO_LOWER }}-proof-builder-rpc:${{ env.CARGO_VERSION }}
