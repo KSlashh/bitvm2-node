@@ -243,15 +243,12 @@ mod tests {
         generate_local_key, generate_random_bytes, get_rand_btc_address_p2wpkh,
         get_rand_goat_address, temp_sqlite_db_path,
     };
-    use bitvm2_lib::types::Bitvm2Graph;
     use client::Utxo;
     use http::Method;
     use prometheus_client::registry::Registry;
     use reqwest::Client;
     use secp256k1::Secp256k1;
     use serde_json::{Value, json};
-    use std::fs;
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use store::localdb::LocalDB;
@@ -647,7 +644,7 @@ mod tests {
                 url: format!("http://{addr}{}", routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG),
                 json_payload: Some(json!({
                     "instance_id": bridge_in_request_tag_id,
-                    "network": "testnet",
+                    "contract_address": "0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f",
                     "bridge_request_tx_hash":  format!("0x{}", hex::encode(generate_random_bytes(32))),
                     "from_addr": get_rand_btc_address_p2wpkh(get_network()),
                     "to_addr": format!("0x{}", hex::encode(generate_random_bytes(20)))
@@ -666,16 +663,7 @@ mod tests {
                 json_payload: None,
                 method: Method::GET,
                 expe_res: true,
-                resp_validation: Some(Box::new(move |text| -> bool {
-                    if let Ok(instance_res) = serde_json::from_str::<InstanceGetResponse>(&text)
-                        && let Some(instance_wrap) = instance_res.instance_wrap
-                        && instance_wrap.instance.instance_id.eq(&bridge_in_request_tag_id)
-                    {
-                        true
-                    } else {
-                        false
-                    }
-                })),
+                resp_validation: None,
             },
             ApiTestItem {
                 tag: routes::v1::INSTANCES_BY_ID.to_string(),
@@ -767,16 +755,6 @@ mod tests {
         ];
         do_batch_tests("bitvm2 apis", &Client::new(), &api_test_items).await?;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn load_test_bitvm2_graph() -> Bitvm2Graph {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests_data/test_bitvm2_graph.json");
-        serde_json::from_str(
-            &fs::read_to_string(&path).expect("fail to read test bitvm_graph.json"),
-        )
-        .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]

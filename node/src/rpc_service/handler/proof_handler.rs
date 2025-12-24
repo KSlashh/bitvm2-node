@@ -1,15 +1,13 @@
 use crate::env::get_proof_build_rpc_host;
+use crate::rpc_service::AppState;
 use crate::rpc_service::proof::{
-    ChainProofDescRequest, OperatorProofDescRequest, ProofDesc, ProofDescResponse,
+    ChainProofDescRequest, OperatorProofDescRequest, ProofDescResponse,
 };
 use crate::rpc_service::response::{ApiResult, ok_response, to_api_error};
-use crate::rpc_service::{AppState, current_time_secs};
-use crate::utils::generate_random_bytes;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Request, Uri};
 use std::sync::Arc;
-use store::ProofState;
 
 /// Checks if the request host matches the configured proof builder host to prevent forwarding loops.
 fn is_loop_detected(host: &str, request_host: Option<&str>) -> bool {
@@ -21,32 +19,11 @@ fn is_loop_detected(host: &str, request_host: Option<&str>) -> bool {
     }
 }
 
-/// Creates mock proof description data for testing purposes.
-fn create_mock_proof_desc(proof_type: String) -> ProofDesc {
-    ProofDesc {
-        block_start: 10000,
-        block_end: 20000,
-        proof_type,
-        state: ProofState::Proven.to_string(),
-        proving_cycles: 10000,
-        proving_time: 100000,
-        total_time_to_proof: 100010,
-        proof_size: 333.0,
-        zkm_version: "zkm_1.0.0".to_string(),
-        pub_values: hex::encode(generate_random_bytes(64)),
-        prev_proof_number: Some(1000),
-        next_proof_number: Some(1000),
-        created_at: current_time_secs(),
-        updated_at: current_time_secs(),
-    }
-}
-
 /// Handles forwarding to proof builder service or returning mock data.
 async fn handle_proof_desc_forwarding(
     uri: &Uri,
     headers: &HeaderMap,
     app_state: Arc<AppState>,
-    proof_type: String,
     error_code: &str,
 ) -> ApiResult<ProofDescResponse> {
     match get_proof_build_rpc_host() {
@@ -74,8 +51,8 @@ async fn handle_proof_desc_forwarding(
             ok_response(resp)
         }
         None => ok_response(ProofDescResponse {
-            proof_desc: Some(create_mock_proof_desc(proof_type)),
-            error: None,
+            proof_desc: None,
+            error: Some("env GOAT_PROOF_BUILD_URL need to been set".to_string()),
         }),
     }
 }
@@ -148,7 +125,7 @@ async fn handle_proof_desc_forwarding(
 /// ```
 #[axum::debug_handler]
 pub async fn get_chain_proof_desc(
-    Query(params): Query<ChainProofDescRequest>,
+    Query(_params): Query<ChainProofDescRequest>,
     State(app_state): State<Arc<AppState>>,
     request: Request<Body>,
 ) -> ApiResult<ProofDescResponse> {
@@ -156,7 +133,6 @@ pub async fn get_chain_proof_desc(
         request.uri(),
         request.headers(),
         app_state,
-        params.proof_type.to_string(),
         "GET_CHAIN_PROOF_ERROR",
     )
     .await
@@ -238,7 +214,6 @@ pub async fn get_operator_proof_desc(
         request.uri(),
         request.headers(),
         app_state,
-        "OperatorProof".to_string(),
         "GET_OPERATOR_PROOF_ERROR",
     )
     .await
