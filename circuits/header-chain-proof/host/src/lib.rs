@@ -25,11 +25,11 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub enable: bool,
 
-    #[arg(long, default_value = "http://127.0.0.1:3002")]
+    #[arg(long, env, default_value = "http://127.0.0.1:3002")]
     pub esplora_url: String,
 
-    #[arg(long, default_value_t = Network::Regtest)]
-    pub btc_network: Network,
+    #[arg(long, env, default_value_t = Network::Regtest)]
+    pub bitcoin_network: Network,
 
     #[clap(long, env, default_value_t = 4)]
     pub batch_size: usize,
@@ -101,12 +101,29 @@ pub async fn fetch_header_chain(
 
     writer.seek(std::io::SeekFrom::Start((block_headers.len() * 80) as u64))?;
 
-    for i in start..(start + batch_size) {
-        let block = btc_client.get_block_by_height(i as u32).await?;
-        tracing::info!("block_id {i}: {}", block.block_hash().to_string());
-        let header: header_chain::CircuitBlockHeader = block.header.into();
-        block_headers.push(header.clone());
-        header.serialize(&mut writer)?;
+    let mut i = start;
+    let mut retries = 3;
+    while i < start + batch_size {
+        tracing::info!("get block by height: {i}");
+        match btc_client.get_block_by_height(i as u32).await {
+            Ok(block) => {
+                tracing::info!("block_id {i}: {}", block.block_hash().to_string());
+                let header: header_chain::CircuitBlockHeader = block.header.into();
+                block_headers.push(header.clone());
+                header.serialize(&mut writer)?;
+                retries = 3;
+                i += 1;
+            }
+            Err(e) => {
+                tracing::error!("get block by height {i} error, {e:?}");
+                retries -= 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10000 - retries * 2000))
+                    .await;
+                if retries == 0 {
+                    anyhow::bail!("get block error");
+                }
+            }
+        };
     }
     writer.set_len((block_headers.len() * 80) as u64)?;
     let backup_file = format!(
