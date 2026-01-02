@@ -256,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             publisher_btc_pubkeys,
             next_publisher_btc_pubkeys,
         } => {
-            let (sequencer_set_hash, _) =
+            let (sequencer_set_hash, _, goat_block_hash) =
                 fetch_cbft_validator_info(&args.cosmos_rpc_url, goat_block_number).await?;
 
             let fee_tx = cached_output.fee_tx.unwrap();
@@ -272,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fee_tx,
                 update_connector,
                 sequencer_set_hash,
+                goat_block_hash,
                 goat_block_number,
             )
             .await
@@ -284,8 +285,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_genesis,
             commit_info,
         } => {
-            let (sequencer_set_hash, cosmos_block_number) =
+            let (sequencer_set_hash, cosmos_block_number, goat_block_hash) =
                 fetch_cbft_validator_info(&args.cosmos_rpc_url, goat_block_number).await?;
+
             let sequencers = fetch_validators(&args.cosmos_rpc_url, cosmos_block_number).await?;
             let fee_tx = cached_output.fee_tx.unwrap();
             let update_connector = cached_output.update_connector;
@@ -301,6 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 update_connector,
                 goat_block_number,
                 sequencer_set_hash,
+                goat_block_hash,
                 output_file,
             )
             .await?;
@@ -448,6 +451,7 @@ async fn action_push_sequencer_set_update(
     update_connector: Option<OutPoint>,
     goat_block_number: u64,
     sequencer_set_hash: [u8; 32],
+    goat_block_hash: [u8; 32],
     output_file: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let witnesses = goat_client.ss_get_sequencer_set_update_witness(goat_block_number).await?;
@@ -501,8 +505,11 @@ async fn action_push_sequencer_set_update(
         };
 
     // Skip construction of the genesis tx
+    let mut commitment = [0u8; 64];
+    commitment[0..32].copy_from_slice(&sequencer_set_hash);
+    commitment[32..].copy_from_slice(&goat_block_hash[0..32]);
     let mut sequencer_set_publish_tx = create_sequencer_update_partial_tx(
-        sequencer_set_hash,
+        commitment,
         &update_connector,
         &Some(fee_tx_outpoint),
         next_update_connector_address.clone(),
@@ -546,6 +553,7 @@ async fn action_sign_sequencer_set_update(
     fee_tx_outpoint: OutPoint,
     update_connector: Option<OutPoint>,
     sequencer_set_hash: [u8; 32],
+    goat_block_hash: [u8; 32],
     goat_block_number: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total = btc_public_keys.len();
@@ -577,8 +585,12 @@ async fn action_sign_sequencer_set_update(
             None => (None, None, Some(replenish_fee)),
         };
 
+    let mut commitment = [0u8; 64];
+    commitment[0..32].copy_from_slice(&sequencer_set_hash);
+    commitment[32..].copy_from_slice(&goat_block_hash[0..32]);
+
     let mut sequencer_set_publish_tx = create_sequencer_update_partial_tx(
-        sequencer_set_hash,
+        commitment,
         &update_connector,
         &Some(fee_tx_outpoint),
         next_update_connector_address.clone(),

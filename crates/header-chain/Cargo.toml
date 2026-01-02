@@ -11,6 +11,7 @@ bitcoin = { workspace = true, features = ["serde", "rand", "secp-recovery"] }
 serde = { workspace = true, default-features = false }
 crypto-bigint = { version = "0.5.5", default-features = false }
 zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", package = "zkm-zkvm", features = ["verify"] }
+zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", package = "zkm-verifier" }
 
 [dev-dependencies]
 hex-literal = "1.0.0"

@@ -17,6 +17,8 @@ state-chain = { path = "../state-chain" }
 # Ziren
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", package = "zkm-verifier" }
 zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", package = "zkm-zkvm", features = ["verify"] }
+#zkm-verifier = { path = "../../../Ziren/crates/verifier" }
+#zkm-zkvm = { path = "../../../Ziren/crates/zkvm/entrypoint", features = ["verify"] }
 
 # Statically turns off logging
 tracing = { workspace = true, features = ["max_level_trace"] }
@@ -46,7 +48,7 @@ serde_json = "1.0"
 rand = "0.8.5"
 borsh = {version = "1.5.3", features = ["derive"] }
 blake3 = "1.6.1"
-zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
+#zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
 
 [build-dependencies]
 prost-build = "0.13"

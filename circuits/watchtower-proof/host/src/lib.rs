@@ -1,18 +1,18 @@
 #![feature(trim_prefix_suffix)]
 //! Generate watchtower proof
-//!
 use borsh::BorshDeserialize;
 use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
+use std::io::Read;
 use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKMProof, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
+    HashableKey, Prover, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
     include_elf,
 };
 
 use bitcoin::{Block, Network, Transaction, Txid, hashes::Hash};
 use bitcoin_light_client_circuit::build_spv;
-use commit_chain::{CommitChainCircuitInput, CommitChainPrevProofType};
+use commit_chain::{CircuitCommit, CommitChainCircuitInput, CommitChainPrevProofType};
 use sha2::{Digest, Sha256};
-use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
+use state_chain::{CircuitStateBlock, StateChainCircuitInput, StateChainPrevProofType};
 use std::str::FromStr;
 use std::sync::OnceLock;
 static ELF_ID: OnceLock<String> = OnceLock::new();
@@ -138,56 +138,80 @@ impl ProofBuilder for WatchtowerProofBuilder {
         };
 
         // --- header chain --- //
-        let bytes =
-            std::fs::read(&format!("{}.in", header_chain_input_proof)).context("read error")?;
-        let mut header_chain_input: HeaderChainCircuitInput = bincode::deserialize(&bytes)?;
+        let header_chain_input = {
+            let mut reader =
+                std::fs::File::open(&format!("{header_chain_input_proof}.blocks")).unwrap();
+            let mut headers: Vec<u8> = Vec::new();
+            reader.read_to_end(&mut headers)?;
+            let block_headers: Vec<_> = headers
+                .chunks(80)
+                .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
+                .collect::<Vec<CircuitBlockHeader>>();
 
-        let proof_bytes =
-            fs::read(&header_chain_input_proof).context("Failed to read input proof file")?;
-        let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes)?;
-        header_chain_input.pv_hash = proof.public_values.hash().try_into().unwrap();
+            let zkm_public_values =
+                fs::read(&format!("{}.public_inputs.bin", header_chain_input_proof)).unwrap();
+            let zkm_proof = fs::read(header_chain_input_proof)
+                .context("Failed to read input proof file")
+                .unwrap();
+            let zkm_vk_hash =
+                fs::read(&format!("{}.vk_hash.bin", header_chain_input_proof)).unwrap();
+            let prev_output = zkm_sdk::ZKMPublicValues::from(&zkm_public_values).read();
+            let prev_proof = HeaderChainPrevProofType::PrevProof(prev_output);
 
-        let ZKMProof::Compressed(header_compressed_proof) = proof.proof else { panic!() };
-        let bytes = std::fs::read(&format!("{}.vk", header_chain_input_proof))
-            .context("read header chain vk error")?;
-        let header_chain_vk: zkm_sdk::ZKMVerifyingKey = bincode::deserialize(&bytes)?;
-        //assert_eq!(header_chain_output.vk_hash, header_chain_vk.hash_u32());
+            HeaderChainCircuitInput {
+                prev_proof,
+                zkm_proof,
+                zkm_public_values,
+                zkm_vk_hash,
+                block_headers,
+            }
+        };
 
         // --- commit chain --- //
-        let bytes = std::fs::read(&format!("{}.in", commit_chain_input_proof))
-            .context("read commit chain in error")?;
-        let mut commit_chain_input: CommitChainCircuitInput = bincode::deserialize(&bytes)?;
-
-        // Set the previous proof type based on input_proof argument
-        let proof_bytes =
-            fs::read(&commit_chain_input_proof).context("Failed to read input proof file")?;
-        let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes)?;
-
-        //let commit_chain_output: CommitChainCircuitOutput = proof.public_values.read();
-        commit_chain_input.pv_hash = proof.public_values.hash().try_into().unwrap();
-
-        let ZKMProof::Compressed(commit_compressed_proof) = proof.proof else { panic!() };
-
-        let bytes = std::fs::read(&format!("{}.vk", commit_chain_input_proof))
-            .context("read commit chain vk error")?;
-        let commit_chain_vk: zkm_sdk::ZKMVerifyingKey = bincode::deserialize(&bytes)?;
-        //assert_eq!(commit_chain_output.vk_hash, commit_chain_vk.hash_u32());
+        let commit_chain_input = {
+            let reader =
+                std::fs::File::open(&format!("{commit_chain_input_proof}.commits")).unwrap();
+            let commits: Vec<CircuitCommit> = serde_json::from_reader(reader)?;
+            let zkm_public_values =
+                fs::read(&format!("{}.public_inputs.bin", commit_chain_input_proof)).unwrap();
+            let zkm_proof = fs::read(commit_chain_input_proof)
+                .context("Failed to read input proof file")
+                .unwrap();
+            let zkm_vk_hash =
+                fs::read(&format!("{}.vk_hash.bin", commit_chain_input_proof)).unwrap();
+            let prev_output = zkm_sdk::ZKMPublicValues::from(&zkm_public_values).read();
+            let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
+            CommitChainCircuitInput {
+                prev_proof,
+                zkm_proof,
+                zkm_public_values,
+                zkm_vk_hash,
+                commits,
+            }
+        };
 
         // --- state chain --- //
-        let bytes = std::fs::read(&format!("{}.in", state_chain_input_proof))
-            .context("read state chain in error")?;
-        let mut state_chain_input: StateChainCircuitInput = bincode::deserialize(&bytes)?;
+        let state_chain_input = {
+            let reader = std::fs::File::open(&format!("{state_chain_input_proof}.blocks")).unwrap();
+            let states: Vec<CircuitStateBlock> = serde_json::from_reader(reader)?;
+            let zkm_proof = fs::read(state_chain_input_proof)
+                .context("Failed to read input proof file")
+                .unwrap();
+            let zkm_public_values =
+                fs::read(&format!("{}.public_inputs.bin", state_chain_input_proof)).unwrap();
+            let zkm_vk_hash =
+                fs::read(&format!("{}.vk_hash.bin", state_chain_input_proof)).unwrap();
+            let prev_output = zkm_sdk::ZKMPublicValues::from(&zkm_public_values).read();
+            let prev_proof = StateChainPrevProofType::PrevProof(prev_output);
+            StateChainCircuitInput {
+                prev_proof,
+                zkm_proof,
+                zkm_public_values,
+                zkm_vk_hash,
+                blocks: states,
+            }
+        };
 
-        // Set the previous proof type based on input_proof argument
-        let proof_bytes =
-            fs::read(&state_chain_input_proof).context("Failed to read input proof file")?;
-        let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes)?;
-
-        state_chain_input.pv_hash = proof.public_values.hash().try_into().unwrap();
-        let ZKMProof::Compressed(state_compressed_proof) = proof.proof else { panic!() };
-        let bytes = std::fs::read(&format!("{}.vk", state_chain_input_proof))
-            .context("read state chain vk error")?;
-        let state_chain_vk: zkm_sdk::ZKMVerifyingKey = bincode::deserialize(&bytes)?;
         // --- spv --- //
         let genesis_sequencer_commit_txid = Txid::from_str(&genesis_sequencer_commit_txid)?;
         let latest_sequencer_commit_txid = Txid::from_str(&latest_sequencer_commit_txid)?;
@@ -232,25 +256,6 @@ impl ProofBuilder for WatchtowerProofBuilder {
                 stdin.write(&commit_chain_input);
                 stdin.write(&state_chain_input);
                 stdin.write(&spv);
-
-                if commit_chain_input.prev_proof != CommitChainPrevProofType::GenesisBlock {
-                    stdin.write_proof(*commit_compressed_proof, commit_chain_vk.vk);
-                } else {
-                    tracing::info!("skip writing commit chain proof");
-                }
-
-                if header_chain_input.prev_proof != HeaderChainPrevProofType::GenesisBlock {
-                    stdin.write_proof(*header_compressed_proof, header_chain_vk.vk);
-                } else {
-                    tracing::info!("skip writing header chain proof");
-                }
-
-                if state_chain_input.prev_proof != StateChainPrevProofType::GenesisBlock {
-                    stdin.write_proof(*state_compressed_proof, state_chain_vk.vk);
-                } else {
-                    tracing::info!("skip writing consensus chain proof");
-                }
-
                 let elf_id = if ELF_ID.get().is_none() {
                     ELF_ID
                         .set(hex::encode(Sha256::digest(&self.proving_key.elf)))

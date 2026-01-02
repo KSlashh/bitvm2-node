@@ -15,7 +15,7 @@ use state_chain::*;
 use std::sync::Arc;
 use url::Url;
 use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKMProof, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
+    HashableKey, Prover, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
     include_elf,
 };
 
@@ -83,6 +83,7 @@ impl LongRunning for Args {
             next_args.start,
             self.batch_size
         );
+        next_args.blocks = format!("{}.blocks", next_args.input_proof);
         next_args
     }
 }
@@ -99,9 +100,29 @@ async fn fetch_withdrawal(
     let mut block_numbers = vec![];
     let mut graph_ids: Vec<[u8; 16]> = vec![];
     for i in start..start + batch_size {
-        let block = provider.get_block(i.into()).await.unwrap().unwrap();
+        let block = match provider.get_block(i.into()).await {
+            Ok(Some(x)) => x,
+            Ok(None) => {
+                tracing::error!("get block {i} returns none");
+                continue;
+            }
+            Err(e) => {
+                tracing::error!("get block {i} error, {e}");
+                continue;
+            }
+        };
         for txid in block.transactions.hashes() {
-            let txn = provider.get_transaction_by_hash(txid).await.unwrap().unwrap();
+            let txn = match provider.get_transaction_by_hash(txid).await {
+                Ok(Some(x)) => x,
+                Ok(None) => {
+                    tracing::error!("get transaction by hash {txid} returns none");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("get transaction by hash {txid} error, {e}");
+                    continue;
+                }
+            };
             let to = txn.to();
             let input = txn.input();
             if to == Some(*l2_contract_address) && &input[0..4] == proceed_withdraw_method_id {
@@ -156,7 +177,7 @@ pub async fn fetch_state_chain(
     assert!(start > 0, "Don't get genesis block from the consensus layer.");
     let mut blocks: Vec<_> = Vec::new();
     let addr = l2_contract_address.trim_prefix("0x");
-    let bytes: [u8; 20] = hex::decode(addr).unwrap().try_into().unwrap();
+    let bytes: [u8; 20] = hex::decode(addr)?.try_into().unwrap();
     let l2_contract_address = Address::from(bytes);
     let base_slot: [u8; 32] = U256::from(16).to_be_bytes().try_into()?;
 
@@ -173,10 +194,29 @@ pub async fn fetch_state_chain(
     .await?;
 
     for i in start..(start + batch_size) {
-        let (_, cl_block_number) = fetch_cbft_validator_info(cosmos_rpc_url, i).await?;
-        let cosmos_txns = fetch_cbft_tx_data(cosmos_rpc_url, cl_block_number).await?;
-        let cosmos_block = fetch_cosmos_block(cosmos_rpc_url, cl_block_number).await?;
-        let evm_block = fetch_exection_layer_block(&execution_layer_rpc, i, &genesis).await?;
+        let (_, cl_block_number, _goat_block_hash) =
+            fetch_cbft_validator_info(cosmos_rpc_url, i).await.map_err(|e| {
+                tracing::error!("fetch_cbft_tx_data: {e:?}");
+                // GOAT's block time is 3 seconds
+                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
+            })?;
+        let cosmos_txns =
+            fetch_cbft_tx_data(cosmos_rpc_url, cl_block_number).await.map_err(|e| {
+                tracing::error!("fetch_cbft_tx_data: {e:?}");
+                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
+            })?;
+        let cosmos_block =
+            fetch_cosmos_block(cosmos_rpc_url, cl_block_number).await.map_err(|e| {
+                tracing::error!("fetch_cosmos_block: {e:?}");
+                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
+            })?;
+
+        let evm_block =
+            fetch_exection_layer_block(&execution_layer_rpc, i, &genesis).await.map_err(|e| {
+                tracing::error!("fetch_exection_layer_block: {e:?}");
+                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
+            })?;
+        println!("block: {i}, cl_block_number: {cl_block_number}, txns: {}", cosmos_txns.len());
 
         let withdrawals = if !graph_block_numbers.is_empty() {
             let indices: Vec<usize> = graph_block_numbers
@@ -185,10 +225,10 @@ pub async fn fetch_state_chain(
                 .filter(|&(_, &val)| val == i)
                 .map(|(i, _)| i)
                 .collect();
-            let _graph_ids: Vec<_> = indices.iter().map(|&x| graph_ids[x].clone()).collect();
-            if _graph_ids.len() > 0 {
-                tracing::info!("block_id: {i}, check graph_ids: {:?}", _graph_ids);
-                Some((l2_contract_address, base_slot, _graph_ids))
+            let hit_graph_ids: Vec<_> = indices.iter().map(|&x| graph_ids[x].clone()).collect();
+            if hit_graph_ids.len() > 0 {
+                tracing::info!("block_id: {i}, check graph_ids: {:?}", hit_graph_ids);
+                Some((l2_contract_address, base_slot, hit_graph_ids))
             } else {
                 None
             }
@@ -245,37 +285,44 @@ impl ProofBuilder for StateChainProofBuilder {
             anyhow::bail!("Invalid state chain inputs");
         };
 
-        let vk_hash = self.verifying_key.hash_u32();
-        // Set the previous proof type based on input_proof argument
         let prev_receipt = if *init_input {
             None
         } else {
-            let proof_bytes = fs::read(input_proof).context("Failed to read input proof file")?;
-            let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes)?;
-            Some(proof)
-        };
-        let (prev_proof, pv_hash) = match prev_receipt.clone() {
-            Some(mut receipt) => {
-                let request = receipt.public_values.read();
-                let pv_hash: [u8; 32] = receipt.public_values.hash().try_into().unwrap();
-                (StateChainPrevProofType::PrevProof(request), pv_hash)
-            }
-            None => (StateChainPrevProofType::GenesisBlock, [0u8; 32]),
+            let public_inputs = fs::read(&format!("{}.public_inputs.bin", input_proof))
+                .context("Read public input")?;
+            Some(public_inputs)
         };
 
-        let input: StateChainCircuitInput =
-            StateChainCircuitInput { vk_hash, pv_hash, prev_proof, blocks: blocks.clone() };
+        let (prev_proof, zkm_proof, zkm_public_values, zkm_vk_hash) = match prev_receipt.clone() {
+            Some(public_inputs) => {
+                let proof_bytes =
+                    fs::read(input_proof).context("Failed to read input proof file")?;
+                let zkm_vk_hash =
+                    fs::read(&format!("{}.vk_hash.bin", input_proof)).context("Read vk_hash")?;
+                let prev_output: StateChainCircuitOutput =
+                    zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
+                (
+                    StateChainPrevProofType::PrevProof(prev_output),
+                    proof_bytes,
+                    public_inputs,
+                    zkm_vk_hash.to_vec(),
+                )
+            }
+            None => (StateChainPrevProofType::GenesisBlock, Vec::new(), Vec::new(), Vec::new()),
+        };
+
+        let input: StateChainCircuitInput = StateChainCircuitInput {
+            prev_proof,
+            zkm_proof,
+            zkm_public_values,
+            zkm_vk_hash,
+            blocks: blocks.clone(),
+        };
         // Generate the proofs.
         let (proof, cycles, proving_time) = tracing::info_span!("generate proof").in_scope(
             || -> anyhow::Result<(ZKMProofWithPublicValues, u64, f32)> {
                 let mut stdin = ZKMStdin::new();
                 stdin.write(&input);
-                if let Some(proof) = prev_receipt {
-                    let ZKMProof::Compressed(compressed_proof) = proof.proof else { panic!() };
-                    stdin.write_proof(*compressed_proof, self.verifying_key.vk.clone());
-                } else {
-                    tracing::info!("Skip writing proof for genesis evm block");
-                }
                 let elf_id = if ELF_ID.get().is_none() {
                     ELF_ID
                         .set(hex::encode(Sha256::digest(&self.proving_key.elf)))
@@ -290,7 +337,7 @@ impl ProofBuilder for StateChainProofBuilder {
                 let (proof, cycles) = self.client.prove_with_cycles(
                     &self.proving_key,
                     &stdin,
-                    ZKMProofKind::Compressed,
+                    ZKMProofKind::Groth16,
                     elf_id,
                 )?;
                 let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
@@ -309,18 +356,27 @@ impl ProofBuilder for StateChainProofBuilder {
     fn save_proof(
         &self,
         ctx: &ProofRequest,
-        input: &[u8],
+        _input: &[u8],
         _cycles: u64,
         proof: ZKMProofWithPublicValues,
     ) -> anyhow::Result<(String, usize)> {
         let ProofRequest::StateChainProofRequest { output_proof, .. } = ctx else {
             anyhow::bail!("Invalid state chain inputs");
         };
-        fs::write(output_proof, bincode::serialize(&proof)?)?;
-        let public_value_hex = hex::encode(proof.public_values.as_slice());
+        //fs::write(output_proof, bincode::serialize(&proof)?)?;
+        //let public_value_hex = hex::encode(proof.public_values.as_slice());
+        //let proof_size = proof.bytes().len();
+        //fs::write(&format!("{}.vk", output_proof), bincode::serialize(&self.verifying_key)?)?;
+        //fs::write(&format!("{}.in", output_proof), input)?;
+        std::fs::write(&format!("{}", output_proof), proof.bytes())?;
+        let public_value_hex = hex::encode(proof.public_values.to_vec());
         let proof_size = proof.bytes().len();
-        fs::write(&format!("{}.vk", output_proof), bincode::serialize(&self.verifying_key)?)?;
-        fs::write(&format!("{}.in", output_proof), input)?;
+        std::fs::write(
+            &format!("{}.public_inputs.bin", output_proof),
+            proof.public_values.to_vec(),
+        )?;
+        std::fs::write(&format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;
+
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))
     }

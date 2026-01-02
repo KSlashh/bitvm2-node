@@ -69,8 +69,12 @@ pub fn watch_longest_chain(
 
     // check the equivalence of sequencer set
     let commit_sequencer_set_hash = sequencer_hash(&commit_chain_output.chain_state.sequencers);
-    let state_seqeuencer_set_hash = cosmos_block.signed_header.header.validators_hash;
-    assert_eq!(commit_sequencer_set_hash, state_seqeuencer_set_hash);
+    let expected_seqeuencer_set_hash = cosmos_block.signed_header.header.validators_hash;
+    assert_eq!(commit_sequencer_set_hash, expected_seqeuencer_set_hash);
+
+    //let commitment = commit_chain::extract_op_return(&commit_chain_output.commit_txn.output);
+    //assert!(commitment[0..32], commit_sequencer_set_hash);
+    //assert!(commitment[32..64], state_chain_output.chain_state.latest_evm_block_hash);
 
     println!("commit public inputs");
     // commit public inputs
@@ -237,9 +241,9 @@ pub fn propose_longest_chain(
     verify_sequencer_commit(&cosmos_block);
     // check the equivalence of sequencer set
     let commit_sequencer_set_hash = sequencer_hash(&commit_chain_output.chain_state.sequencers);
-    let state_seqeuencer_set_hash = cosmos_block.signed_header.header.validators_hash;
+    let expected_seqeuencer_set_hash = cosmos_block.signed_header.header.validators_hash;
 
-    assert_eq!(commit_sequencer_set_hash, state_seqeuencer_set_hash);
+    assert_eq!(commit_sequencer_set_hash, expected_seqeuencer_set_hash);
 
     // (operator_total_work, included_watchtowers, graph_id, operator_genesis_sequencer_commit_txid, btc_best_block_hash)
     //(hash_operator_inputs(graph_id, operator_genesis_sequencer_commit_txid), btc_best_block_hash)
@@ -271,21 +275,6 @@ pub fn hash_operator_constant(
     let hash = sha256::Hash::from_engine(engine);
     *hash.as_byte_array()
 }
-
-/*
-pub fn hash_operator_inputs(
-    block_hash: [u8; 32],
-    constant: [u8; 32],
-    included_watchtowers: U256,
-) -> [u8; 32] {
-    let mut engine = sha256::HashEngine::default();
-    engine.input(&block_hash);
-    engine.input(&constant);
-    engine.input(&included_watchtowers.to_le_bytes::<32>());
-    let hash = sha256::Hash::from_engine(engine);
-    *hash.as_byte_array()
-}
-*/
 
 /// Utility method for converting u32 words to bytes in big endian.
 pub fn words_to_bytes_be(words: &[u32; 8]) -> [u8; 32] {

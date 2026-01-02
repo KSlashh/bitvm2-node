@@ -40,14 +40,14 @@ pub struct StateChainState {
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct StateChainCircuitOutput {
-    pub vk_hash: [u32; 8],
     pub chain_state: StateChainState,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct StateChainCircuitInput {
-    pub vk_hash: [u32; 8],
-    pub pv_hash: [u8; 32],
+    pub zkm_proof: Vec<u8>,
+    pub zkm_public_values: Vec<u8>,
+    pub zkm_vk_hash: Vec<u8>,
     pub prev_proof: StateChainPrevProofType,
     pub blocks: Vec<CircuitStateBlock>,
 }

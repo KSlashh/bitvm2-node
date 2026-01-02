@@ -90,17 +90,21 @@ pub struct CommitChainState {
     pub threshold: u16,
 }
 
+pub const PROOF_SIZE: usize = 260;
+pub const PUBLIC_INPUTS_SIZE: usize = 36;
+pub const VK_HASH_SIZE: usize = 66;
+
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct CommitChainCircuitOutput {
-    pub vk_hash: [u32; 8],
     pub chain_state: CommitChainState,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct CommitChainCircuitInput {
-    pub vk_hash: [u32; 8],
-    pub pv_hash: [u8; 32],
     pub prev_proof: CommitChainPrevProofType,
+    pub zkm_proof: Vec<u8>,
+    pub zkm_public_values: Vec<u8>,
+    pub zkm_vk_hash: Vec<u8>,
     pub commits: Vec<CircuitCommit>,
 }
 
@@ -146,7 +150,7 @@ impl CommitChainState {
                     println!(
                         "expected prev commit: {expected_prev_commit:?}, {prev_sequencer_set_hash:?}"
                     );
-                    assert_eq!(prev_sequencer_set_hash[..], expected_prev_commit);
+                    assert_eq!(prev_sequencer_set_hash[..], expected_prev_commit[0..32]);
                 } else {
                     panic!("Invalid prev sequencer set hash");
                 }
@@ -156,7 +160,7 @@ impl CommitChainState {
             let expected_latest_commit =
                 extract_op_return_data(&latest_commit_txn_with_wtns.output);
             if let Hash::Sha256(latest_sequencer_set_hash) = sequencer_hash(latest_sequencers) {
-                assert_eq!(latest_sequencer_set_hash[..], expected_latest_commit);
+                assert_eq!(latest_sequencer_set_hash[..], expected_latest_commit[0..32]);
             } else {
                 panic!("Invalid latest sequencer set hash");
             }

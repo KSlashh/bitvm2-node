@@ -88,7 +88,7 @@ zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", features = ["ark"]
 #zkm-core-executor = { path = "../Ziren/crates/core/executor" }
 #zkm-prover = { path = "../Ziren/crates/prover" }
 #zkm-sdk = { path = "../Ziren/crates/sdk" }
-#zkm-verifier = { path = "../Ziren/crates/verifier" }
+#zkm-verifier = { path = "../Ziren/crates/verifier", features = ["ark"] }
 
 bitvm2-lib = { path = "crates/bitvm2-ga" }
 store = { path = "crates/store" }
@@ -135,10 +135,10 @@ provider = { git = "https://github.com/ProjectZKM/reth-processor", branch = "fea
 
 reth-chainspec = { git = "https://github.com/ziren-patches/reth", branch = "patch-1.9.3", default-features = false }
 
-# guest-executor = { path = "../../reth-processor/crates/executor/guest" }
-# host-executor = { path = "../../reth-processor/crates/executor/host", features = ["alerting"] }
-# primitives = { path = "../../reth-processor/crates/primitives" }
-# provider= { path = "../../reth-processor/crates/provider" }
+#guest-executor = { path = "../reth-processor/crates/executor/guest" }
+#host-executor = { path = "../reth-processor/crates/executor/host", features = ["alerting"] }
+#primitives = { path = "../reth-processor/crates/primitives" }
+#provider= { path = "../reth-processor/crates/provider" }
 
 
 # revm
@@ -149,7 +149,7 @@ revm-database-interface = { git = "https://github.com/ziren-patches/revm", branc
 alloy-rlp = "1.0"
 alloy-trie = "1.0"
 alloy-chains = { version = "0.2.0", default-features = false, features = ["serde"] }
-alloy-primitives = { version = "1.2", default-features = false, features = ["sha3-keccak", "map-foldhash", "serde"] }
+alloy-primitives = { version = "1.0.0", default-features = false, features = ["sha3-keccak", "map-foldhash", "serde"] }
 alloy-provider = { git = "https://github.com/ziren-patches/alloy", branch = "patch-1.0.41", default-features = false, features = [
     "reqwest",
     "reqwest-rustls-tls",
@@ -157,6 +157,9 @@ alloy-provider = { git = "https://github.com/ziren-patches/alloy", branch = "pat
 
 # tendermint
 tendermint = { git = "https://github.com/ProjectZKM/tendermint-rs", branch = "patch-0.40.3", default-features = false, features = ["secp256k1"] }
+tendermint-light-client-verifier = { git = "https://github.com/ProjectZKM/tendermint-rs", branch = "patch-0.40.3", default-features = false, features = [
+  "rust-crypto",
+] }
 
 lazy_static = "1.5.0"
 

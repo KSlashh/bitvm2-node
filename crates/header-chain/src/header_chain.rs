@@ -31,7 +31,6 @@ pub const NETWORK_TYPE: &str = {
 
 // Const evaluation of network type from environment
 const IS_REGTEST: bool = matches!(NETWORK_TYPE.as_bytes(), b"regtest");
-const IS_TESTNET3: bool = matches!(NETWORK_TYPE.as_bytes(), b"testnet");
 const IS_TESTNET4: bool = matches!(NETWORK_TYPE.as_bytes(), b"testnet4");
 const MINIMUM_WORK_TESTNET: U256 =
     U256::from_be_hex("0000000000000000000000000000000000000000000000000000000100010001");
@@ -199,9 +198,6 @@ impl ChainState {
     }
 
     pub fn apply_blocks(&mut self, block_headers: Vec<CircuitBlockHeader>) {
-        if IS_TESTNET3 {
-            return self.apply_blocks_testnet3(block_headers);
-        }
         let mut current_target_bytes = if IS_REGTEST {
             NETWORK_CONSTANTS.max_target.to_be_bytes()
         } else {
@@ -294,73 +290,6 @@ impl ChainState {
 
         self.total_work = current_work.to_be_bytes();
     }
-
-    pub fn apply_blocks_testnet3(&mut self, block_headers: Vec<CircuitBlockHeader>) {
-        // current target / work
-        let mut current_target_bytes = bits_to_target(self.current_target_bits);
-        let mut current_work = U256::from_be_bytes(self.total_work);
-
-        // target bit of latest non-minimal difficult block
-        let mut last_non_min_bits = self.current_target_bits;
-
-        let mut last_block_time = self.prev_11_timestamps[(self.block_height as usize + 10) % 11];
-
-        for block_header in block_headers {
-            self.block_height = self.block_height.wrapping_add(1);
-
-            let use_min_difficulty = block_header.time > last_block_time + 1200;
-
-            let (_target_to_use, _expected_bits, work_to_add) = if use_min_difficulty {
-                (
-                    NETWORK_CONSTANTS.max_target_bytes,
-                    NETWORK_CONSTANTS.max_bits,
-                    MINIMUM_WORK_TESTNET,
-                )
-            } else {
-                (current_target_bytes, last_non_min_bits, calculate_work(&current_target_bytes))
-            };
-
-            let new_block_hash = block_header.compute_block_hash();
-
-            assert_eq!(block_header.prev_block_hash, self.best_block_hash);
-
-            // assert_eq!(block_header.bits, expected_bits);
-
-            // check_hash_valid(&new_block_hash, &target_to_use);
-
-            if !validate_timestamp(block_header.time, self.prev_11_timestamps) {
-                panic!("Timestamp is not valid");
-            }
-
-            if !use_min_difficulty {
-                last_non_min_bits = block_header.bits;
-                current_target_bytes = bits_to_target(last_non_min_bits);
-            }
-
-            self.block_hashes_mmr.append(new_block_hash);
-            self.best_block_hash = new_block_hash;
-            current_work = current_work.wrapping_add(&work_to_add);
-
-            self.prev_11_timestamps[self.block_height as usize % 11] = block_header.time;
-
-            last_block_time = block_header.time;
-
-            // retarget（2016 blocks）
-            if self.block_height % BLOCKS_PER_EPOCH == BLOCKS_PER_EPOCH - 1 {
-                let new_target = calculate_new_difficulty(
-                    self.epoch_start_time,
-                    block_header.time,
-                    last_non_min_bits,
-                );
-                last_non_min_bits = target_to_bits(&new_target);
-                current_target_bytes = new_target;
-                self.current_target_bits = last_non_min_bits;
-                self.epoch_start_time = block_header.time;
-            }
-        }
-
-        self.total_work = current_work.to_be_bytes();
-    }
 }
 
 fn median(arr: [u32; 11]) -> u32 {
@@ -443,7 +372,6 @@ fn calculate_work(target: &[u8; 32]) -> U256 {
     Serialize, Deserialize, Eq, PartialEq, Clone, Debug, BorshDeserialize, BorshSerialize, Hash,
 )]
 pub struct BlockHeaderCircuitOutput {
-    pub vk_hash: [u32; 8],
     pub chain_state: ChainState,
 }
 
@@ -458,8 +386,9 @@ pub enum HeaderChainPrevProofType {
 /// The input of the header chain circuit.
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub struct HeaderChainCircuitInput {
-    pub vk_hash: [u32; 8],
-    pub pv_hash: [u8; 32],
+    pub zkm_proof: Vec<u8>,
+    pub zkm_public_values: Vec<u8>,
+    pub zkm_vk_hash: Vec<u8>,
     pub prev_proof: HeaderChainPrevProofType,
     pub block_headers: Vec<CircuitBlockHeader>,
 }

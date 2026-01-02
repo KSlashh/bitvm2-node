@@ -24,7 +24,7 @@ function find_input_proof() {
 if [ $start -ne $EL_START_BLOCK_NUMBER ]; then
   input_file=$(find_input_proof $start)
 else
-  RUST_LOG=info $CMD -- --start $EL_START_BLOCK_NUMBER --batch-size $batch --init-input --output-proof "${DATA}/${start}-${batch}.bin" --blocks $DATA/blocks-${start}-${batch}.json
+  RUST_LOG=info $CMD -- --start $EL_START_BLOCK_NUMBER --batch-size $batch --init-input --output-proof "${DATA}/${start}-${batch}.bin" --blocks $DATA/${start}-${batch}.blocks
   input_file="$start-${batch}.bin"
   start=$(($start + $batch))
 fi
@@ -36,7 +36,7 @@ while true; do
   RUST_LOG=info $CMD -- \
     --start "$start" \
     --batch-size $batch \
-    --blocks $DATA/blocks-${start}-${batch}.json \
+    --blocks $DATA/${start}-${batch}.blocks \
     --input-proof $DATA/$input_file \
     --output-proof "${DATA}/$start-${batch}.bin"
   input_file="$start-${batch}.bin"

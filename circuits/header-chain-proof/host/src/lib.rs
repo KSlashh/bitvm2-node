@@ -1,9 +1,7 @@
 use bitcoin::Network;
 use borsh::{BorshDeserialize, BorshSerialize};
 use client::btc_chain::BTCClient;
-use header_chain::{
-    BlockHeaderCircuitOutput, CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType,
-};
+use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,9 +9,7 @@ use std::{
     io::{Read, Seek},
 };
 use zkm_sdk::ZKMProofKind;
-use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKMProof, ZKMProofWithPublicValues, ZKMStdin, include_elf,
-};
+use zkm_sdk::{HashableKey, Prover, ProverClient, ZKMProofWithPublicValues, ZKMStdin, include_elf};
 static ELF_ID: OnceLock<String> = OnceLock::new();
 use anyhow::Context;
 use clap::Parser;
@@ -102,7 +98,7 @@ pub async fn fetch_header_chain(
     writer.seek(std::io::SeekFrom::Start((block_headers.len() * 80) as u64))?;
 
     let mut i = start;
-    let mut retries = 3;
+    let mut retries = 9;
     while i < start + batch_size {
         tracing::info!("get block by height: {i}");
         match btc_client.get_block_by_height(i as u32).await {
@@ -117,7 +113,7 @@ pub async fn fetch_header_chain(
             Err(e) => {
                 tracing::error!("get block by height {i} error, {e:?}");
                 retries -= 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(10000 - retries * 2000))
+                tokio::time::sleep(tokio::time::Duration::from_millis(10000 - retries * 1000))
                     .await;
                 if retries == 0 {
                     anyhow::bail!("get block error");
@@ -186,25 +182,31 @@ impl ProofBuilder for HeaderChainProofBuilder {
             anyhow::bail!("Invalid proof request type");
         };
 
-        let vk_hash = self.verifying_key.hash_u32();
         let mut _start = 0;
         // Set the previous proof type based on input_proof argument
         let prev_receipt = if *init_input {
             None
         } else {
-            let proof_bytes = fs::read(&input_proof).context("read error")?;
-            let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes)?;
-            Some(proof)
+            let public_inputs = fs::read(&format!("{}.public_inputs.bin", input_proof)).unwrap();
+            Some(public_inputs)
         };
-        let (prev_proof, pv_hash) = match prev_receipt.clone() {
-            Some(mut receipt) => {
-                let request: BlockHeaderCircuitOutput = receipt.public_values.read();
-                _start = request.chain_state.block_height as usize + 1;
-                let pv_hash: [u8; 32] = receipt.public_values.hash().try_into().unwrap();
-                (HeaderChainPrevProofType::PrevProof(request), pv_hash)
+
+        let (prev_proof, zkm_proof, zkm_public_values, zkm_vk_hash) = match prev_receipt.clone() {
+            Some(public_inputs) => {
+                let proof_bytes =
+                    fs::read(input_proof).context("Failed to read input proof file").unwrap();
+                let zkm_vk_hash = fs::read(&format!("{}.vk_hash.bin", input_proof)).unwrap();
+                let prev_output = zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
+                (
+                    HeaderChainPrevProofType::PrevProof(prev_output),
+                    proof_bytes,
+                    public_inputs,
+                    zkm_vk_hash.to_vec(),
+                )
             }
-            None => (HeaderChainPrevProofType::GenesisBlock, [0u8; 32]),
+            None => (HeaderChainPrevProofType::GenesisBlock, Vec::new(), Vec::new(), Vec::new()),
         };
+
         tracing::info!(
             "header-chain length: {}, start: {}, batch_size: {}",
             total_block_headers.len(),
@@ -213,21 +215,19 @@ impl ProofBuilder for HeaderChainProofBuilder {
         );
 
         let block_headers = (&total_block_headers[*start..*start + *batch_size]).to_vec();
-        let input: HeaderChainCircuitInput =
-            HeaderChainCircuitInput { vk_hash, prev_proof, pv_hash, block_headers };
+        let input: HeaderChainCircuitInput = HeaderChainCircuitInput {
+            prev_proof,
+            zkm_proof,
+            zkm_public_values,
+            zkm_vk_hash,
+            block_headers,
+        };
 
         // Generate the proofs.
         let (proof, cycles, proving_time) = tracing::info_span!("generate proof").in_scope(
             || -> anyhow::Result<(ZKMProofWithPublicValues, u64, f32)> {
                 let mut stdin = ZKMStdin::new();
                 stdin.write(&input);
-                if let Some(proof) = prev_receipt {
-                    tracing::info!("Generate proof from block {}", _start);
-                    let ZKMProof::Compressed(compressed_proof) = proof.proof else { panic!() };
-                    stdin.write_proof(*compressed_proof, self.verifying_key.vk.clone());
-                } else {
-                    tracing::info!("Generate proof from genesis block");
-                }
                 let elf_id = if ELF_ID.get().is_none() {
                     ELF_ID
                         .set(hex::encode(Sha256::digest(&self.proving_key.elf)))
@@ -241,7 +241,7 @@ impl ProofBuilder for HeaderChainProofBuilder {
                 let (proof, cycles) = self.client.prove_with_cycles(
                     &self.proving_key,
                     &stdin,
-                    ZKMProofKind::Compressed,
+                    ZKMProofKind::Groth16,
                     elf_id,
                 )?;
                 let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
@@ -262,18 +262,28 @@ impl ProofBuilder for HeaderChainProofBuilder {
     fn save_proof(
         &self,
         ctx: &ProofRequest,
-        input: &[u8],
+        _input: &[u8],
         _cycles: u64,
         proof: ZKMProofWithPublicValues,
     ) -> anyhow::Result<(String, usize)> {
         let ProofRequest::HeaderChainProofRequest { output_proof, .. } = ctx else {
             anyhow::bail!("invalid context");
         };
-        fs::write(&output_proof, bincode::serialize(&proof)?)?;
-        let public_value_hex = hex::encode(proof.public_values.as_slice());
+        //fs::write(&output_proof, bincode::serialize(&proof)?)?;
+        //let public_value_hex = hex::encode(proof.public_values.as_slice());
+        //let proof_size = proof.bytes().len();
+        //fs::write(&format!("{}.vk", output_proof), bincode::serialize(&self.verifying_key)?)?;
+        //fs::write(&format!("{}.in", output_proof), input)?;
+
+        std::fs::write(&format!("{}", output_proof), proof.bytes())?;
+        let public_value_hex = hex::encode(proof.public_values.to_vec());
         let proof_size = proof.bytes().len();
-        fs::write(&format!("{}.vk", output_proof), bincode::serialize(&self.verifying_key)?)?;
-        fs::write(&format!("{}.in", output_proof), input)?;
+        std::fs::write(
+            &format!("{}.public_inputs.bin", output_proof),
+            proof.public_values.to_vec(),
+        )?;
+        std::fs::write(&format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;
+
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))
     }

@@ -1,15 +1,56 @@
 # BitVM2 Circuits 
 
-## Verification Path
+## Overview 
 
 Trust Setup: choose a snapshot of GOAT Pre Alpha Mainnet, which consists of (Seqeuncer Set, EVM Block Hash)
 
-Verify:
+Main components:
 
-* BTC Header Chain, check whether the Sequencer Set Commitment transaction is in the longgest chain
-* Sequencer Set Commitment, check whether the publishers have published the correct Sequencer Set
-* State Chain, check the EVM state transition, and check whether the EVM block has been signed by the Sequencer Set
-* Operator's total work >= Watchtowers' largest total work
+* BTC Header Chain: the bitcoin header chain
+* Commit Chain: the sequencer set commitment, where each commitment creates a block
+* State Chain: the EVM state transition, each block contains a EVM block, the withdrawals and a cosmos light block
+
+Circuits:
+
+* Watchtower proof(latest_sequencer_commit_txid, genesis_sequencer_commit_txid, header_chain_proof, commit_chain_proof, state_chain_proof, SPV)
+> * Constraints:
+>> * The latest_sequencer_commit_txid is included in the header chain proof
+>> * The latest_sequencer_commit_txid is the latest commit txn in the commit chain
+>> * The state chain's latest block(EVM block) is signed by the sequencer set in the latest block of commit chain
+> * Outputs: total_work, the bitcoin block height that includes the latest sequencer set commitment
+
+
+* Operator proof:
+> * Constraints:
+>> * The latest_sequencer_commit_txid is included in the header chain proof
+>> * The latest_sequencer_commit_txid is the latest commit txn in the commit chain
+>> * The state chain's latest block(EVM block) is signed by the sequencer set in the latest block of commit chain
+>> * For each watchtower proof,
+>>> * The watchtower challenge transaction is valid
+>>> * The proof is valid
+>>> * The graph is as same as the operator's graph id
+>>> * The operator's total work >= Watchtowers' largest total work
+>>> * The operator's block height that includes the latest sequencer commit transaction is larger than the watchtower's 
+>> * Verify that the withdrawal state change in the Gateway contract is correct
+> * Outputs: latest block hash of the header chain, hash(graph_id, operator's genesis sequencer commit transaction id, included_watchtowers)
+
+## Circuit Upgrade
+
+Given that the interval between Peg-in and Peg-out may extend over several months, two types of upgrades require separate consideration:
+
+1. Proof system upgrades (Ziren): Result in a different recursion verification key.  
+
+2. Modifications of guest program: Arise from protocol changes in Bitcoin, Cosmos, or Geth, result in different ELF and guest verification key.
+
+
+For case 1, Ziren's proof network can keep multiple recursion verification keys, and load the correct key with respect to the version in the proof.
+
+For case 2, 
+> * If there is no Ziren upgrade during this interval, and the inputs of the proof aggregation are compressed proofs, but with different `start_pc`, `pc`, etc. 
+> * If there is some Ziren upgrades during this interval, once we support the multiple verification keys in Ziren, this problem can be reduced to the former one.
+
+
+With multiple proof recursions, we generate a Groth16 proof, and verify with `Groth16Verifier::verify(proof, zkm_public_values, zkm_vk_hash, groth16_vk)`. 
 
 ## Preparation
 
@@ -94,7 +135,7 @@ Generate the proof:
 
 ```
 # Genesis
-RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --init-input --output-proof "data/commit-chain/0-1.bin" --commit-info ./data/commit-chain/commit_info.json.0 --commits data/commit-chain/commits.bin.0
+RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --init-input --output-proof "data/commit-chain/0-1.bin" --commit-info ./data/commit-chain/commit_info.json.0 --commits data/commit-chain/0-1.bin.commits
 
 # Regular proof
 RUST_LOG=info cargo run --package commit-chain-proof --bin commit-chain-proof -r -- --input-proof "data/commit-chain/0-1.bin" --output-proof "data/commit-chain/1-1.bin" --commit-info ./data/commit-chain/commit_info.json.1 --commits data/commit-chain/commits.bin.1
@@ -112,7 +153,8 @@ We generate `state-chain-proof` periodically, like by 5 GOAT EVM blocks. Optiona
 * Generate state-chain proof. 
 
 ```
-export EL_START_BLOCK_NUMBER=9511050
+#export EL_START_BLOCK_NUMBER=9511050
+export EL_START_BLOCK_NUMBER=9917590
 export BATCH_SIZE=10
 export L2_CONTRACT_ADDRESS=0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f
 
@@ -130,7 +172,7 @@ If a challenge is happened, each watchtower should broadcast a `watchtower-chall
 export BITCOIN_NETWORK=regtest
 export GENESIS_SEQUENCER_COMMIT_TXID=$(cat ./data/commit-chain/commit_info.json.0 | jq -r .genesis_txid)
 export LATEST_SEQUENCER_COMMIT_TXID=$(cat ./data/commit-chain/commit_info.json.0 | jq -r .txid)
-export HEADER_CHAIN_INPUT_PROOF="data/header-chain/503050-10.bin"
+export HEADER_CHAIN_INPUT_PROOF="data/header-chain/0-116000.bin"
 export COMMIT_CHAIN_INPUT_PROOF="data/commit-chain/0-1.bin"
 export LATEST_STATE_BLOCK_HASH="0x7908184bce067fa5a4508d309cbaf22dd1e0b586ad2dd42c0e51a5308a7bd815"
 export STATE_CHAIN_INPUT_PROOF="data/state-chain/9511050-10.bin"
@@ -174,7 +216,7 @@ After calling the [`proceedWithdraw`](https://github.com/GOATNetwork/bitvm2-L2-c
 export BITCOIN_NETWORK=regtest
 export GENESIS_SEQUENCER_COMMIT_TXID=$(cat ./data/commit-chain/commit_info.json.0 | jq -r .genesis_txid)
 export LATEST_SEQUENCER_COMMIT_TXID=$(cat ./data/commit-chain/commit_info.json.2 | jq -r .txid)
-export HEADER_CHAIN_INPUT_PROOF="data/header-chain/503050-10.bin"
+export HEADER_CHAIN_INPUT_PROOF="data/header-chain/0-116000.bin"
 export COMMIT_CHAIN_INPUT_PROOF="data/commit-chain/2-1.bin"
 export STATE_CHAIN_INPUT_PROOF="data/state-chain/9511050-10.bin"
 export LATEST_STATE_BLOCK_HASH="0x7908184bce067fa5a4508d309cbaf22dd1e0b586ad2dd42c0e51a5308a7bd815"

@@ -67,13 +67,14 @@ pub async fn fetch_validators(cosmos_rpc_url: &str, block_height: u64) -> Result
 pub async fn fetch_cbft_validator_info(
     cosmos_rpc_url: &str,
     goat_block_height: u64,
-) -> Result<([u8; 32], u64)> {
+) -> Result<([u8; 32], u64, [u8; 32])> {
     // find cosmos height by goat block height, goat_block_height should be always less than or equal to cosmos_block_height
     // 1. fetch the latest cosmos block height
     // 2. binary search cosmos block height between goat block height and latest cosmos block height
     // > 2.1. fetch the block info and parse the first transction: // curl "https://cosmos.testnet3.goat.network/block?height=5756784" | jq .result.block.data
     let mut block_height = goat_block_height;
     let mut sequencer_hash = [0u8; 32];
+    let mut goat_block_hash = [0u8; 32];
 
     let mut max_retries = 100;
     while max_retries > 0 {
@@ -88,6 +89,7 @@ pub async fn fetch_cbft_validator_info(
         if let Some(payload) = parse_cbft_tx_payload(&tx_data[0]) {
             if payload.block_number == goat_block_height {
                 sequencer_hash = validators_hash.try_into().unwrap();
+                goat_block_hash = payload.block_hash.try_into().unwrap();
                 break;
             }
             if payload.block_number < block_height {
@@ -102,7 +104,7 @@ pub async fn fetch_cbft_validator_info(
         anyhow::bail!("Can not find the cosmos block for goat block height {goat_block_height}");
     }
 
-    Ok((sequencer_hash, block_height))
+    Ok((sequencer_hash, block_height, goat_block_hash))
 }
 
 pub async fn fetch_cbft_tx_data(cosmos_rpc_url: &str, height: u64) -> Result<Vec<String>> {
@@ -168,7 +170,7 @@ mod tests {
         let cosmos_rpc_url = std::env::var("COSMOS_RPC_URL")
             .unwrap_or("https://cosmos.testnet3.goat.network/".to_string());
         let evm_block_number = 9511050;
-        let (sequencer_hash, block_number) =
+        let (sequencer_hash, block_number, _) =
             fetch_cbft_validator_info(&cosmos_rpc_url, evm_block_number).await.unwrap();
 
         println!("hex sequencer_hash: {}", hex::encode(sequencer_hash));
