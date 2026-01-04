@@ -24,7 +24,7 @@ pub(crate) async fn spv_header_hash_update(
         let mut header_hashes = Vec::with_capacity(len);
         for height in last_height + 1..=target_height {
             heights.push(height);
-            let mut header_hash = btc_client.get_block_hash(height as u32).await?.to_byte_array();
+            let header_hash = btc_client.get_block_hash(height as u32).await?.to_byte_array();
             header_hashes.push(header_hash);
         }
 
