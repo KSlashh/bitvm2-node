@@ -8,6 +8,7 @@ use std::{
     fs,
     io::{Read, Seek},
 };
+use util::get_btc_block_confirms;
 use zkm_sdk::ZKMProofKind;
 use zkm_sdk::{HashableKey, Prover, ProverClient, ZKMProofWithPublicValues, ZKMStdin, include_elf};
 static ELF_ID: OnceLock<String> = OnceLock::new();
@@ -97,10 +98,18 @@ pub async fn fetch_header_chain(
 
     writer.seek(std::io::SeekFrom::Start((block_headers.len() * 80) as u64))?;
 
+    let confirmations = get_btc_block_confirms(btc_client.network());
+
     let mut i = start;
     let mut retries = 9;
     while i < start + batch_size {
         tracing::info!("get block by height: {i}");
+        let tip_height = btc_client.get_height().await?;
+        if i as u32 + confirmations > tip_height {
+            tracing::info!("current tip height: {tip_height}, wait for new block");
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            continue;
+        }
         match btc_client.get_block_by_height(i as u32).await {
             Ok(block) => {
                 tracing::info!("block_id {i}: {}", block.block_hash().to_string());
