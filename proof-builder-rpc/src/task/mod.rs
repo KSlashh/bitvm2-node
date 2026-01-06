@@ -188,6 +188,17 @@ pub(crate) async fn fetch_latest_long_running_task(
     storage_processor.find_latest_long_running_task_proof_by_name(chain_name).await
 }
 
+pub(crate) async fn fetch_latest_long_running_task_by_state(
+    local_db: &LocalDB,
+    chain_name: String,
+    proof_state: i64,
+) -> anyhow::Result<Option<LongRunningTaskProof>> {
+    let mut storage_processor = local_db.acquire().await?;
+    storage_processor
+        .find_latest_long_running_task_proof_by_name_and_state(chain_name, proof_state)
+        .await
+}
+
 // fetch next task from watchtower or operator.
 #[tracing::instrument(level = "info", skip(local_db))]
 pub(crate) async fn fetch_on_demand_task(
@@ -299,11 +310,21 @@ pub(crate) async fn fetch_on_demand_task(
         )
         .await?
     {
-        Some(d) => d,
+        Some(d) => {
+            if d.proof_state != ProofState::Proven.to_i64() {
+                tracing::info!(
+                    "State chain proof is not ready for block: {execution_layer_block_number}, proof not ready"
+                );
+                return Ok(None);
+            } else {
+                d
+            }
+        }
         None => {
-            anyhow::bail!(
-                "State chain proof is not ready for block: {execution_layer_block_number}"
+            tracing::info!(
+                "State chain proof is not ready for block: {execution_layer_block_number}, record not found"
             );
+            return Ok(None);
         }
     };
     let state_chain_input_proof = state_chain_input_proof.path_to_proof.unwrap();

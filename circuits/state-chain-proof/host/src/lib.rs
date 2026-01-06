@@ -194,12 +194,33 @@ pub async fn fetch_state_chain(
     .await?;
 
     for i in start..(start + batch_size) {
-        let (_, cl_block_number, _goat_block_hash) =
-            fetch_cbft_validator_info(cosmos_rpc_url, i).await.map_err(|e| {
-                tracing::error!("fetch_cbft_tx_data: {e:?}");
-                // GOAT's block time is 3 seconds
+        let evm_block =
+            fetch_exection_layer_block(&execution_layer_rpc, i, &genesis).await.map_err(|e| {
+                tracing::error!("fetch_exection_layer_block: {e:?}");
                 proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
             })?;
+
+        //let evm_block_hash = evm_block.current_block.hash_slow();
+        //let parent_beacon_block_root =
+        //    evm_block.current_block.header.parent_beacon_block_root.unwrap();
+
+        //let cosmos_block_height = match get_cosmos_block_height_at(
+        //    cosmos_rpc_url,
+        //    *parent_beacon_block_root,
+        //).await {
+        //    Ok(d) => d,
+        //    Err(_) =>None,
+        //};
+        let cosmos_block_height = None;
+
+        let (_, cl_block_number, _goat_block_hash) =
+            fetch_cbft_validator_info(cosmos_rpc_url, i, cosmos_block_height).await.map_err(
+                |e| {
+                    tracing::error!("fetch_cbft_validator_info: {e:?}");
+                    // GOAT's block time is 3 seconds
+                    proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
+                },
+            )?;
         let cosmos_txns =
             fetch_cbft_tx_data(cosmos_rpc_url, cl_block_number).await.map_err(|e| {
                 tracing::error!("fetch_cbft_tx_data: {e:?}");
@@ -211,12 +232,10 @@ pub async fn fetch_state_chain(
                 proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
             })?;
 
-        let evm_block =
-            fetch_exection_layer_block(&execution_layer_rpc, i, &genesis).await.map_err(|e| {
-                tracing::error!("fetch_exection_layer_block: {e:?}");
-                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
-            })?;
-        println!("block: {i}, cl_block_number: {cl_block_number}, txns: {}", cosmos_txns.len());
+        tracing::info!(
+            "block: {i}, cl_block_number: {cl_block_number}, txns: {}",
+            cosmos_txns.len()
+        );
 
         let withdrawals = if !graph_block_numbers.is_empty() {
             let indices: Vec<usize> = graph_block_numbers
