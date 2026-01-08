@@ -202,7 +202,6 @@ impl ProofBuilder for OperatorProofBuilder {
         "operator-chain".to_string()
     }
 
-    #[tracing::instrument(level = "info", skip(self))]
     fn build_proof(
         &self,
         ctx: &ProofRequest,
@@ -238,11 +237,8 @@ impl ProofBuilder for OperatorProofBuilder {
                 .unwrap();
             let zkm_vk_hash =
                 fs::read(&format!("{}.vk_hash.bin", header_chain_input_proof)).unwrap();
-            let prev_output = zkm_sdk::ZKMPublicValues::from(&zkm_public_values).read();
-            let prev_proof = HeaderChainPrevProofType::PrevProof(prev_output);
-
             HeaderChainCircuitInput {
-                prev_proof,
+                prev_proof: HeaderChainPrevProofType::GenesisBlock, // unused
                 zkm_proof,
                 zkm_public_values,
                 zkm_vk_hash,
@@ -259,10 +255,8 @@ impl ProofBuilder for OperatorProofBuilder {
                 .unwrap();
             let zkm_vk_hash =
                 fs::read(&format!("{}.vk_hash.bin", commit_chain_input_proof)).unwrap();
-            let prev_output = zkm_sdk::ZKMPublicValues::from(&zkm_public_values).read();
-            let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
             CommitChainCircuitInput {
-                prev_proof,
+                prev_proof: CommitChainPrevProofType::GenesisBlock, // unused
                 zkm_proof,
                 zkm_public_values,
                 zkm_vk_hash,
@@ -279,10 +273,8 @@ impl ProofBuilder for OperatorProofBuilder {
                 fs::read(&format!("{}.public_inputs.bin", state_chain_input_proof)).unwrap();
             let zkm_vk_hash =
                 fs::read(&format!("{}.vk_hash.bin", state_chain_input_proof)).unwrap();
-            let prev_output = zkm_sdk::ZKMPublicValues::from(&zkm_public_values).read();
-            let prev_proof = StateChainPrevProofType::PrevProof(prev_output);
             StateChainCircuitInput {
-                prev_proof,
+                prev_proof: StateChainPrevProofType::GenesisBlock, // unused
                 zkm_proof,
                 zkm_public_values,
                 zkm_vk_hash,
@@ -323,13 +315,6 @@ impl ProofBuilder for OperatorProofBuilder {
             target_block.clone(),
             &bitcoin_block_headers,
         );
-
-        //let eth_client_execution_input: EthClientExecutorInput =
-        //    fetch_exection_layer_block(&args).await;
-        //println!(
-        //    "el block hash: {}",
-        //    eth_client_execution_input.current_block.header.hash_slow().to_string()
-        //);
 
         // Generate the proofs
         let (proof, cycles, proving_time) = tracing::info_span!("generate proof").in_scope(

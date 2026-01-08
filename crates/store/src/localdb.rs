@@ -2624,13 +2624,14 @@ impl<'a> StorageProcessor<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn update_operator_proof_success(
+    pub async fn update_operator_proof(
         &mut self,
         id: i64,
         path_to_proof: String,
         public_value_hex: String,
         proof_size: i64,
         cycles: i64,
+        proof_state: i64,
         total_time_to_proof: i64,
         proving_time: i64,
         zkm_version: &str,
@@ -2642,7 +2643,7 @@ impl<'a> StorageProcessor<'a> {
                  public_value_hex = ?,
                  proof_size = ?,
                  cycles = ?,
-                 proof_state = 2,
+                 proof_state = ?,
                  total_time_to_proof = ?,
                  proving_time = ?,
                  zkm_version = ?,
@@ -2652,6 +2653,7 @@ impl<'a> StorageProcessor<'a> {
             public_value_hex,
             proof_size,
             cycles,
+            proof_state,
             total_time_to_proof,
             proving_time,
             zkm_version,
@@ -2781,7 +2783,7 @@ impl<'a> StorageProcessor<'a> {
                         created_at,
                         updated_at
                  FROM operator_proof
-                 WHERE proof_state != 2
+                 WHERE proof_state == 0
                  ORDER BY id ASC
                  LIMIT 1",
         )
@@ -2791,13 +2793,14 @@ impl<'a> StorageProcessor<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn update_watchtower_proof_success(
+    pub async fn update_watchtower_proof(
         &mut self,
         id: i64,
         path_to_proof: String,
         public_value_hex: String,
         proof_size: i64,
         cycles: i64,
+        proof_state: i64,
         total_time_to_proof: i64,
         proving_time: i64,
         zkm_version: &str,
@@ -2809,7 +2812,7 @@ impl<'a> StorageProcessor<'a> {
                  public_value_hex = ?,
                  proof_size = ?,
                  cycles = ?,
-                 proof_state = 2,
+                 proof_state = ?,
                  total_time_to_proof = ?,
                  proving_time = ?,
                  zkm_version = ?,
@@ -2819,6 +2822,7 @@ impl<'a> StorageProcessor<'a> {
             public_value_hex,
             proof_size,
             cycles,
+            proof_state,
             total_time_to_proof,
             proving_time,
             zkm_version,
@@ -2849,26 +2853,6 @@ impl<'a> StorageProcessor<'a> {
             instance_id,
             graph_id,
             public_key
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(res.rows_affected())
-    }
-
-    pub async fn update_watchtower_proof_state(
-        &mut self,
-        id: i64,
-        proof_state: i64,
-    ) -> anyhow::Result<u64> {
-        let current_time = get_current_timestamp_secs();
-        let res = sqlx::query!(
-            "UPDATE watchtower_proof
-             SET proof_state = ?,
-                 updated_at = ?
-             WHERE id = ?",
-            proof_state,
-            current_time,
-            id,
         )
         .execute(self.conn())
         .await?;
@@ -3000,7 +2984,7 @@ impl<'a> StorageProcessor<'a> {
                          created_at,
                          updated_at
                   FROM watchtower_proof
-                  WHERE proof_state != 2
+                  WHERE proof_state == 0
                   ORDER BY id ASC
                   lIMIT 1",
         )

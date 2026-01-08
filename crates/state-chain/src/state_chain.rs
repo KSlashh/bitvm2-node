@@ -36,6 +36,7 @@ pub struct StateChainState {
     pub genesis_evm_block_hash: [u8; 32],
     pub latest_evm_block_hash: [u8; 32],
     pub latest_cosmos_block: Vec<u8>,
+    pub withdrawals: Vec<(Address, [u8; 32], Vec<[u8; 16]>)>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -63,6 +64,7 @@ impl StateChainState {
             latest_evm_block_hash: genesis_evm_block_hash,
             genesis_evm_block_hash,
             latest_cosmos_block,
+            withdrawals: vec![],
         }
     }
 
@@ -95,6 +97,9 @@ impl StateChainState {
                     &block.cosmos_txns,
                     &data_hash,
                 );
+                if let Some(w) = block.withdrawals {
+                    self.withdrawals.push(w);
+                }
             }
             self.evm_block_height += 1;
             self.latest_evm_block_hash = current_block_hash;

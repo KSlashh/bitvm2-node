@@ -18,6 +18,7 @@ use header_chain::{
     HeaderChainPrevProofType, MMRHost, SPV, verify_merkle_proof,
 };
 use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
+use zkm_primitives::io::ZKMPublicValues;
 use zkm_verifier::Groth16Verifier;
 
 use bitcoin::{ScriptBuf, TxOut, Txid, secp256k1::PublicKey};
@@ -51,9 +52,13 @@ pub fn watch_longest_chain(
         &commit_chain.zkm_vk_hash,
     )
     .expect("Failed to verify commit chain proof");
-    let CommitChainPrevProofType::PrevProof(commit_chain_output) = &commit_chain.prev_proof else {
+
+    let prev_output = ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
+    let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
+    let CommitChainPrevProofType::PrevProof(commit_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in watch_longest_chain");
     };
+
     assert_eq!(
         commit_chain_output.chain_state.commit_txn.compute_txid(),
         Txid::from_byte_array(latest_sequencer_commit_txid)
@@ -69,8 +74,9 @@ pub fn watch_longest_chain(
     )
     .expect("Failed to verify header chain proof");
 
-    let HeaderChainPrevProofType::PrevProof(btc_header_chain_output) = &header_chain.prev_proof
-    else {
+    let prev_output = ZKMPublicValues::from(&header_chain.zkm_public_values).read();
+    let prev_proof = HeaderChainPrevProofType::PrevProof(prev_output);
+    let HeaderChainPrevProofType::PrevProof(btc_header_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in watch_longest_chain");
     };
     // verify that the latest_sequecner_commit_tx is in the header chain
@@ -79,7 +85,9 @@ pub fn watch_longest_chain(
 
     verify_proof(&state_chain.zkm_proof, &state_chain.zkm_public_values, &state_chain.zkm_vk_hash)
         .expect("Failed to verify state chain proof");
-    let StateChainPrevProofType::PrevProof(state_chain_output) = &state_chain.prev_proof else {
+    let prev_output = ZKMPublicValues::from(&state_chain.zkm_public_values).read();
+    let prev_proof = StateChainPrevProofType::PrevProof(prev_output);
+    let StateChainPrevProofType::PrevProof(state_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in watch_longest_chain");
     };
     // check the signature.
@@ -143,7 +151,9 @@ pub fn propose_longest_chain(
         &commit_chain.zkm_vk_hash,
     )
     .expect("Failed to verify commit chain proof");
-    let CommitChainPrevProofType::PrevProof(commit_chain_output) = &commit_chain.prev_proof else {
+    let prev_output = ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
+    let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
+    let CommitChainPrevProofType::PrevProof(commit_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in propose_longest_chain");
     };
     assert_eq!(
@@ -163,9 +173,9 @@ pub fn propose_longest_chain(
         &operator_header_chain.zkm_vk_hash,
     )
     .expect("Failed to verify header chain proof");
-    let HeaderChainPrevProofType::PrevProof(btc_header_chain_output) =
-        &operator_header_chain.prev_proof
-    else {
+    let prev_output = ZKMPublicValues::from(&operator_header_chain.zkm_public_values).read();
+    let prev_proof = HeaderChainPrevProofType::PrevProof(prev_output);
+    let HeaderChainPrevProofType::PrevProof(btc_header_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in propose_longest_chain");
     };
     let operator_total_work = btc_header_chain_output.chain_state.total_work;
@@ -268,19 +278,13 @@ pub fn propose_longest_chain(
     }
 
     println!("verify el block");
-    let mut is_found = false;
-    for block in &state_chain.blocks {
-        if let Some(withdrawals) = &block.withdrawals
-            && withdrawals.2.contains(&graph_id)
-        {
-            is_found = true;
-            break;
-        }
-    }
-    assert!(is_found, "Graph id {graph_id:?} is not included in current state chain");
+
     verify_proof(&state_chain.zkm_proof, &state_chain.zkm_public_values, &state_chain.zkm_vk_hash)
         .expect("Failed to verify state chain proof");
-    let StateChainPrevProofType::PrevProof(state_chain_output) = &state_chain.prev_proof else {
+
+    let prev_output = ZKMPublicValues::from(&state_chain.zkm_public_values).read();
+    let prev_proof = StateChainPrevProofType::PrevProof(prev_output);
+    let StateChainPrevProofType::PrevProof(state_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in propose_longest_chain");
     };
     // check the signature.
@@ -303,6 +307,15 @@ pub fn propose_longest_chain(
     assert_eq!(commitment[32..64], state_chain_output.chain_state.genesis_evm_block_hash[..]);
 
     assert_eq!(commit_sequencer_set_hash, expected_seqeuencer_set_hash);
+
+    let mut is_found = false;
+    for withdrawal in &state_chain_output.chain_state.withdrawals {
+        if withdrawal.2.contains(&graph_id) {
+            is_found = true;
+            break;
+        }
+    }
+    assert!(is_found, "Graph id {graph_id:?} is not included in current state chain");
 
     // (operator_total_work, included_watchtowers, graph_id, operator_genesis_sequencer_commit_txid, btc_best_block_hash)
     //(hash_operator_inputs(graph_id, operator_genesis_sequencer_commit_txid), btc_best_block_hash)
