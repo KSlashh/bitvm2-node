@@ -2669,18 +2669,20 @@ impl<'a> StorageProcessor<'a> {
         &mut self,
         instance_id: &Uuid,
         graph_id: &Uuid,
-        proof_state: i64,
+        old_proof_state: i64,
+        new_proof_state: i64,
     ) -> anyhow::Result<u64> {
         let current_time = get_current_timestamp_secs();
         let res = sqlx::query!(
             "UPDATE operator_proof
              SET proof_state = ?,
                  updated_at = ?
-             WHERE instance_id = ? AND graph_id = ?",
-            proof_state,
+             WHERE instance_id = ? AND graph_id = ? AND  proof_state = ?",
+            new_proof_state,
             current_time,
             instance_id,
-            graph_id
+            graph_id,
+            old_proof_state
         )
         .execute(self.conn())
         .await?;
@@ -2838,7 +2840,8 @@ impl<'a> StorageProcessor<'a> {
         instance_id: &Uuid,
         graph_id: &Uuid,
         public_key: &str,
-        proof_state: i64,
+        old_proof_state: i64,
+        new_proof_state: i64,
     ) -> anyhow::Result<u64> {
         let current_time = get_current_timestamp_secs();
         let res = sqlx::query!(
@@ -2847,12 +2850,13 @@ impl<'a> StorageProcessor<'a> {
                  updated_at = ?
              WHERE   instance_id = ?
                     AND graph_id = ?
-                    AND  public_key = ?",
-            proof_state,
+                    AND  public_key = ? AND proof_state = ?",
+            new_proof_state,
             current_time,
             instance_id,
             graph_id,
-            public_key
+            public_key,
+            old_proof_state
         )
         .execute(self.conn())
         .await?;

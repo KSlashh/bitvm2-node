@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use uuid::Uuid;
 
@@ -91,7 +91,9 @@ fn infer_business_id(content: &GOATMessageContent) -> Option<Uuid> {
         GOATMessageContent::Take2Sent(v) => Some(v.graph_id),
         GOATMessageContent::SyncGraphRequest(v) => Some(v.graph_id),
         GOATMessageContent::SyncGraph(v) => Some(v.graph_id),
-        GOATMessageContent::InstanceDiscarded(v) => v.graph_infos.first().map(|(graph_id, _, _)| *graph_id),
+        GOATMessageContent::InstanceDiscarded(v) => {
+            v.graph_infos.first().map(|(graph_id, _, _)| *graph_id)
+        }
         GOATMessageContent::RequestNodeInfo(_) | GOATMessageContent::ResponseNodeInfo(_) => None,
     }
 }

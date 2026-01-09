@@ -187,8 +187,14 @@ pub(super) async fn update_operator_proof_task_timeout(
 ) -> ApiResult<OperatorProofTimeoutUpdateResponse> {
     let instance_id = InputValidator::validate_uuid(&payload.instance_id, "instance_id")?;
     let graph_id = InputValidator::validate_uuid(&payload.graph_id, "graph_id")?;
-    match update_operator_task_state(&api_state.local_db, instance_id, graph_id, ProofState::Failed)
-        .await
+    match update_operator_task_state(
+        &api_state.local_db,
+        instance_id,
+        graph_id,
+        ProofState::New,
+        ProofState::Failed,
+    )
+    .await
     {
         Ok(rows_affected) => ok_response(OperatorProofTimeoutUpdateResponse {
             instance_id: instance_id.to_string(),
@@ -276,6 +282,7 @@ pub(super) async fn update_watchtower_proof_task_timeout(
         instance_id,
         graph_id,
         &payload.public_key,
+        ProofState::New,
         ProofState::Failed,
     )
     .await

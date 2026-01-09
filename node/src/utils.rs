@@ -10,7 +10,6 @@ use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Result, anyhow, bail};
-use ark_serialize::CanonicalDeserialize;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
@@ -1828,43 +1827,6 @@ pub async fn get_operator_proof(
         bail!("No graph in db");
     }
 }
-pub async fn get_operator_proof_vk(
-    local_db: &LocalDB,
-    http_client: &HttpAsyncClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<VerifyingKey> {
-    let mut storage_processor = local_db.acquire().await?;
-    if let Some(graph) = storage_processor.find_graph(&graph_id).await?
-        && graph.proceed_withdraw_height > 0
-    {
-        let url = format!(
-            "http://{}{}",
-            get_proof_build_rpc_host()
-                .ok_or_else(|| anyhow::anyhow!("failed to get proof_build_rpc_host"))?,
-            NODES_OPERATOR_BASE
-        );
-        let response = http_client
-            .post_response_json::<OperatorProofResponse, OperatorProofRequest>(
-                &url,
-                &OperatorProofRequest {
-                    instance_id: instance_id.to_string(),
-                    graph_id: graph_id.to_string(),
-                    execution_layer_block_number: graph.proceed_withdraw_height,
-                },
-            )
-            .await?;
-
-        match response.proof_data {
-            Some(proof_data) => Ok(VerifyingKey::deserialize_compressed(proof_data.vk.as_slice())?),
-            None => bail!("failed to get Groth16Proof"),
-        }
-    } else {
-        warn!("graph:{graph_id} not found or proceed_withdraw_height <= 0");
-        bail!("No graph in db or proceed_withdraw_height <= 0");
-    }
-}
-
 const ASSERT_COMMIT_CACHE_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
