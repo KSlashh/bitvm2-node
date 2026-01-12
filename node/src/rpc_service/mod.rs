@@ -5,6 +5,7 @@ mod node;
 pub(crate) mod proof;
 mod response;
 pub mod routes;
+pub(super) mod utils;
 pub mod validation;
 
 use crate::env::{get_btc_url_from_env, get_goat_network, get_network, goat_config_from_env};
@@ -243,12 +244,14 @@ mod tests {
         generate_local_key, generate_random_bytes, get_rand_btc_address_p2wpkh,
         get_rand_goat_address, temp_sqlite_db_path,
     };
+    use alloy::primitives::U256;
     use client::Utxo;
     use http::Method;
     use prometheus_client::registry::Registry;
     use reqwest::Client;
     use secp256k1::Secp256k1;
     use serde_json::{Value, json};
+    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use store::localdb::LocalDB;
@@ -389,9 +392,11 @@ mod tests {
             goat_addr: get_rand_goat_address(),
             btc_pub_key: pub_key.clone(),
             socket_addr: "".to_string(),
-            reward: 0,
+            reward: "0".to_string(),
             service_fee_rate: 0.0,
-            available_peg_btc: 0,
+            available_peg_btc: U256::from_str("4700000000000000000000000")
+                .unwrap_or_default()
+                .to_string(),
             updated_at: current_time_secs(),
             created_at: current_time_secs(),
         });
@@ -403,9 +408,11 @@ mod tests {
             goat_addr: goat_addr.clone(),
             btc_pub_key: pub_key.clone(),
             socket_addr: "".to_string(),
-            reward: 0,
+            reward: "0".to_string(),
             service_fee_rate: 0.0,
-            available_peg_btc: 0,
+            available_peg_btc: U256::from_str("4700000000000000000000000")
+                .unwrap_or_default()
+                .to_string(),
             updated_at: current_time_secs(),
             created_at: current_time_secs(),
         });
@@ -498,6 +505,7 @@ mod tests {
             escrow_hash: None,
             bridge_out_lock_time: 0,
             post_pegin_txhash: None,
+            bridge_out_amount: "0".to_string(),
             status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
@@ -529,6 +537,7 @@ mod tests {
             bridge_out_lock_time: 0,
             post_pegin_txhash: None,
             status_updated_at: current_time_secs(),
+            bridge_out_amount: "0".to_string(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
         });

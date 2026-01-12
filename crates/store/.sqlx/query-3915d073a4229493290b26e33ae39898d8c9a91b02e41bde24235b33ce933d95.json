@@ -1,61 +1,51 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT * FROM node WHERE peer_id = ?",
+  "query": "SELECT * from bridge_out_global_stats WHERE id = ?",
   "describe": {
     "columns": [
       {
-        "name": "peer_id",
+        "name": "id",
         "ordinal": 0,
-        "type_info": "Text"
+        "type_info": "Integer"
       },
       {
-        "name": "actor",
+        "name": "initial_txn",
         "ordinal": 1,
-        "type_info": "Text"
+        "type_info": "Integer"
       },
       {
-        "name": "goat_addr",
+        "name": "initial_amount",
         "ordinal": 2,
         "type_info": "Text"
       },
       {
-        "name": "btc_pub_key",
+        "name": "claim_txn",
         "ordinal": 3,
-        "type_info": "Text"
+        "type_info": "Integer"
       },
       {
-        "name": "socket_addr",
+        "name": "claim_amount",
         "ordinal": 4,
         "type_info": "Text"
       },
       {
-        "name": "node_name",
+        "name": "refund_txn",
         "ordinal": 5,
-        "type_info": "Text"
+        "type_info": "Integer"
       },
       {
-        "name": "service_fee_rate",
+        "name": "refund_amount",
         "ordinal": 6,
-        "type_info": "Float"
-      },
-      {
-        "name": "available_peg_btc",
-        "ordinal": 7,
-        "type_info": "Text"
-      },
-      {
-        "name": "reward",
-        "ordinal": 8,
         "type_info": "Text"
       },
       {
         "name": "created_at",
-        "ordinal": 9,
+        "ordinal": 7,
         "type_info": "Integer"
       },
       {
         "name": "updated_at",
-        "ordinal": 10,
+        "ordinal": 8,
         "type_info": "Integer"
       }
     ],
@@ -71,10 +61,8 @@
       false,
       false,
       false,
-      false,
-      false,
       false
     ]
   },
-  "hash": "e4bd68a486be21ff33af14a577155a3e30fdc1fe9a927a9a98be1d4a6dd0cb4a"
+  "hash": "3915d073a4229493290b26e33ae39898d8c9a91b02e41bde24235b33ce933d95"
 }
