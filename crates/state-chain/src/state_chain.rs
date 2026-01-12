@@ -26,7 +26,7 @@ pub struct CircuitStateBlock {
     pub cosmos_block: Vec<u8>,
     pub evm_block: EthClientExecutorInput,
     // (gateway contracts, withdraw_data_base_slot, [graph_ids])
-    pub withdrawals: Vec<(Address, [u8; 32], Vec<[u8; 16]>)>,
+    pub withdrawals: Vec<WithdrawalSlot>,
 }
 
 /// The latest seqeuncer set
@@ -36,7 +36,7 @@ pub struct StateChainState {
     pub genesis_evm_block_hash: [u8; 32],
     pub latest_evm_block_hash: [u8; 32],
     pub latest_cosmos_block: Vec<u8>,
-    pub withdrawals: Vec<(Address, [u8; 32], Vec<[u8; 16]>)>,
+    pub withdrawals: Vec<WithdrawalSlot>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -109,7 +109,7 @@ impl StateChainState {
 // https://github.com/GOATNetwork/bitvm2-L2-contracts/blob/main/src/Gateway.sol#L192
 // Get base slot:  forge inspect src/GatewayDebug.sol:GatewayDebug storage-layout
 pub fn execute_el_block_and_check_withdraw_tx(
-    withdrawals: &Vec<WithdrawalSlot>,
+    withdrawals: &[WithdrawalSlot],
     input: EthClientExecutorInput,
 ) -> Header {
     // verify the state transition and withdraw status

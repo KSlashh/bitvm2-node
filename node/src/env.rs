@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
+use util::hex_parse;
 use zeroize::Zeroizing;
 
 pub const ENV_BTC_CHAIN_URL: &str = "BTC_CHAIN_URL";
@@ -525,4 +526,9 @@ pub fn should_always_challenge() -> bool {
         Ok(val) => val.to_lowercase() == "true",
         Err(_) => false,
     }
+}
+
+pub fn get_genesis_sequencer_commit_id() -> [u8; 32] {
+    let hexed = std::env::var("GENESIS_SEQUENCER_COMMIT_ID").unwrap();
+    hex_parse::<32>(&hexed).unwrap()
 }
