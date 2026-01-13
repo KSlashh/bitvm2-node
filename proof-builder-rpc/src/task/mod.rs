@@ -244,6 +244,7 @@ pub(crate) async fn fetch_on_demand_task(
         execution_layer_block_number,
         watchtower_challenge_init_txid,
         watchtower_challenge_txids,
+        included_watchtowers,
         watchtower_public_keys,
         graph_id,
     ) = if is_watchtower {
@@ -257,6 +258,7 @@ pub(crate) async fn fetch_on_demand_task(
                     task.execution_layer_block_number,
                     None,
                     challenge_txids,
+                    vec![],
                     pubkeys,
                     Some(task.graph_id.as_simple().to_string()),
                 )
@@ -291,11 +293,14 @@ pub(crate) async fn fetch_on_demand_task(
             watchtower_info.iter().map(|w| w.challenge_txid.0.to_string()).collect::<Vec<_>>();
         let challenge_public_keys: Vec<String> =
             watchtower_info.iter().map(|w| w.public_key.clone()).collect::<Vec<_>>();
+        let included_watchtowers: Vec<bool> =
+            watchtower_info.iter().map(|w| w.included).collect::<Vec<_>>();
         (
             task.id,
             task.execution_layer_block_number,
             Some(challenge_init_txids[0].clone()),
             challenge_txids,
+            included_watchtowers,
             challenge_public_keys,
             Some(task.graph_id.as_simple().to_string()),
         )
@@ -309,22 +314,23 @@ pub(crate) async fn fetch_on_demand_task(
             let txid = Txid::from_str(challenge_txid).unwrap();
             match btc_client.get_tx_status(&txid).await {
                 Ok(tx) => {
-                    if let Some(height) = tx.block_height {
-                        if (height as i64) < block_number {
-                            tracing::error!(
-                                "Challenge txid {} is included in block {}, which is before the current block number {}",
-                                challenge_txid,
-                                height,
-                                block_number
-                            );
-                            block_number = height as i64;
-                        }
+                    if let Some(height) = tx.block_height
+                        && tx.confirmed
+                        && (height as i64) < block_number
+                    {
+                        tracing::info!(
+                            "Challenge txid {} is included in block {}, which is before the current block number {}",
+                            challenge_txid,
+                            height,
+                            block_number
+                        );
+                        block_number = height as i64;
                     } else {
-                        tracing::error!("Challenge txid {} is not confirmed yet", challenge_txid);
+                        tracing::warn!("Challenge txid {} is not confirmed yet", challenge_txid);
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
+                    tracing::warn!(
                         "Failed to get tx status for txid {}, error: {}",
                         challenge_txid,
                         e
@@ -334,6 +340,15 @@ pub(crate) async fn fetch_on_demand_task(
         }
         block_number
     };
+
+    tracing::info!(
+        "is_watchtower {is_watchtower}, btc_block_number {btc_block_number}, execution_layer_block_number {execution_layer_block_number}"
+    );
+    if !is_watchtower && btc_block_number == 0 {
+        tracing::warn!("Watchtower challenge tx is not confirmed yet.");
+        return Ok(None);
+    }
+
     let header_chain_input_proof = if btc_block_number > 0 {
         match storage_processor
             .find_long_running_task_proof_including_block_number(
@@ -402,6 +417,7 @@ pub(crate) async fn fetch_on_demand_task(
         state_chain_input_proof,
         watchtower_challenge_init_txid,
         watchtower_challenge_txids,
+        included_watchtowers,
         watchtower_public_keys,
         graph_id,
     }))
@@ -585,9 +601,25 @@ pub(crate) async fn add_operator_task(
     instance_id: Uuid,
     graph_id: Uuid,
     execution_layer_block_number: i64,
+    watchtower_challenge_txids: Vec<String>,
+    included_watchtowers: Vec<bool>,
 ) -> anyhow::Result<u64> {
-    let mut storage_processor = local_db.acquire().await?;
-    Ok(storage_processor
+    let mut storage_processor = local_db.start_transaction().await?;
+    // update watchtower's challenge txid.
+
+    for (i, txid) in watchtower_challenge_txids.iter().enumerate() {
+        storage_processor
+            .update_watchtower_proof_challenge_txid(
+                &instance_id,
+                &graph_id,
+                i as i32,
+                txid,
+                included_watchtowers[i],
+            )
+            .await?;
+    }
+
+    let affected_rows = storage_processor
         .create_operator_proof(&OperatorProof {
             id: 1,
             instance_id,
@@ -599,7 +631,9 @@ pub(crate) async fn add_operator_task(
             cycles: 0,
             ..Default::default()
         })
-        .await?)
+        .await?;
+    storage_processor.commit().await?;
+    Ok(affected_rows)
 }
 
 pub(crate) async fn find_operator_task(
@@ -709,6 +743,6 @@ mod tests {
         let instance_id = Uuid::from_str("00112233445566778899aabbccddeeff").unwrap();
         let graph_id = Uuid::from_str("00112233445566778899aabbccddeeff").unwrap();
         let number = 9511055;
-        add_operator_task(&local_db, instance_id, graph_id, number).await.unwrap();
+        add_operator_task(&local_db, instance_id, graph_id, number, vec![], vec![]).await.unwrap();
     }
 }

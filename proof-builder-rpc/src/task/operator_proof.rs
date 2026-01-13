@@ -2,6 +2,7 @@ use crate::{
     config::ProofBuilderConfig,
     task::{ProofState, fetch_on_demand_task, update_operator_task},
 };
+use bitcoin_light_client_circuit::le_bits_to_u256;
 use operator_proof::{OperatorProofBuilder, fetch_target_block_and_watchtower_tx};
 use proof_builder::{ProofBuilder, ProofRequest};
 use std::time::Duration;
@@ -49,6 +50,8 @@ pub(crate) fn spawn_operator_proof_task(
                         args.watchtower_challenge_init_txid = next_task.watchtower_challenge_init_txid.unwrap().clone();
                         args.watchtower_challenge_txids = next_task.watchtower_challenge_txids.join(",");
                         args.watchtower_public_keys = next_task.watchtower_public_keys.join(",");
+                        // LE array to string, e.g. [1, 1, 1, 0] => 7
+                        args.included_watchtowers = le_bits_to_u256(&next_task.included_watchtowers.try_into().unwrap()).to_string();
                         task_index = next_task.task_index;
                     } else {
                         tracing::info!("Wait for the next task");
@@ -84,25 +87,25 @@ pub(crate) fn spawn_operator_proof_task(
                     };
                     let ctx = ProofRequest::OperatorProofRequest {
                         included_watchtowers: args.included_watchtowers.clone(),
-                            graph_id: hex_parse::<16>(&args.graph_id).unwrap(),
-                            genesis_sequencer_commit_txid: args.genesis_sequencer_commit_txid.clone(),
+                        graph_id: hex_parse::<16>(&args.graph_id).unwrap(),
+                        genesis_sequencer_commit_txid: args.genesis_sequencer_commit_txid.clone(),
 
-                            header_chain_input_proof: args.header_chain_input_proof.clone(),
-                            commit_chain_input_proof: args.commit_chain_input_proof.clone(),
-                            state_chain_input_proof: args.state_chain_input_proof.clone(),
-                            execution_layer_block_number: args.execution_layer_block_number,
+                        header_chain_input_proof: args.header_chain_input_proof.clone(),
+                        commit_chain_input_proof: args.commit_chain_input_proof.clone(),
+                        state_chain_input_proof: args.state_chain_input_proof.clone(),
+                        execution_layer_block_number: args.execution_layer_block_number,
 
-                            output: args.output.clone(),
+                        output: args.output.clone(),
 
-                            block_pos,
-                            target_block,
-                            operator_latest_sequencer_commit_txn,
+                        block_pos,
+                        target_block,
+                        operator_latest_sequencer_commit_txn,
 
-                            watchtower_challenge_txns,
-                            watchtower_challenge_txn_prev_outs,
-                            watchtower_challenge_txn_prev_indices,
-                            watchtower_challenge_txn_pubkeys,
-                            watchtower_challenge_txn_scripts,
+                        watchtower_challenge_txns,
+                        watchtower_challenge_txn_prev_outs,
+                        watchtower_challenge_txn_prev_indices,
+                        watchtower_challenge_txn_pubkeys,
+                        watchtower_challenge_txn_scripts,
                     };
                     let proving_start = tokio::time::Instant::now();
                     let (cycles, proving_time, public_value_hex, proof_size, proof_state, zkm_version) = match builder.build_proof(&ctx) {

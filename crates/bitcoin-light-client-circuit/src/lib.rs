@@ -116,12 +116,22 @@ pub fn watch_longest_chain(
     (btc_header_chain_output.chain_state.total_work, commit_chain_output.chain_state.block_height)
 }
 
-fn u256_to_bits(u: U256) -> [bool; 256] {
+pub fn u256_to_le_bits(u: U256) -> [bool; 256] {
     let mut bits = [false; 256];
     for (i, item) in bits.iter_mut().enumerate() {
         *item = u.bit(i); // U256 provides `.bit(n)` method
     }
     bits
+}
+
+pub fn le_bits_to_u256(bits: &[bool; 256]) -> U256 {
+    let mut u = U256::ZERO;
+    for (i, bit) in bits.iter().enumerate() {
+        if *bit {
+            u += U256::ONE << i; // Set the i-th bit if it's true
+        }
+    }
+    u
 }
 
 // calculate operator public input:  https://github.com/ProjectZKM/Ziren/blob/main/crates/sdk/src/utils.rs#L42
@@ -187,7 +197,7 @@ pub fn propose_longest_chain(
     assert!(spv.verify(&btc_header_chain_output.chain_state.block_hashes_mmr));
 
     // parse included_watchtowers into bits array
-    let included_watchertowers_bits = u256_to_bits(included_watchtowers);
+    let included_watchertowers_bits = u256_to_le_bits(included_watchtowers);
     println!("included watchtowers:{included_watchertowers_bits:?}");
     // For each watchtowers, if the included_watchtowers[i] is true,
     //   verify the watchtower_challenge_txns[i] is valid
@@ -560,5 +570,24 @@ mod tests {
 
         let op_return_data = commit_chain::extract_op_return_data(&tx.output);
         assert_eq!(expected_op_data.to_vec(), op_return_data);
+    }
+
+    #[test]
+    fn test_u256_to_le_bits() {
+        use std::str::FromStr;
+        // generate random u256
+        let u = U256::from(rand::random::<u128>());
+        let bits = u256_to_le_bits(u);
+        let reconstructed = le_bits_to_u256(&bits);
+        assert_eq!(u, reconstructed);
+
+        let u_str = u.to_string();
+        let u = U256::from_str(&u_str).unwrap();
+        let bits = u256_to_le_bits(u);
+        let reconstructed2 = le_bits_to_u256(&bits);
+        assert_eq!(u, reconstructed);
+        assert_eq!(u, reconstructed2);
+        let reconstructed_str = reconstructed2.to_string();
+        assert_eq!(u_str, reconstructed_str);
     }
 }
