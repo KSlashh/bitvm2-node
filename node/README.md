@@ -22,30 +22,49 @@ stateDiagram-v2
     [*] --> OperatorPresigned: Create graph
     
     OperatorPresigned --> CommitteePresigned: Committee presigns
+    OperatorPresigned --> Obsoleted: PreKickoff on-chain but data not posted
+    
     CommitteePresigned --> OperatorDataPushed: Operator pushes L2 data
-    OperatorDataPushed --> PreKickoff: PreKickoff tx confirmed
+    CommitteePresigned --> Obsoleted: PreKickoff on-chain but data not posted
+    
+    OperatorDataPushed --> PreKickoff: PreKickoff tx confirmed on Bitcoin
+    OperatorDataPushed --> Obsoleted: Pegin not withdrawable & no withdraw request
     
     PreKickoff --> OperatorKickOff: Kickoff tx broadcast
     PreKickoff --> Skipped: Guardian/ForceSkip triggered
     
-    OperatorKickOff --> Challenge: WatchtowerChallengeInit confirmed
     OperatorKickOff --> OperatorTake1: Timeout without challenge
+    OperatorKickOff --> Challenge: WatchtowerChallengeInit confirmed
     
-    Challenge --> Disprove: Challenge or timeout detected
-    Challenge --> OperatorTake1: All resolved normally
-    
-    Disprove --> OperatorTake2: Disprove verified
+    Challenge --> Disprove: Disprove needed<br/>(challenge/timeout detected)
+    Challenge --> OperatorTake2: Normal completion<br/>(all challenges passed)
     
     OperatorTake1 --> [*]
     OperatorTake2 --> [*]
     Skipped --> [*]
     Obsoleted --> [*]
+    Disprove --> [*]
     
     note right of Challenge
-        Tracked by ChallengeSubStatus:
-        - watchtower_challenge_status
-        - commit_blockhash_status
-        - assert_commit_status
+        Sub-phases tracked by ChallengeSubStatus:
+        1. Watchtower Challenge Phase
+           - Watchers may challenge
+           - Operator ACK/NACK responses
+        2. CommitBlockHash Phase
+           - Operator commits blockhash
+        3. Assert Commit Phase
+           - Operator commits assertions
+    end note
+    
+    note right of Disprove
+        Triggered when any challenge
+        or timeout detected during
+        Challenge phase sub-phases
+    end note
+    
+    note right of Obsoleted
+        Reimbursement by other operators
+        or graph data not posted in time
     end note
     
     note right of OperatorPresigned
@@ -55,6 +74,79 @@ stateDiagram-v2
         - Disproving
     end note
 ```
+
+### Challenge to OperatorTake2 Flow
+
+The path from Challenge → OperatorTake2 requires successful completion of three sub-phases:
+
+```mermaid
+---
+title: Challenge Phase Flow to OperatorTake2
+---
+stateDiagram-v2
+    [*] --> Challenge
+    
+    Challenge --> WTPhase: Enter Watchtower Challenge Phase
+    Challenge --> Disprove: Challenge/Timeout<br/>detected
+    
+    WTPhase --> WTInit: WatchtowerChallengeInitTx<br/>confirmed
+    WTInit --> WTChallenge: Watchtowers may challenge
+    WTInit --> WTTimeout: No watchtower<br/>challenges
+    
+    WTChallenge --> WTAllACK: All watchtowers ACK
+    WTChallenge --> Disprove: Any NACK or timeout
+    
+    WTTimeout --> Disprove: Timeout expired
+    
+    WTAllACK --> BlockHashPhase: Proceed to BlockHash Phase
+    
+    BlockHashPhase --> BlockHashWait: Wait for<br/>WatchtowerChallenge<br/>completion
+    BlockHashWait --> BlockHashCommit: Operator commits<br/>blockhash
+    BlockHashWait --> Disprove: Commit timeout
+    
+    BlockHashCommit --> AssertPhase: Proceed to Assert Phase
+    
+    AssertPhase --> AssertInit: AssertInitTx confirmed
+    AssertInit --> AssertCommit: Operator commits<br/>assertions
+    AssertInit --> Disprove: Assert timeout
+    
+    AssertCommit --> CheckComplete: All phases complete?
+    
+    CheckComplete --> OperatorTake2: Yes - All conditions met<br/>✓ WatchtowerChallengeNormalFinished<br/>✓ BlockHash committed<br/>✓ Assertions committed
+    CheckComplete --> Disprove: No - Missing conditions
+    
+    OperatorTake2 --> [*]
+    Disprove --> [*]
+    
+    note right of Challenge
+        Initial state when
+        WatchtowerChallengeInit
+        confirmed on Bitcoin
+    end note
+    
+    note right of WTPhase
+        Monitor each watchtower
+        for challenges or timeout
+    end note
+    
+    note right of BlockHashPhase
+        Only proceeds after
+        WatchtowerChallengeStatus
+        reaches normal finish
+    end note
+    
+    note right of AssertPhase
+        Operator must commit
+        all assertions within
+        timelock window
+    end note
+```
+
+**Transition Conditions to OperatorTake2:**
+- `watchtower_challenge_status == WatchtowerChallengeNormalFinished`
+- `commit_blockhash_status == OperatorCommit`
+- `assert_commit_status == OperatorCommit`
+- `disprove_type == None` (no errors detected)
 
 ### Challenge Phase: WatchtowerChallengeStatus
 
@@ -152,7 +244,6 @@ stateDiagram-v2
     
     Challenge --> OperatorACK: Operator accepts challenge claim
     Challenge --> OperatorNACK: Operator rejects challenge claim
-    Challenge --> ChallengeTimeout: Operator response timelock expires
     
     OperatorACK --> [*]
     OperatorNACK --> [*]
@@ -200,7 +291,7 @@ pub struct WTInitTxVoutMonitorData {
 ```
 
 - `data_map`: Tracks status for each watchtower index
-- `require_disproved_indexes`: Indices requiring disprove (populated when item status changes to ChallengeTimeout or OperatorNACK)
+- `require_disproved_indexes`: Indices requiring disprove (populated for items in OperatorInit or Challenge status)
 - `commit_blockhash_status`: Synchronized with WatchtowerChallengeStatus
 - `is_challenge_timeout_sent`: Flag for timeout message tracking
 

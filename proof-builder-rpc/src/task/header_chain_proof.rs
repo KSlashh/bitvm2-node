@@ -26,6 +26,11 @@ pub(crate) fn spawn_header_chain_proof_task(
                 anyhow::bail!("Header chain proof generate task cancelled");
             }
         }
+        assert_eq!(
+            args.batch_size, 1,
+            "Header chain proof batch size must be 1, current batch size: {}",
+            args.batch_size
+        );
 
         let builder = HeaderChainProofBuilder::new();
         loop {
@@ -82,7 +87,7 @@ pub(crate) fn spawn_header_chain_proof_task(
                     let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
                     let zkm_version = proof.zkm_version.clone();
                     let (public_value_hex, proof_size) = builder.save_proof(&ctx, &input, cycles, proof)?;
-                    create_long_running_task(&local_db, args.start as u64, args.batch_size as u64, args.output_proof.clone(), public_value_hex, proof_size as i64, cycles, HeaderChainProofBuilder::name(), proving_duration as i64, proving_time as i64, store::ProofState::Proven, zkm_version).await?;
+                    create_long_running_task(&local_db, args.start as i64, args.batch_size as i64, args.output_proof.clone(), public_value_hex, proof_size as i64, cycles, HeaderChainProofBuilder::name(), proving_duration as i64, proving_time as i64, store::ProofState::Proven, zkm_version).await?;
                     args = ProofBuilderConfig::run_next(args, HeaderChainProofBuilder::name())?;
                 }
                 _ = cancellation_token.cancelled() => {
