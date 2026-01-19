@@ -12,7 +12,7 @@ batch=${2:-$_batch}
 function find_input_proof() {
   local start="$1"
   local input_file
-  input_file=$(find $DATA -maxdepth 1 -type f -name '*-*.bin' -printf '%f\n' |
+  input_file=$(find $DATA -maxdepth 1 -type f -regex '.*[0-9]+-[0-9]+\.bin$' -printf '%f\n' |
     awk -v sum="$start" -F '[-.]' '($1 + $2) == sum { print $0; exit }')
 
   if [ ! $input_file ]; then
