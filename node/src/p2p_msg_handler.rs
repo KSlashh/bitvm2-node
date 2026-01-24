@@ -63,10 +63,10 @@ impl P2pMessageHandler for BitvmNodeProcessor {
             }
             TickMessageType::RegularlyAction => {
                 tracing::debug!("Handling regular action tick message");
-                let tick_data = serde_json::to_vec(&GOATMessage {
-                    actor: actor.clone(),
-                    content: "tick".as_bytes().to_vec(),
-                })?;
+                let tick_data =
+                    GOATMessage { actor: actor.clone(), content: GOATMessageContent::Tick }
+                        .serialize_message()
+                        .await?;
 
                 handle_self_p2p_msg(
                     swarm,
@@ -93,7 +93,7 @@ impl P2pMessageHandler for BitvmNodeProcessor {
     ) -> anyhow::Result<()> {
         if topic == Actor::All.to_string() {
             let message_content = GOATMessageContent::RequestNodeInfo(get_local_node_info());
-            match send_to_peer(swarm, GOATMessage::from_typed(Actor::All, &message_content)?) {
+            match send_to_peer(swarm, GOATMessage::new(Actor::All, message_content)).await {
                 Ok(_) => {}
                 Err(e) => {
                     println!("finish_subscribe_topic: send request NodeInfo {e}");
@@ -193,7 +193,7 @@ mod tests {
         // send to actor
         let actors = get_rpc_support_actors();
         for actor in actors {
-            match send_to_peer(swarm, GOATMessage::from_typed(actor, &message_content)?) {
+            match send_to_peer(swarm, GOATMessage::new(actor, message_content.clone())).await {
                 Ok(_) => {}
                 Err(err) => warn!("{err}"),
             }
@@ -214,10 +214,10 @@ mod tests {
                 tracing::info!("recv_and_dispatch receive local message");
                 return Ok(());
             }
-            let message: GOATMessage = serde_json::from_slice(message)?;
-            let content: GOATMessageContent = message.to_typed()?;
+            let message = GOATMessage::deserialize_message(message).await?;
+            let content: &GOATMessageContent = message.content();
             if let (GOATMessageContent::RequestNodeInfo(node_info), _) = (content, actor) {
-                save_node_info(&self.local_db, &node_info).await.expect("save_node_info");
+                save_node_info(&self.local_db, node_info).await.expect("save_node_info");
             }
             Ok(())
         }
