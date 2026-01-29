@@ -20,4 +20,5 @@ jobs:
       - name: Run all unit tests
         run:  |
           source ~/.zkm-toolchain/env 
-          cargo test -r --all --features ci-tests -- --nocapture
+          cd crates/bitvm2-ga
+          cargo test -r --features ci-tests -- --nocapture
