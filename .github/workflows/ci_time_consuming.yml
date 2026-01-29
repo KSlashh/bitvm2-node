@@ -11,7 +11,7 @@ env:
 jobs:
   test:
     name: Cargo Test
-    runs-on: self-hosted
+    runs-on: [self-hosted, bitvm2-node]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
