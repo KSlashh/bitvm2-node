@@ -1,69 +1,124 @@
-name: Release
+name: Release Binaries
 
 on:
   push:
     tags:
       - v[0-9]+.*
+  workflow_dispatch:
 
 permissions:
   contents: write
+  packages: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@master
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+  build-and-release:
+    runs-on: ${{ matrix.os }}
 
-  upload-assets:
-    name: ${{ matrix.target }}
-    needs:
-      - create-release
     strategy:
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-    runs-on: ${{ matrix.os }}
+        os: [ubuntu-latest, macos-latest]
+
     steps:
-      - uses: actions/checkout@master
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode Command Line Tools
+        if: matrix.os == 'macos-latest'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Ziren toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+
       # Install Go for all platforms (required for zkm-recursion-gnark-ffi)
       - name: Install Go (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+
       - name: Install Go (macOS)
         if: matrix.os == 'macos-latest'
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      # Install protobuf-compiler for Ubuntu
-      - name: Install protobuf-compiler (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Extract version from tag
+        id: version
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-      # Install protobuf-compiler for macOS
-      - name: Install protobuf-compiler (macOS)
-        if: matrix.os == 'macos-latest'
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version: $VERSION"
+
+      - name: Build all binaries in release mode
         run: |
-          brew install protobuf
-          # Install Rust nightly toolchain
-      - uses: actions-rs/toolchain@v1
+          source ~/.zkm-toolchain/env
+          cargo build -r --workspace
+
+      - name: Create release artifacts directory
+        run: mkdir -p release-artifacts
+
+      - name: Collect binaries
+        run: |
+          BINS=(
+            "target/release/noded"
+            "target/release/sequencer-set-publish"
+            "target/release/send-challenge"
+            "target/release/send-rbf"
+            "target/release/send-pegin-request"
+            "target/release/send-pegout"
+            "target/release/db-inject"
+          )
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            PLATFORM="x86_64-linux"
+            CHECKSUM_CMD="sha256sum"
+          else
+            PLATFORM="x86_64-macos"
+            CHECKSUM_CMD="shasum -a 256"
+          fi
+
+          for bin in "${BINS[@]}"; do
+            if [ -f "$bin" ]; then
+              BASENAME=$(basename "$bin")
+              ARCHIVE="release-artifacts/${BASENAME}-${VERSION}-${PLATFORM}"
+              cp "$bin" "$ARCHIVE"
+              chmod +x "$ARCHIVE"
+              $CHECKSUM_CMD "$ARCHIVE" > "${ARCHIVE}.sha256"
+              echo "✓ $BASENAME"
+            fi
+          done
+
+          echo "Artifacts created:"
+          ls -lh release-artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
         with:
-          toolchain: nightly
-          override: true
-      - uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          # (required)
-          bin: bitvm2-noded
-          archive: $bin-$target
-          target: ${{ matrix.target }}
-          tar: all
+          files: release-artifacts/*
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
         env:
-          # (required)
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_PROFILE_RELEASE_LTO: true
+
+      - name: Upload to Releases summary
+        run: |
+          echo "## Released Binaries (${{ runner.os }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Version: $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          ls -1 release-artifacts/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
