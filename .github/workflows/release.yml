@@ -31,6 +31,13 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Fix macOS SDK for cgo
+        if: runner.os == 'macOS'
+        run: |
+          SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+          echo "SDKROOT=$SDKROOT" >> $GITHUB_ENV
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV        
+
       - name: Install Ziren toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf \
@@ -67,13 +74,13 @@ jobs:
       - name: Collect binaries
         run: |
           BINS=(
-            "../target/release/noded"
-            "../target/release/sequencer-set-publish"
-            "../target/release/send-challenge"
-            "../target/release/send-rbf"
-            "../target/release/send-pegin-request"
-            "../target/release/send-pegout"
-            "../target/release/db-inject"
+            "target/release/bitvm2-noded"
+            "target/release/sequencer-set-publish"
+            "target/release/challenge"
+            "target/release/send-rbf"
+            "target/release/pegin-request"
+            "target/release/pegout"
+            "target/release/update-db"
           )
 
           if [ "${{ runner.os }}" = "Linux" ]; then
@@ -87,18 +94,23 @@ jobs:
             CHECKSUM_CMD="shasum -a 256"
           fi
 
+          STAGING_DIR="release-staging"
+          mkdir -p "$STAGING_DIR"
+
           for bin in "${BINS[@]}"; do
             if [ -f "$bin" ]; then
               BASENAME=$(basename "$bin")
-              ARCHIVE="release-artifacts/${BASENAME}-${VERSION}-${PLATFORM}"
-              cp "$bin" "$ARCHIVE"
-              chmod +x "$ARCHIVE"
-              $CHECKSUM_CMD "$ARCHIVE" > "${ARCHIVE}.sha256"
+              cp "$bin" "$STAGING_DIR/"
+              chmod +x "$STAGING_DIR/$BASENAME"
               echo "✓ $BASENAME"
             fi
           done
 
-          echo "Artifacts created:"
+          ARCHIVE_NAME="bitvm2-node-${VERSION}-${PLATFORM}.tar.gz"
+          tar -czf "release-artifacts/${ARCHIVE_NAME}" -C "$STAGING_DIR" .
+          $CHECKSUM_CMD "release-artifacts/${ARCHIVE_NAME}" > "release-artifacts/${ARCHIVE_NAME}.sha256"
+
+          echo "Archive created:"
           ls -lh release-artifacts/
 
       - name: Create GitHub Release
@@ -116,4 +128,5 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Version: $VERSION" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Archive:" >> $GITHUB_STEP_SUMMARY
           ls -1 release-artifacts/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY

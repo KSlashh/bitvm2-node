@@ -1,12 +1,8 @@
 # Container image that runs your code
 FROM ubuntu:latest
 
-# Copies your code file from your action repository to the filesystem path `/` of the container
-COPY target/release/sequencer-set-publish /usr/local/bin
-COPY target/release/pegin-request /usr/local/bin
-COPY target/release/send-rbf /usr/local/bin
-COPY target/release/challenge /usr/local/bin
-
+# Copy binaries into the container
+COPY target/release/* /usr/local/bin/
 COPY node/entrypoint.sh /entrypoint.sh
 
 RUN apt update && apt install sqlite3 ca-certificates -y && update-ca-certificates
