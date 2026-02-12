@@ -2,8 +2,8 @@
 use base64::Engine;
 use bitvm2_lib::actors::Actor;
 use bitvm2_noded::env::{
-    self, ENV_PEER_KEY, check_node_info, get_btc_url_from_env, get_goat_network, get_network,
-    get_node_pubkey, goat_config_from_env,
+    self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, check_node_info, get_btc_url_from_env,
+    get_goat_network, get_network, get_node_pubkey, goat_config_from_env,
 };
 use clap::{Parser, Subcommand};
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -16,7 +16,9 @@ use tracing_subscriber::EnvFilter;
 use bitvm2_noded::utils::{
     self, generate_local_key, save_local_info, set_node_external_socket_addr_env,
 };
-use bitvm2_noded::{rpc_service, run_maintenance_tasks, run_watch_event_task};
+use bitvm2_noded::{
+    rpc_service, run_maintenance_tasks, run_sequencer_set_hash_monitor_task, run_watch_event_task,
+};
 
 use anyhow::Result;
 use bitvm2_noded::middleware::swarm::{Bitvm2SwarmConfig, BitvmNetworkManager};
@@ -118,6 +120,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+
+    let is_publisher = actor == Actor::Publisher || actor == Actor::All;
+    let sequencer_set_monitor_start_cosmos_block =
+        env::get_sequencer_set_monitor_start_cosmos_block_from_env();
+    if is_publisher && sequencer_set_monitor_start_cosmos_block.is_none() {
+        return Err(anyhow::anyhow!(
+            "sequencer_set_monitor_start_cosmos_block is required when sequencer set monitor is enabled"
+        )
+        .into());
+    }
     let mut metric_registry = Registry::default();
 
     // Create cancellation token for graceful shutdown
@@ -156,6 +168,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_db_clone1 = local_db.clone();
     let local_db_clone2 = local_db.clone();
     let local_db_clone3 = local_db.clone();
+    let local_db_clone4 = local_db.clone();
     let opt_rpc_addr = opt.rpc_addr.clone();
     let peer_id_string_clone = peer_id_string.clone();
     let metric_registry_clone = Arc::new(Mutex::new(metric_registry));
@@ -211,6 +224,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }));
+
+    if is_publisher {
+        let start_cosmos_block = sequencer_set_monitor_start_cosmos_block.unwrap();
+        let cosmos_rpc_url = env::get_cosmos_rpc_url_from_env();
+        let cancel_token_clone = cancellation_token.clone();
+        task_handles.push(tokio::spawn(async move {
+            let goat_client =
+                Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
+            match run_sequencer_set_hash_monitor_task(
+                local_db_clone4,
+                goat_client,
+                cosmos_rpc_url,
+                start_cosmos_block,
+                SEQUENCER_SET_MONITOR_INTERVAL_SECS,
+                cancel_token_clone,
+            )
+            .await
+            {
+                Ok(tag) => Ok(tag),
+                Err(e) => {
+                    tracing::error!("Sequencer set monitor task error: {}", e);
+                    Err("sequencer_set_monitor_error".to_string())
+                }
+            }
+        }));
+    }
     // }
 
     let cancel_token_clone = cancellation_token.clone();
