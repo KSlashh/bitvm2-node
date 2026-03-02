@@ -6,7 +6,7 @@ mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
 
 use crate::action::GOATMessageContent;
-use crate::env::{is_enable_update_spv_contract, is_relayer};
+use crate::env::{get_maintenance_run_timeout_secs, is_enable_update_spv_contract, is_relayer};
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     detect_init_withdraw_call, detect_kickoff, detect_take1_or_challenge, process_graph_challenge,
 };
@@ -22,11 +22,11 @@ use client::goat_chain::GOATClient;
 pub use event_watch_task::{is_processing_gateway_history_events, run_watch_event_task};
 pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use store::localdb::{LocalDB, StorageProcessor};
 use store::{Graph, MessageType};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 async fn fetch_on_turn_graph_by_status<'a>(
     storage_processor: &mut StorageProcessor<'a>,
@@ -116,19 +116,34 @@ pub async fn run_maintenance_tasks(
     interval: u64,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
+    let mut tick: u64 = 0;
+    let maintenance_run_timeout = Duration::from_secs(get_maintenance_run_timeout_secs());
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+                tick += 1;
+                let tick_start = Instant::now();
+                info!(tick, interval_secs = interval, "maintenance task tick start");
                 // Execute the normal monitoring logic
-                match run(actor.clone(),&local_db,btc_client.clone(),goat_client.clone()).await
-                {
-                    Ok(_) => {}
-                    Err(err) => {error!("run_scheduled_tasks, err {:?}", err)}
+                match tokio::time::timeout(
+                    maintenance_run_timeout,
+                    run(actor.clone(),&local_db,btc_client.clone(),goat_client.clone()),
+                ).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {error!("run_scheduled_tasks, err {:?}", err)}
+                    Err(_) => {
+                        error!(
+                            tick,
+                            timeout_secs = maintenance_run_timeout.as_secs(),
+                            "maintenance run timeout"
+                        )
+                    }
                 }
+                info!(tick, elapsed_ms = tick_start.elapsed().as_millis() as u64, "maintenance task tick end");
             }
             _ = cancellation_token.cancelled() => {
-                tracing::info!("Watch event task received shutdown signal");
-                return Ok("watch_shutdown".to_string());
+                tracing::info!("maintenance task received shutdown signal");
+                return Ok("maintenance_shutdown".to_string());
             }
         }
     }
