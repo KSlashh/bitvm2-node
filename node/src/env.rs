@@ -62,6 +62,7 @@ pub const ENV_ACTOR: &str = "ACTOR";
 pub const ENV_IPFS_ENDPOINT: &str = "IPFS_ENDPOINT";
 pub const ENV_COMMITTEE_NUM: &str = "COMMITTEE_NUM";
 pub const ENV_EXTERNAL_SOCKET_ADDR: &str = "EXTERNAL_SOCKET_ADDR";
+pub const COMMITTEE_INSTANCE_KEYS_DIR: &str = "cache/committee-instance-keys/";
 pub const SCRIPT_CACHE_FILE_NAME: &str = "cache/partial_script.bin";
 pub const ASSERT_COMMITS_CACHE_DIR: &str = "cache/assert_commits_cache/";
 pub const IPFS_GRAPH_CACHE_DIR: &str = "cache/graph_cache/";
@@ -134,6 +135,11 @@ pub const ENV_INSTANCE_MAINTENANCE_BATCH_SIZE: &str = "INSTANCE_MAINTENANCE_BATC
 pub const DEFAULT_INSTANCE_MAINTENANCE_BATCH_SIZE: u32 = 50;
 pub const ENV_MAINTENANCE_RUN_TIMEOUT_SECS: &str = "MAINTENANCE_RUN_TIMEOUT_SECS";
 pub const DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS: u64 = 60;
+pub const ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: &str = "ENABLE_COMMITTEE_INSTANCE_KEY_DELETE";
+pub const DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: bool = false;
+pub const ENV_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: &str =
+    "COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS";
+pub const DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: i64 = 32;
 
 pub fn get_network() -> Network {
     let network = std::env::var(ENV_BITCOIN_NETWORK).unwrap_or("testnet4".to_string());
@@ -565,6 +571,26 @@ pub fn get_maintenance_run_timeout_secs() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .map(|timeout| timeout.clamp(1, 300))
         .unwrap_or(DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS)
+}
+
+pub fn is_enable_committee_instance_key_delete() -> bool {
+    // TODO: enable this feature when ready
+    tracing::warn!(
+        "Committee key delete not activated, ignore ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE"
+    );
+    false
+    // std::env::var(ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
+    //     .ok()
+    //     .map(|value| value.eq_ignore_ascii_case("true"))
+    //     .unwrap_or(DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
+}
+
+pub fn get_committee_instance_key_delete_timelock_blocks() -> i64 {
+    std::env::var(ENV_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|v| v.clamp(1, 200_000))
+        .unwrap_or(DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS)
 }
 
 pub fn should_always_challenge() -> bool {

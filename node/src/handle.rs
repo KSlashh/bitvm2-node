@@ -1,10 +1,12 @@
 use crate::action::*;
-use crate::env::{get_bitvm_key, get_network, get_node_goat_address, is_relayer};
+use crate::env::{
+    COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_network, get_node_goat_address, is_relayer,
+};
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::utils::*;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::hashes::Hash;
 use bitcoin::{OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
@@ -37,6 +39,79 @@ pub struct HandlerContext<'a> {
     pub from_peer_id: PeerId,
     pub id: MessageId,
     pub is_self_peer: bool,
+}
+
+fn committee_instance_keys_envelope_path(instance_id: Uuid) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
+    path.push(format!("{instance_id}.json"));
+    path
+}
+
+fn is_io_not_found_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn load_committee_instance_keypair(
+    committee_master_key: &CommitteeMasterKey,
+    instance_id: Uuid,
+) -> Result<bitcoin::key::Keypair> {
+    let envelope_path = committee_instance_keys_envelope_path(instance_id);
+    committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(|| {
+        format!(
+            "load committee instance keypair failed for {} at {}",
+            instance_id,
+            envelope_path.display()
+        )
+    })
+}
+
+fn load_or_create_committee_instance_keypair(
+    committee_master_key: &CommitteeMasterKey,
+    instance_id: Uuid,
+) -> Result<bitcoin::key::Keypair> {
+    let envelope_path = committee_instance_keys_envelope_path(instance_id);
+    match committee_master_key.load_instance_keypair(instance_id, &envelope_path) {
+        Ok(keypair) => Ok(keypair),
+        Err(load_err) => {
+            if !is_io_not_found_error(&load_err) {
+                return Err(load_err).with_context(|| {
+                    format!(
+                        "load committee instance keypair failed for {} at {} (refuse auto-overwrite for non-missing envelope)",
+                        instance_id,
+                        envelope_path.display()
+                    )
+                });
+            }
+            tracing::info!(
+                "committee instance key not found for {} at {}: {}, creating new envelope",
+                instance_id,
+                envelope_path.display(),
+                load_err
+            );
+            committee_master_key
+                .create_instance_keypair_envelope(instance_id, &envelope_path)
+                .with_context(|| {
+                    format!(
+                        "create committee instance key envelope failed for {} at {}",
+                        instance_id,
+                        envelope_path.display()
+                    )
+                })?;
+            committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(
+                || {
+                    format!(
+                        "reload committee instance key envelope failed for {} at {}",
+                        instance_id,
+                        envelope_path.display()
+                    )
+                },
+            )
+        }
+    }
 }
 
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
@@ -709,10 +784,10 @@ async fn handle_pegin_request_committee(
     )
     .await?;
     // 3. call Gateway.answerPeginRequest
-    let pubkey_for_instance = CommitteeMasterKey::new(get_bitvm_key()?)
-        .keypair_for_instance(instance_id)
-        .public_key()
-        .into();
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    let instance_keypair =
+        load_or_create_committee_instance_keypair(&committee_master_key, instance_id)?;
+    let pubkey_for_instance = instance_keypair.public_key().into();
     ctx.goat_client.gateway_answer_pegin_request(&instance_id, &pubkey_for_instance).await?;
     Ok(())
 }
@@ -887,14 +962,15 @@ async fn handle_create_graph_committee(
     store_graph(ctx.local_db, graph).await?;
     // 3. generate Musig2 nonces & broadcast NonceGeneration
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-    let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph(
+    let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+    let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph_with_keypair(
         instance_id,
         graph_id,
         graph.parameters.watchtower_pubkeys.len(),
         graph.assert_commit_num,
+        instance_keypair,
     );
-    let local_committee_pubkey =
-        committee_master_key.keypair_for_instance(instance_id).public_key().into();
+    let local_committee_pubkey = instance_keypair.public_key().into();
     let message_content = GOATMessageContent::NonceGeneration(NonceGeneration {
         instance_id,
         graph_id,
@@ -931,18 +1007,16 @@ async fn handle_create_graph_committee(
         }
         let agg_nonces = nonces_aggregation(&pub_nonces)?;
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph(
+        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_with_keypair(
             instance_id,
             graph_id,
             watchtower_num,
             assert_commit_num,
+            instance_keypair,
         );
-        let committee_partial_sigs = committee_pre_sign(
-            committee_master_key.keypair_for_instance(instance_id),
-            sec_nonces,
-            agg_nonces.clone(),
-            &mut graph,
-        )?;
+        let committee_partial_sigs =
+            committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut graph)?;
         let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
             instance_id,
             graph_id,
@@ -1010,10 +1084,9 @@ async fn handle_nonce_generation_committee(
     let pub_nonces_unchecked =
         get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
     if pub_nonces_unchecked.len() == committee_pubkeys.len() {
-        let local_committee_pubkey = CommitteeMasterKey::new(get_bitvm_key()?)
-            .keypair_for_instance(instance_id)
-            .public_key()
-            .into();
+        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+        let local_committee_pubkey = instance_keypair.public_key().into();
         let message = make_message(ctx, content);
         let graph = match get_graph_or_defer(
             ctx.swarm,
@@ -1040,20 +1113,16 @@ async fn handle_nonce_generation_committee(
             pub_nonces.push(pn);
         }
         let agg_nonces = nonces_aggregation(&pub_nonces)?;
-        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph(
+        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_with_keypair(
             instance_id,
             graph_id,
             watchtower_num,
             assert_commit_num,
+            instance_keypair,
         );
         // 4. if received enough valid committee partial sigs, endorse the graph
-        let committee_partial_sigs = committee_pre_sign(
-            committee_master_key.keypair_for_instance(instance_id),
-            sec_nonces,
-            agg_nonces.clone(),
-            &mut graph,
-        )?;
+        let committee_partial_sigs =
+            committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut graph)?;
         let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
             instance_id,
             graph_id,
@@ -1234,10 +1303,9 @@ async fn handle_committee_presign_committee(
         };
         let graph = Bitvm2Graph::from_simplified(&graph)?;
         let committee_sig_for_graph = endorse_graph(ctx.goat_client, &graph).await?;
-        let local_committee_pubkey = CommitteeMasterKey::new(get_bitvm_key()?)
-            .keypair_for_instance(instance_id)
-            .public_key()
-            .into();
+        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+        let local_committee_pubkey = instance_keypair.public_key().into();
         let committee_evm_address = get_node_goat_address()
             .ok_or_else(|| anyhow::anyhow!("failed to get node goat address".to_string()))?;
         let message_content = GOATMessageContent::EndorseGraph(EndorseGraph {
@@ -1404,8 +1472,8 @@ async fn handle_graph_finalize_committee(
         >= todo_funcs::min_required_operator()
     {
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let local_committee_pubkey =
-            committee_master_key.keypair_for_instance(instance_id).public_key().into();
+        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+        let local_committee_pubkey = instance_keypair.public_key().into();
         let stored_pub_nonce = get_committee_pub_nonce_for_instance(
             ctx.local_db,
             instance_id,
@@ -1413,7 +1481,8 @@ async fn handle_graph_finalize_committee(
         )
         .await?;
         if stored_pub_nonce.is_none() {
-            let (_, pub_nonce, nonce_sig) = committee_master_key.nonce_for_instance(instance_id);
+            let (_, pub_nonce, nonce_sig) =
+                committee_master_key.nonce_for_instance_with_keypair(instance_id, instance_keypair);
             let message_content = GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
                 instance_id,
                 committee_pubkey: local_committee_pubkey,
@@ -1523,17 +1592,17 @@ async fn handle_pegin_confirm_nonce_committee(
     let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
     if pub_nonces.len() == committee_pubkeys.len() {
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let local_committee_pubkey =
-            committee_master_key.keypair_for_instance(instance_id).public_key().into();
-        let (sec_nonce, _, _) = committee_master_key.nonce_for_instance(instance_id);
+        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+        let local_committee_pubkey = instance_keypair.public_key().into();
+        let (sec_nonce, _, _) =
+            committee_master_key.nonce_for_instance_with_keypair(instance_id, instance_keypair);
         let agg_nonce =
             nonce_aggregation(&pub_nonces.iter().map(|(_, pn)| pn.clone()).collect::<Vec<_>>());
         let instance_params = get_instance_parameters(ctx.local_db, instance_id)
             .await?
             .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
         let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
-        let context = instance_params
-            .get_verifier_context(committee_master_key.keypair_for_instance(instance_id))?;
+        let context = instance_params.get_verifier_context(instance_keypair)?;
         let partial_sig = pegin_confirm
             .sign_input_0_musig2(&context, &sec_nonce, &agg_nonce)
             .map_err(|e| anyhow!("Failed to sign pegin confirm for {instance_id}: {e}"))?;
@@ -3183,14 +3252,58 @@ async fn handle_disprove_ready_challenger(
             Some(*disprover_evm_address.as_ref()),
         )?;
         let challenger_master_key = ChallengerMasterKey::new(get_bitvm_key()?);
-        let challenger_master_keypair = challenger_master_key.master_keypair();
-        build_sign_and_broadcast_non_standard_tx(
+        let challenger_disprove_keypair = challenger_master_key.keypair_for_nst_disprove();
+        if let Err(e) = build_sign_and_broadcast_non_standard_tx(
             ctx.btc_client,
-            challenger_master_keypair,
-            disprove_tx,
+            challenger_disprove_keypair,
+            disprove_tx.clone(),
             connector_e_input.amount,
         )
-        .await?;
+        .await
+        {
+            if e.downcast_ref::<SpecialError>()
+                .is_some_and(|se| matches!(se, SpecialError::InsufficientBalance(_)))
+            {
+                let disprove_address = node_p2wsh_address(
+                    get_network(),
+                    &challenger_disprove_keypair.public_key().into(),
+                );
+                let disprove_balance = ctx
+                    .btc_client
+                    .get_address_utxo(disprove_address.clone())
+                    .await?
+                    .iter()
+                    .map(|u| u.value)
+                    .sum::<bitcoin::Amount>();
+                let fee_rate = get_fee_rate(ctx.btc_client).await?;
+                let est_fee_sat =
+                    ((disprove_tx.weight().to_vbytes_ceil() + 200) as f64 * fee_rate).ceil() as u64;
+                let target_balance_sat = est_fee_sat + 20_000;
+                let shortfall_sat = target_balance_sat.saturating_sub(disprove_balance.to_sat());
+                if shortfall_sat > 0 {
+                    tracing::info!(
+                        "Top up nst-disprove p2wsh address for {instance_id}:{graph_id}: shortfall={} sats",
+                        shortfall_sat
+                    );
+                    fund_address(
+                        ctx.btc_client,
+                        challenger_master_key.master_keypair(),
+                        disprove_address,
+                        bitcoin::Amount::from_sat(shortfall_sat),
+                    )
+                    .await?;
+                }
+                build_sign_and_broadcast_non_standard_tx(
+                    ctx.btc_client,
+                    challenger_disprove_keypair,
+                    disprove_tx,
+                    connector_e_input.amount,
+                )
+                .await?;
+            } else {
+                return Err(e);
+            }
+        }
     } else {
         tracing::info!("All assertions valid for {instance_id}:{graph_id}, no need to disprove");
         return Ok(());

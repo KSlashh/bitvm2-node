@@ -1,3 +1,4 @@
+use crate::keys::hkdf_derive_bytes;
 use crate::types::{
     Bitvm2Graph, Bitvm2GraphParameters, Groth16Proof, OperatorWotsPublicKeys,
     OperatorWotsSecretKeys, OperatorWotsSignatures, PublicInputs, VerifyingKey,
@@ -50,7 +51,9 @@ use goat::transactions::watchtower_challenge::{
     WatchtowerChallengeTimeoutTransaction, operator_ack, operator_commit_blockhash,
 };
 use goat::utils::num_blocks_per_network;
-use sha2::{Digest, Sha256};
+use hex::encode as hex_encode;
+
+const OPERATOR_WOTS_HKDF_SALT: &[u8] = b"bitvm2/operator-wots/v1";
 
 pub fn generate_wots_keys(seed: &str) -> (OperatorWotsSecretKeys, OperatorWotsPublicKeys) {
     let secrets = wots_seed_to_secrets(seed);
@@ -101,30 +104,27 @@ pub fn wots_secrets_to_pubkeys(secrets: &OperatorWotsSecretKeys) -> OperatorWots
 
 #[allow(deprecated)]
 pub fn wots_seed_to_secrets(seed: &str) -> OperatorWotsSecretKeys {
-    fn sha256(input: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(input);
-        format!("{:x}", hasher.finalize())
-    }
-    fn sha256_with_id(input: &str, idx: usize) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(input);
-        sha256(&format!("{:x}{:04x}", hasher.finalize(), idx))
-    }
-
-    let seed_hash = sha256(seed);
+    let seed_bytes = seed.as_bytes();
     let wot32_seckeys = (0..NUM_GUEST + NUM_PUBS + NUM_U256)
         .map(|idx| {
-            let sec_i = sha256_with_id(&seed_hash, 1);
-            let sec_i = sha256_with_id(&sec_i, idx);
+            let sec_i = hex_encode(hkdf_derive_bytes(
+                seed_bytes,
+                OPERATOR_WOTS_HKDF_SALT,
+                format!("wots32/{idx}").as_bytes(),
+                32,
+            ));
             let sec_str = format!("{sec_i}{:04x}{:04x}", 1, idx);
             Wots32::secret_from_str(&sec_str)
         })
         .collect::<Vec<WinternitzSecret>>();
     let wot16_seckeys = (0..NUM_HASH)
         .map(|idx| {
-            let sec_i = sha256_with_id(&seed_hash, 2);
-            let sec_i = sha256_with_id(&sec_i, idx);
+            let sec_i = hex_encode(hkdf_derive_bytes(
+                seed_bytes,
+                OPERATOR_WOTS_HKDF_SALT,
+                format!("wots16/{idx}").as_bytes(),
+                32,
+            ));
             let sec_str = format!("{sec_i}{:04x}{:04x}", 0, idx);
             Wots16::secret_from_str(&sec_str)
         })
@@ -169,20 +169,21 @@ pub fn corrupt_proof(
     let mut scramble2: [u8; HASH_LEN] = [1u8; HASH_LEN];
     scramble2[HASH_LEN / 2] = 37;
     println!("corrupted assertion at index {index}");
+    let sec_index = index + NUM_GUEST;
     if index < NUM_PUBS {
         let i = index;
         let assn = scramble;
-        let sig = Wots32::sign(&wots_sec[index], &assn);
+        let sig = Wots32::sign(&wots_sec[sec_index], &assn);
         sigs.1.0[i] = sig;
     } else if index < NUM_PUBS + NUM_U256 {
         let i = index - NUM_PUBS;
         let assn = scramble;
-        let sig = Wots32::sign(&wots_sec[index], &assn);
+        let sig = Wots32::sign(&wots_sec[sec_index], &assn);
         sigs.1.1[i] = sig;
     } else if index < NUM_PUBS + NUM_U256 + NUM_HASH {
         let i = index - NUM_PUBS - NUM_U256;
         let assn = scramble2;
-        let sig = Wots16::sign(&wots_sec[index], &assn);
+        let sig = Wots16::sign(&wots_sec[sec_index], &assn);
         sigs.1.2[i] = sig;
     }
 }
