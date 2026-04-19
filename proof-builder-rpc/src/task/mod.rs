@@ -14,7 +14,6 @@ use ::header_chain_proof::HeaderChainProofBuilder;
 use ::state_chain_proof::StateChainProofBuilder;
 use bitcoin::{BlockHash, Network, Txid};
 use client::btc_chain::BTCClient;
-use commit_chain::CircuitCommit;
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
@@ -276,7 +275,7 @@ async fn read_watchtower_challenge_details<'a>(
         if let Some(first) = challenge_init_txids.first() {
             if !challenge_init_txids.iter().all(|x| first == x) {
                 anyhow::bail!(
-                    "Inconsistant watchtower challenge info from instance {} and graph_id {}",
+                    "Inconsistent watchtower challenge info from instance {} and graph_id {}",
                     task.instance_id,
                     task.graph_id
                 );
@@ -477,17 +476,22 @@ pub(crate) async fn fetch_on_demand_task(
     };
     tracing::info!("commit_chain_input_proof: {commit_chain_input_proof:?}");
     let commit_chain_input_proof = commit_chain_input_proof.path_to_proof.unwrap();
-    let file = format!("{commit_chain_input_proof}.commits");
-    let content = match std::fs::read_to_string(&file) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("read {file:?} error, {e}");
+    let commits_file = format!("{commit_chain_input_proof}.commits");
+    let commits: Vec<commit_chain::CircuitCommit> =
+        match serde_json::from_str(&std::fs::read_to_string(&commits_file)?) {
+            Ok(commits) => commits,
+            Err(err) => {
+                tracing::warn!("Failed to read commit-chain commits, error: {err}");
+                return Ok(None);
+            }
+        };
+    let latest_sequencer_commit_txid = match commits.first() {
+        Some(commit) => commit.commit_txn.compute_txid().to_string(),
+        None => {
+            tracing::warn!("Commit-chain proof does not contain any commits yet");
             return Ok(None);
         }
     };
-    let commits: Vec<CircuitCommit> = serde_json::from_str(&content)?;
-    let latest_sequencer_commit_txid = commits[0].commit_txn.compute_txid().to_string();
-
     Ok(Some(OnDemandTask {
         task_index,
         latest_sequencer_commit_txid,

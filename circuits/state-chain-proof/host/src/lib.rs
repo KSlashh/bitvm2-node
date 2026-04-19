@@ -32,6 +32,7 @@ const STATE_CHAIN: &[u8] = include_elf!("guest");
 use std::fs;
 
 use clap::Parser;
+
 /// The arguments for the cli.
 #[derive(Debug, Clone, Parser, serde::Deserialize, serde::Serialize)]
 pub struct Args {
@@ -317,29 +318,48 @@ impl ProofBuilder for StateChainProofBuilder {
             Some(public_inputs)
         };
 
-        let (prev_proof, zkm_proof, zkm_public_values, zkm_vk_hash) = match prev_receipt.clone() {
-            Some(public_inputs) => {
-                let proof_bytes =
-                    fs::read(input_proof).context("Failed to read input proof file")?;
-                let zkm_vk_hash =
-                    fs::read(&format!("{}.vk_hash.bin", input_proof)).context("Read vk_hash")?;
-                let prev_output: StateChainCircuitOutput =
-                    zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
-                (
-                    StateChainPrevProofType::PrevProof(prev_output),
-                    proof_bytes,
-                    public_inputs,
-                    zkm_vk_hash.to_vec(),
-                )
-            }
-            None => (StateChainPrevProofType::GenesisBlock, Vec::new(), Vec::new(), Vec::new()),
-        };
+        let (prev_proof, zkm_proof, zkm_public_values, zkm_vk_hash, zkm_version) =
+            match prev_receipt.clone() {
+                Some(public_inputs) => {
+                    let proof_bytes =
+                        fs::read(input_proof).context("Failed to read input proof file")?;
+                    let zkm_vk_hash = fs::read(&format!("{}.vk_hash.bin", input_proof))
+                        .context("Read vk_hash")?;
+                    let version_path = format!("{input_proof}.zkm_version.bin");
+                    let zkm_version = fs::read(&version_path)
+                        .with_context(|| {
+                            format!("failed to read zkm_version file '{version_path}'")
+                        })
+                        .and_then(|raw_zkm_version| {
+                            String::from_utf8(raw_zkm_version).with_context(|| {
+                                format!("invalid UTF-8 in zkm_version file '{version_path}'")
+                            })
+                        })?;
+                    let prev_output: StateChainCircuitOutput =
+                        zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
+                    (
+                        StateChainPrevProofType::PrevProof(prev_output),
+                        proof_bytes,
+                        public_inputs,
+                        zkm_vk_hash.to_vec(),
+                        zkm_version,
+                    )
+                }
+                None => (
+                    StateChainPrevProofType::GenesisBlock,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    "v1.2.5".into(),
+                ),
+            };
 
         let input: StateChainCircuitInput = StateChainCircuitInput {
             prev_proof,
             zkm_proof,
             zkm_public_values,
             zkm_vk_hash,
+            zkm_version,
             blocks: blocks.clone(),
         };
         // Generate the proofs.
@@ -390,11 +410,13 @@ impl ProofBuilder for StateChainProofBuilder {
         std::fs::write(&format!("{}", output_proof), proof.bytes())?;
         let public_value_hex = hex::encode(proof.public_values.to_vec());
         let proof_size = proof.bytes().len();
+        let zkm_version = proof.zkm_version.clone();
         std::fs::write(
             &format!("{}.public_inputs.bin", output_proof),
             proof.public_values.to_vec(),
         )?;
         std::fs::write(&format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;
+        std::fs::write(&format!("{}.zkm_version.bin", output_proof), zkm_version)?;
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))

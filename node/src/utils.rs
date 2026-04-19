@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::net::SocketAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -70,8 +71,8 @@ use store::{
     PeginInstanceProcessData, SerializableTxid, UInt64Array3,
 };
 use stun_client::{Attribute, Class, Client};
-use zkm_sdk::{ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues};
-use zkm_verifier::{GROTH16_VK_BYTES, convert_ark};
+use zkm_sdk::ZKMProofWithPublicValues;
+use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_vk};
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
@@ -1614,15 +1615,15 @@ pub async fn is_take2_timelock_expired(
 
 /// Loads partial scripts from a local cache file.
 /// If cache file does not exist, generate partial scripts by vk an cache it
-pub async fn get_partial_scripts(version: String) -> Result<Vec<ScriptBuf>> {
-    let scripts_cache_path = format!("{SCRIPT_CACHE_FILE_NAME}_{version}.bin");
+pub async fn get_partial_scripts() -> Result<Vec<ScriptBuf>> {
+    let scripts_cache_path = format!("{SCRIPT_CACHE_FILE_NAME}.bin");
     if Path::new(&scripts_cache_path).exists() {
         let file = File::open(scripts_cache_path)?;
         let reader = BufReader::new(file);
         let scripts_bytes: Vec<ScriptBuf> = bincode::deserialize_from(reader)?;
         Ok(scripts_bytes)
     } else {
-        let partial_scripts = generate_partial_scripts(&get_vk(&version).await?);
+        let partial_scripts = generate_partial_scripts(&get_vk().await?);
         if let Some(parent) = Path::new(&scripts_cache_path).parent() {
             fs::create_dir_all(parent)?;
         };
@@ -1634,7 +1635,7 @@ pub async fn get_partial_scripts(version: String) -> Result<Vec<ScriptBuf>> {
 }
 
 pub async fn get_disprove_scripts(graph_params: &Bitvm2GraphParameters) -> Result<Vec<ScriptBuf>> {
-    let partial_scripts = get_partial_scripts(graph_params.zkm_version.clone()).await?;
+    let partial_scripts = get_partial_scripts().await?;
     let (mut disprove_scripts, disprove_scripts_1) = generate_disprove_scripts(
         &partial_scripts,
         graph_params.operator_wots_pubkeys.clone(),
@@ -1751,17 +1752,27 @@ pub async fn broadcast_package(
 
 fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Vec<u8>> {
     let graph_id = graph_id.as_bytes();
-    let proof =
-        proof_data.proof.as_slice().try_into().map_err(|_| anyhow!("invalid proof length"))?;
-    let public_inputs = proof_data
-        .public_inputs
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid public inputs length"))?;
+    let proof = proof_data.proof.as_slice();
     if proof_data.vk.len() != VK_HASH_SIZE {
         bail!("invalid vk_hash length");
     }
-    Ok(build_watchtower_commitment(graph_id, proof, public_inputs, &proof_data.vk))
+    if proof_data.proof_part_stark_vk.is_empty() {
+        bail!("missing proof_part_stark_vk");
+    }
+
+    build_watchtower_commitment(
+        graph_id,
+        proof,
+        &proof_data.public_inputs,
+        &proof_data.vk,
+        &proof_data.proof_part_stark_vk,
+    )
+    .map_err(|e| anyhow!("failed to build watchtower commitment: {e}"))
+}
+
+fn load_part_stark_vk_for_zkm_version(zkm_version: &str) -> Result<Vec<u8>> {
+    catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version).to_vec()))
+        .map_err(|_| anyhow!("failed to load part_stark_vk for zkm_version {zkm_version}"))
 }
 
 // proof network
@@ -1932,28 +1943,24 @@ pub async fn get_operator_proof(
                 info!("get_operator_proof get proof successfully");
                 let proof: ZKMProofWithPublicValues =
                     bincode::deserialize(proof_data.proof.as_slice()).unwrap();
-                if proof.zkm_version != bitvm_graph.parameters.zkm_version {
-                    bail!(
-                        "zkm_version mismatch, expected {}, got {}",
-                        bitvm_graph.parameters.zkm_version,
-                        proof.zkm_version
-                    );
-                }
-                let (_best_btc_block_hash, constant, included_watchtower): (
-                    [u8; 32],
-                    [u8; 32],
-                    [u8; 32],
-                ) = proof.public_values.clone().read();
+                let proof_part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
+                let output: bitcoin_light_client_circuit::OperatorPublicOutputs =
+                    proof.public_values.clone().read();
                 // TODO: additionally check constant and included_watchtower with included_watchtowers.
                 //proof.public_values.head();
                 info!("get_operator_proof parse proof successfully");
-                let groth16_vk = &GROTH16_VK_BYTES;
-                let ark_proof = convert_ark(&proof, &proof_data.vk, groth16_vk).unwrap();
+                let ark_proof = convert_ark_imm_wrap_vk(
+                    &proof,
+                    &proof_data.vk,
+                    &IMM_GROTH16_VK_BYTES,
+                    &proof_part_stark_vk,
+                )
+                .map_err(|e| anyhow!("failed to convert operator proof to ark format: {e}"))?;
                 info!("get_operator_proof parse proof successfully");
 
                 Ok((
                     Some((
-                        [constant, included_watchtower],
+                        [output.constant, output.included_watchtowers],
                         ark_proof.proof.clone(),
                         ark_proof.public_inputs.into(),
                         ark_proof.groth16_vk.into(),
@@ -2692,7 +2699,6 @@ pub async fn build_graph_params(
         watchtower_pubkeys,
         hashlocks,
         guest_constant_value,
-        zkm_version: ZKM_CIRCUIT_VERSION.to_string(), // use the latest version
     })
 }
 
@@ -3856,7 +3862,6 @@ fn convert_graph(bitvm2_graph: &Bitvm2Graph, current_time: i64) -> Graph {
             .collect(),
         init_withdraw_tx_hash: None,
         bridge_out_start_at: 0,
-        zkm_version: bitvm2_graph.parameters.zkm_version.clone(),
         status_updated_at: current_time,
         proceed_withdraw_height: 0,
         created_at: current_time,
@@ -4829,5 +4834,17 @@ mod tests {
         let url = base_url.join(NODES_OPERATOR_BASE).unwrap();
 
         assert_eq!(url.as_str(), "http://127.0.0.1:8900/v1/proofs/operator_proofs");
+    }
+
+    #[test]
+    fn test_load_part_stark_vk_for_zkm_version_accepts_known_version() {
+        let part_stark_vk = load_part_stark_vk_for_zkm_version("v1.2.4").unwrap();
+        assert!(!part_stark_vk.is_empty());
+    }
+
+    #[test]
+    fn test_load_part_stark_vk_for_zkm_version_rejects_unknown_version_without_panic() {
+        let err = load_part_stark_vk_for_zkm_version("v0.0.0-test").unwrap_err();
+        assert!(err.to_string().contains("failed to load part_stark_vk"));
     }
 }
