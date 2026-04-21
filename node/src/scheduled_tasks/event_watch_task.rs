@@ -977,9 +977,16 @@ pub async fn fetch_history_events(
                 .await
             {
                 Ok(Some(v)) => v,
-                Ok(None) | Err(_) => {
+                Ok(None) => {
                     warn!(
-                        "fetch_history_events:fail to get graph sync block height, will try later"
+                        "fetch_history_events:fail to get graph sync block height, will try later, empty value returned"
+                    );
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "fetch_history_events:fail to get graph sync block height, will try later, err:{e:#}"
                     );
                     sleep(Duration::from_millis(500)).await;
                     continue;
@@ -1089,14 +1096,24 @@ pub async fn monitor_events_item(
     .await?;
     let query_client = GraphQueryClient::new();
     // let current_finalized = goat_client.get_finalized_block_number().await?;
-    let current_finalized =
-        match query_client.get_sync_block_height(&watch_contract.the_graph_url).await {
-            Ok(Some(v)) => v,
-            Ok(None) | Err(_) => {
-                warn!("monitor_events_item:fail to get graph sync block height, will try later");
-                return Ok(());
-            }
-        };
+    let current_finalized = match query_client
+        .get_sync_block_height(&watch_contract.the_graph_url)
+        .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            warn!(
+                "monitor_events_item:fail to get graph sync block height, will try later, empty value returned"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                "monitor_events_item:fail to get graph sync block height, will try later, err:{e:#}"
+            );
+            return Ok(());
+        }
+    };
 
     if watch_contract.from_height == 0 || watch_contract.from_height >= current_finalized {
         warn!(
