@@ -159,6 +159,10 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::PeginRequest(_) => MessageType::PeginRequest,
         GOATMessageContent::CreateGraph(_) => MessageType::CreateGraph,
         GOATMessageContent::ConfirmInstance(_) => MessageType::ConfirmInstance,
+        GOATMessageContent::InitGraph(_) => MessageType::InitGraph,
+        GOATMessageContent::GenCircuits(_) => MessageType::GenCircuits,
+        GOATMessageContent::CutCircuits(_) => MessageType::CutCircuits,
+        GOATMessageContent::SolideringProof(_) => MessageType::SolideringProof,
         GOATMessageContent::NonceGeneration(_) => MessageType::NonceGeneration,
         GOATMessageContent::CommitteePresign(_) => MessageType::CommitteePresign,
         GOATMessageContent::GraphFinalize(_) => MessageType::GraphFinalize,
@@ -184,9 +188,10 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::OperatorCommitBlockHashTimeout(_) => {
             MessageType::OperatorCommitBlockHashTimeout
         }
-        GOATMessageContent::AssertInitReady(_) => MessageType::AssertInitReady,
-        GOATMessageContent::AssertCommitTimeout(_) => MessageType::AssertCommitTimeout,
-        GOATMessageContent::DisproveReady(_) => MessageType::DisproveReady,
+        GOATMessageContent::AssertReady(_) => MessageType::AssertReady,
+        GOATMessageContent::AssertSent(_) => MessageType::AssertSent,
+        GOATMessageContent::ChallengeAssertSent(_) => MessageType::ChallengeAssertSent,
+        GOATMessageContent::WronglyChallengeTimeout(_) => MessageType::WronglyChallengeTimeout,
         GOATMessageContent::DisproveSent(_) => MessageType::DisproveSent,
         GOATMessageContent::Take1Ready(_) => MessageType::Take1Ready,
         GOATMessageContent::Take1Sent(_) => MessageType::Take1Sent,

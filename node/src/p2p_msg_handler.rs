@@ -153,6 +153,7 @@ mod tests {
                 bootnodes,
                 topic_names: vec![
                     Actor::Committee.to_string(),
+                    Actor::Verifier.to_string(),
                     Actor::Challenger.to_string(),
                     Actor::Operator.to_string(),
                     Actor::Watchtower.to_string(),

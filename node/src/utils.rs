@@ -76,8 +76,7 @@ use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_v
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
-    NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_OPERATOR_PROOF_TIMEOUT,
-    PROOFS_WATCHTOWER_PROOF_TIMEOUT,
+    NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
 };
 use crate::scheduled_tasks::get_goat_message_content_type;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
@@ -90,9 +89,9 @@ use bitvm2_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use proof_builder::{
-    OperatorProofRequest, OperatorProofResponse, OperatorProofTimeoutUpdateRequest,
-    OperatorProofTimeoutUpdateResponse, ProofData, WatchtowerProofRequest, WatchtowerProofResponse,
-    WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse,
+    OperatorProofRequest, OperatorProofResponse, ProofData, WatchtowerProofRequest,
+    WatchtowerProofResponse, WatchtowerProofTimeoutUpdateRequest,
+    WatchtowerProofTimeoutUpdateResponse,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -3224,7 +3223,6 @@ pub async fn upsert_message(
             MessageType::WatchtowerChallengeTimeout => {
                 Some(MessageType::WatchtowerChallengeInitSent)
             }
-            MessageType::AssertCommitTimeout => Some(MessageType::AssertInitReady),
             _ => None,
         } {
             notify_to_cancel_proof_task(storage_processor, business_id, cancel_msg_type).await?;
@@ -3256,8 +3254,8 @@ pub async fn notify_to_cancel_proof_task(
     business_id: Uuid,
     msg_type: MessageType,
 ) -> Result<()> {
-    if !matches!(msg_type, MessageType::WatchtowerChallengeInitSent | MessageType::AssertInitReady)
-    {
+    // AssertInitSent is removed; update related logic if needed;
+    if !matches!(msg_type, MessageType::WatchtowerChallengeInitSent) {
         warn!("notify_to_cancel_proof_task: input wrong message type:{msg_type}");
         return Ok(());
     }
@@ -3299,20 +3297,6 @@ pub async fn notify_to_cancel_proof_task(
                     )
                     .await?;
                 info!("call {}, response:{:?}", PROOFS_WATCHTOWER_PROOF_TIMEOUT, response);
-                response.data.is_some()
-            }
-            MessageType::AssertInitReady => {
-                let url = host.join(PROOFS_OPERATOR_PROOF_TIMEOUT)?;
-                let response  = http_client
-                    .post_response_json::<OperatorProofTimeoutUpdateResponse, OperatorProofTimeoutUpdateRequest>(
-                        url.as_str(),
-                        &OperatorProofTimeoutUpdateRequest {
-                            instance_id: graph.instance_id.to_string(),
-                            graph_id: graph.graph_id.to_string(),
-                        },
-                    )
-                    .await?;
-                info!("call {}, response:{:?}", PROOFS_OPERATOR_PROOF_TIMEOUT, response);
                 response.data.is_some()
             }
             _ => false,

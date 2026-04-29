@@ -114,7 +114,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             KeyCommands::FundingAddress => {
                 let public_key = get_node_pubkey()?;
                 let p2wsh_addr = utils::node_p2wsh_address(get_network(), &public_key);
-                println!("Funding P2WSH address (for operator and challenger): {p2wsh_addr}");
+                println!(
+                    "Funding P2WSH address (for operator, verifier and challenger): {p2wsh_addr}"
+                );
             }
         }
         return Ok(());
@@ -143,6 +145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             bootnodes: opt.bootnodes,
             topic_names: vec![
                 Actor::Committee.to_string(),
+                Actor::Verifier.to_string(),
                 Actor::Challenger.to_string(),
                 Actor::Operator.to_string(),
                 Actor::Watchtower.to_string(),

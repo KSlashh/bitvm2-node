@@ -1230,6 +1230,24 @@ pub async fn run_watch_event_task(
             })],
         ),
         (
+            Actor::Verifier,
+            vec![WatchEventConfig::Gateway(TheGraphConfig {
+                address: gateway_contract,
+                the_graph_url: get_goat_gateway_the_graph_urls_from_env(),
+                event_entities: vec![
+                    GatewayEventEntity::InitWithdraws,
+                    GatewayEventEntity::CancelWithdraws,
+                    GatewayEventEntity::ProceedWithdraws,
+                    GatewayEventEntity::WithdrawHappyPaths,
+                    GatewayEventEntity::WithdrawUnhappyPaths,
+                    GatewayEventEntity::WithdrawDisproveds,
+                    GatewayEventEntity::BridgeInRequests,
+                    GatewayEventEntity::BridgeIns,
+                    GatewayEventEntity::PostGraphDatas,
+                ],
+            })],
+        ),
+        (
             Actor::Challenger,
             vec![WatchEventConfig::Gateway(TheGraphConfig {
                 address: gateway_contract,

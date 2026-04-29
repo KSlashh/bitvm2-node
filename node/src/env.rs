@@ -193,8 +193,8 @@ pub fn get_node_pubkey() -> anyhow::Result<PublicKey> {
 }
 
 pub fn get_actor() -> Actor {
-    Actor::from_str(std::env::var(ENV_ACTOR).unwrap_or("Challenger".to_string()).as_str())
-        .expect("Expect one of Committee, Challenger, Operator or Relayer")
+    Actor::from_str(std::env::var(ENV_ACTOR).unwrap_or("Verifier".to_string()).as_str())
+        .expect("Expect one of Committee, Verifier, Challenger, Operator or Relayer")
 }
 
 pub fn get_peer_key() -> String {
@@ -260,10 +260,11 @@ pub async fn check_node_info() {
         panic!("Relayer and Committee must set goat secret key");
     }
     let node_info = get_local_node_info();
-    if [Actor::Operator.to_string(), Actor::Challenger.to_string()].contains(&node_info.actor)
+    if [Actor::Operator.to_string(), Actor::Verifier.to_string(), Actor::Challenger.to_string()]
+        .contains(&node_info.actor)
         && node_info.goat_addr.is_empty()
     {
-        panic!("Operator and Challenger must set goat address or goat secret key");
+        panic!("Operator, Verifier and Challenger must set goat address or goat secret key");
     }
     if Actor::Committee.to_string() == node_info.actor
         || Actor::Operator.to_string() == node_info.actor

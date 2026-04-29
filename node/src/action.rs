@@ -37,6 +37,10 @@ pub enum GOATMessageContent {
     PeginRequest(PeginRequest),
     CreateGraph(CreateGraph),
     ConfirmInstance(ConfirmInstance),
+    InitGraph(InitGraph),
+    GenCircuits(GenCircuits),
+    CutCircuits(CutCircuits),
+    SolideringProof(SolideringProof),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -54,9 +58,10 @@ pub enum GOATMessageContent {
     OperatorAckTimeout(OperatorAckTimeout),
     OperatorCommitBlockHashReady(OperatorCommitBlockHashReady),
     OperatorCommitBlockHashTimeout(OperatorCommitBlockHashTimeout),
-    AssertInitReady(AssertInitReady),
-    AssertCommitTimeout(AssertCommitTimeout),
-    DisproveReady(DisproveReady),
+    AssertReady(AssertReady),
+    AssertSent(AssertSent),
+    ChallengeAssertSent(ChallengeAssertSent),
+    WronglyChallengeTimeout(WronglyChallengeTimeout),
     DisproveSent(DisproveSent),
     Take1Ready(Take1Ready),
     Take1Sent(Take1Sent),
@@ -82,6 +87,32 @@ pub struct PeginRequest {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ConfirmInstance {
     pub instance_id: Uuid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct InitGraph {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GenCircuits {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_pubkey: PublicKey,
+    pub garbled_circuits: Vec<Vec<u8>>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CutCircuits {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_pubkey: PublicKey,
+    pub selected_circuit_indexes: Vec<usize>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SolideringProof {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_pubkey: PublicKey,
+    pub proofs: Vec<Vec<u8>>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
@@ -199,19 +230,27 @@ pub struct OperatorCommitBlockHashTimeout {
     pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct AssertInitReady {
+pub struct AssertReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct AssertCommitTimeout {
+pub struct AssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+    pub assert_txid: Txid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct DisproveReady {
+pub struct ChallengeAssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+    pub challenge_assert_txid: Txid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WronglyChallengeTimeout {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub challenge_assert_txid: Txid,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DisproveSent {

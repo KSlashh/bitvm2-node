@@ -1,9 +1,8 @@
 use crate::action::{
-    AssertCommitTimeout, AssertInitReady, ChallengeSent, DisproveReady, DisproveSent,
-    GOATMessageContent, KickoffReady, KickoffSent, OperatorAckTimeout,
-    OperatorCommitBlockHashReady, OperatorCommitBlockHashTimeout, PreKickoffSent, Take1Ready,
-    Take1Sent, Take2Ready, Take2Sent, WatchtowerChallengeInitSent, WatchtowerChallengeSent,
-    WatchtowerChallengeTimeout,
+    AssertReady, ChallengeSent, DisproveSent, GOATMessageContent, KickoffReady, KickoffSent,
+    OperatorAckTimeout, OperatorCommitBlockHashReady, OperatorCommitBlockHashTimeout,
+    PreKickoffSent, Take1Ready, Take1Sent, Take2Ready, Take2Sent, WatchtowerChallengeInitSent,
+    WatchtowerChallengeSent, WatchtowerChallengeTimeout,
 };
 use crate::env::get_network;
 use crate::rpc_service::current_time_secs;
@@ -246,6 +245,7 @@ impl WTInitTxVoutMonitorData {
         }
     }
 
+    #[allow(dead_code)]
     fn get_require_disproved_string(&self) -> String {
         format!(
             "[{}]",
@@ -420,6 +420,7 @@ impl AssertInitTxVoutMonitorData {
         }
     }
 
+    #[allow(dead_code)]
     fn get_require_disproved_string(&self) -> String {
         format!(
             "[{}]",
@@ -654,7 +655,7 @@ pub async fn process_graph_challenge(
             }
             if is_watchtower_challenge_success && !is_assert_commit_success {
                 info!("graph:{} assert commit is processing", graph.graph_id);
-                // upsert AssertInitReady message whenever watchtower challenge is finished normally, repeated inserts are idempotent
+                // upsert AssertReady message whenever watchtower challenge is finished normally, repeated inserts are idempotent
                 upsert_message(
                     &mut local_db.acquire().await?,
                     false,
@@ -662,7 +663,7 @@ pub async fn process_graph_challenge(
                     None,
                     SELF_SENDER.to_string(),
                     Actor::Operator,
-                    GOATMessageContent::AssertInitReady(AssertInitReady {
+                    GOATMessageContent::AssertReady(AssertReady {
                         instance_id: graph.instance_id,
                         graph_id: graph.graph_id,
                     }),
@@ -670,7 +671,7 @@ pub async fn process_graph_challenge(
                     0,
                 )
                 .await?;
-                // process_assert_commit_monitoring may trigger: DisproveSent(AssertTimeout), AssertCommitTimeout
+                // TODO!: replace legacy assert-commit monitoring with AssertSent/ChallengeAssertSent/WronglyChallengeTimeout monitoring.
                 is_assert_commit_success = process_assert_commit_monitoring(
                     btc_client,
                     local_db,
@@ -683,24 +684,8 @@ pub async fn process_graph_challenge(
             is_all_commit_success = is_watchtower_challenge_success && is_assert_commit_success;
         }
         if !sub_status.is_disproved() && is_all_commit_success {
-            let mut storage_processor = local_db.acquire().await?;
             info!("graph:{} watchtower challenge and assert commit is finished", graph.graph_id);
-            // upsert DisproveReady whenever both watchtower-challenge and assert is finished normally, repeated inserts are idempotent
-            upsert_message(
-                &mut storage_processor,
-                false,
-                graph.graph_id,
-                None,
-                SELF_SENDER.to_string(),
-                Actor::Challenger,
-                GOATMessageContent::DisproveReady(DisproveReady {
-                    instance_id: graph.instance_id,
-                    graph_id: graph.graph_id,
-                }),
-                0,
-                0,
-            )
-            .await?;
+            // TODO!: DisproveReady is removed; update related logic if needed.
             // detect_take2 may return: Take2Ready, Take2Sent, DisproveSent(Disprove)
             if let Some((actor, message_content)) =
                 detect_take2(btc_client, local_db, &graph, current_height).await?
@@ -999,7 +984,7 @@ async fn process_watchtower_challenge_monitoring(
             graph.graph_id,
             None,
             SELF_SENDER.to_string(),
-            Actor::Challenger,
+            Actor::Verifier,
             GOATMessageContent::OperatorCommitBlockHashTimeout(OperatorCommitBlockHashTimeout {
                 instance_id: graph.instance_id,
                 graph_id: graph.graph_id,
@@ -1049,7 +1034,7 @@ async fn process_watchtower_challenge_monitoring(
                 graph.graph_id,
                 Some(vout_monitor_data.get_require_disproved_string()),
                 SELF_SENDER.to_string(),
-                Actor::Challenger,
+                Actor::Verifier,
                 GOATMessageContent::OperatorAckTimeout(OperatorAckTimeout {
                     instance_id: graph.instance_id,
                     graph_id: graph.graph_id,
@@ -1166,24 +1151,8 @@ async fn process_assert_commit_monitoring(
         return Ok(false); // already disproved, no need to process further
     }
     if is_assert_commit_timeout {
+        // TODO!: AssertCommitTimeout is removed; update related logic if needed.
         vout_monitor_data.update_disprove_indexes();
-        if !vout_monitor_data.require_disproved_indexes.is_empty() {
-            upsert_message(
-                &mut local_db.acquire().await?,
-                false,
-                graph.graph_id,
-                Some(vout_monitor_data.get_require_disproved_string()),
-                SELF_SENDER.to_string(),
-                Actor::Challenger,
-                GOATMessageContent::AssertCommitTimeout(AssertCommitTimeout {
-                    instance_id: graph.instance_id,
-                    graph_id: graph.graph_id,
-                }),
-                0,
-                0,
-            )
-            .await?;
-        }
     }
 
     Ok(false)
@@ -1448,7 +1417,7 @@ async fn check_pre_kickoff_sent(
                 graph_id,
                 None,
                 SELF_SENDER.to_string(),
-                Actor::Challenger,
+                Actor::Verifier,
                 GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
                 0,
                 0,

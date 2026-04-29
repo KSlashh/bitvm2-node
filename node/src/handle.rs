@@ -20,7 +20,7 @@ use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::connectors::connector_z::ConnectorZ;
-use goat::transactions::base::{BaseTransaction, Input};
+use goat::transactions::base::BaseTransaction;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
@@ -157,6 +157,57 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         }
         (GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id }), _) => {
             handle_confirm_instance_default(ctx, *instance_id).await
+        }
+        (GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id }), Actor::Verifier) => {
+            handle_init_graph_verifier(ctx, *instance_id, *graph_id).await
+        }
+        (
+            GOATMessageContent::GenCircuits(GenCircuits {
+                instance_id,
+                graph_id,
+                verifier_pubkey,
+                garbled_circuits,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_gen_circuits_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                verifier_pubkey,
+                garbled_circuits,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::CutCircuits(CutCircuits {
+                instance_id,
+                graph_id,
+                verifier_pubkey,
+                selected_circuit_indexes,
+            }),
+            Actor::Verifier,
+        ) => {
+            handle_cut_circuits_verifier(
+                ctx,
+                *instance_id,
+                *graph_id,
+                verifier_pubkey,
+                selected_circuit_indexes,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::SolideringProof(SolideringProof {
+                instance_id,
+                graph_id,
+                verifier_pubkey,
+                proofs,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_solidering_proof_operator(ctx, *instance_id, *graph_id, verifier_pubkey, proofs)
+                .await
         }
         (
             GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph, .. }),
@@ -343,12 +394,20 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         ) => handle_kickoff_sent_committee(ctx, *instance_id, *graph_id, content).await,
         (
             GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
+            Actor::Verifier,
+        )
+        | (
+            GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
             Actor::Challenger,
         ) => handle_kickoff_sent_challenger(ctx, *instance_id, *graph_id, content).await,
         (GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }), _) => {
             handle_kickoff_sent_default(ctx, *instance_id, *graph_id, content).await
         }
         (
+            GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
+            Actor::Verifier,
+        )
+        | (
             GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
             Actor::Challenger,
         ) => handle_prekickoff_sent_challenger(ctx, *instance_id, *graph_id, content).await,
@@ -415,6 +474,10 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         }
         (
             GOATMessageContent::OperatorAckTimeout(OperatorAckTimeout { instance_id, graph_id }),
+            Actor::Verifier,
+        )
+        | (
+            GOATMessageContent::OperatorAckTimeout(OperatorAckTimeout { instance_id, graph_id }),
             Actor::Challenger,
         ) => handle_operator_ack_timeout_challenger(ctx, *instance_id, *graph_id, content).await,
         (
@@ -432,6 +495,13 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 instance_id,
                 graph_id,
             }),
+            Actor::Verifier,
+        )
+        | (
+            GOATMessageContent::OperatorCommitBlockHashTimeout(OperatorCommitBlockHashTimeout {
+                instance_id,
+                graph_id,
+            }),
             Actor::Challenger,
         ) => {
             handle_operator_commit_blockhash_timeout_challenger(
@@ -443,17 +513,57 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             .await
         }
         (
-            GOATMessageContent::AssertInitReady(AssertInitReady { instance_id, graph_id }),
+            GOATMessageContent::AssertReady(AssertReady { instance_id, graph_id }),
             Actor::Operator,
-        ) => handle_assert_init_ready_operator(ctx, *instance_id, *graph_id, content).await,
+        ) => handle_assert_ready_operator(ctx, *instance_id, *graph_id).await,
         (
-            GOATMessageContent::AssertCommitTimeout(AssertCommitTimeout { instance_id, graph_id }),
+            GOATMessageContent::AssertSent(AssertSent { instance_id, graph_id, assert_txid }),
+            Actor::Verifier,
+        )
+        | (
+            GOATMessageContent::AssertSent(AssertSent { instance_id, graph_id, assert_txid }),
             Actor::Challenger,
-        ) => handle_assert_commit_timeout_challenger(ctx, *instance_id, *graph_id, content).await,
+        ) => handle_assert_sent_verifier(ctx, *instance_id, *graph_id, *assert_txid).await,
         (
-            GOATMessageContent::DisproveReady(DisproveReady { instance_id, graph_id }),
+            GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
+                instance_id,
+                graph_id,
+                challenge_assert_txid,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_challenge_assert_sent_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *challenge_assert_txid,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::WronglyChallengeTimeout(WronglyChallengeTimeout {
+                instance_id,
+                graph_id,
+                challenge_assert_txid,
+            }),
+            Actor::Verifier,
+        )
+        | (
+            GOATMessageContent::WronglyChallengeTimeout(WronglyChallengeTimeout {
+                instance_id,
+                graph_id,
+                challenge_assert_txid,
+            }),
             Actor::Challenger,
-        ) => handle_disprove_ready_challenger(ctx, *instance_id, *graph_id, content).await,
+        ) => {
+            handle_wrongly_challenge_timeout_verifier(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *challenge_assert_txid,
+            )
+            .await
+        }
         (
             GOATMessageContent::DisproveSent(DisproveSent {
                 instance_id,
@@ -876,40 +986,57 @@ async fn handle_confirm_instance_operator(
     }
     // 2. save the instance data to local db
     store_instance_parameters(ctx.local_db, &instance_params).await?;
-    // 3. create & presign graph
-    let (graph_nonce, cur_prekickoff_tx) =
-        match get_current_prekickoff_tx(ctx.local_db, &local_operator_pubkey).await? {
-            Some(v) => v,
-            None => {
-                let genesis_prekickoff_tx =
-                    build_genesis_prekickoff_tx(ctx.btc_client, ctx.goat_client).await?;
-                (0, genesis_prekickoff_tx)
-            }
-        };
-    let prekickoff_params =
-        build_prekickoff_params(ctx.btc_client, graph_nonce, cur_prekickoff_tx).await?;
-    let graph_params = build_graph_params(
-        ctx.local_db,
-        ctx.goat_client,
-        instance_params,
-        prekickoff_params,
-        graph_nonce,
-        Uuid::new_v4(),
-    )
-    .await?;
-    let graph_id = graph_params.graph_id;
-    let disprove_scripts = get_disprove_scripts(&graph_params).await?;
-    let mut graph = generate_bitvm_graph(graph_params, disprove_scripts)?;
-    operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
-    store_graph(ctx.local_db, &graph.to_simplified()?).await?;
-    // 4. broadcast CreateGraph
-    let message_content = GOATMessageContent::CreateGraph(CreateGraph {
-        instance_id,
-        graph_id,
-        graph_nonce,
-        graph: graph.to_simplified()?,
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    let _ = local_operator_pubkey;
+    // TODO!: after PeginPrepare is confirmed, broadcast InitGraph and let Verifiers generate GC.
+    let graph_id = Uuid::new_v4(); // store it
+    let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_init_graph_verifier(
+    _ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<()> {
+    // TODO!: generate garbled circuits and broadcast GenCircuits.
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_gen_circuits_operator(
+    _ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    _verifier_pubkey: &PublicKey,
+    _garbled_circuits: &Vec<Vec<u8>>,
+) -> Result<()> {
+    // TODO!: select a subset of GC and broadcast CutCircuits.
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_cut_circuits_verifier(
+    _ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    _verifier_pubkey: &PublicKey,
+    _selected_circuit_indexes: &Vec<usize>,
+) -> Result<()> {
+    // TODO!: generate proofs for the remaining GC and broadcast SolideringProof.
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_solidering_proof_operator(
+    _ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    _verifier_pubkey: &PublicKey,
+    _solidering_proofs: &Vec<Vec<u8>>,
+) -> Result<()> {
+    // TODO!: verify Verifier SolideringProof, build Graph and broadcast CreateGraph.
     Ok(())
 }
 
@@ -2904,410 +3031,49 @@ async fn handle_operator_commit_blockhash_timeout_challenger(
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_assert_init_ready_operator(
-    ctx: &mut HandlerContext<'_>,
+async fn handle_assert_ready_operator(
+    _ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    content: &GOATMessageContent,
 ) -> Result<()> {
-    // triggered by timeout task
-    let message = make_message(ctx, content);
-    let (mut graph, graph_status, graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    if graph_status != GraphStatus::Challenge {
-        tracing::warn!(
-            "Ignore AssertInitReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
-        );
-        return Ok(());
-    }
-    match graph_sub_status {
-        Some(sub_status) => {
-            if !sub_status.is_watchtower_challenge_success() {
-                tracing::warn!(
-                    "Ignore AssertInitReady for {instance_id}:{graph_id}: watchtower challenge not finished yet, sub-status {sub_status:?}"
-                );
-                return Ok(());
-            }
-        }
-        None => {
-            tracing::warn!(
-                "Ignore AssertInitReady for {instance_id}:{graph_id}: graph sub-status is None"
-            );
-            return Ok(());
-        }
-    }
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let operator_graph_keypair = operator_master_key.master_keypair();
-    let assert_init_txid = graph.assert_init.tx().compute_txid();
-    // uncomment the following lines to check operator proof before sending assert-init txn
-    // let (proof_opt, wait_secs) =
-    //     get_operator_proof(local_db, http_client, instance_id, graph_id).await?;
-    // if proof_opt.is_none() {
-    //     tracing::warn!(
-    //         "Retry AssertInitReady for {instance_id}:{graph_id} later: operator proof not ready, retry after {wait_secs} seconds"
-    //     );
-    //     push_local_unhandled_messages(local_db, graph_id, &message, wait_secs).await?;
-    //     return Ok(());
-    // }
-    // 1. sign & broadcast assert-init txn
-    if !tx_on_chain(ctx.btc_client, &assert_init_txid).await? {
-        let assert_init_tx = operator_sign_assert_init(operator_graph_keypair, &mut graph)?;
-        let anchor_vout = assert_init_tx.output.len() as u64 - 1;
-        let assert_init_tx_total_input_amount =
-            graph.assert_init.prev_outs().iter().map(|o| o.value).sum();
-        let child_tx = build_cpfp_txns(
-            ctx.btc_client,
-            &assert_init_tx,
-            anchor_vout,
-            assert_init_tx_total_input_amount,
-        )
-        .await?;
-        match child_tx {
-            Some(tx) => broadcast_package(ctx.btc_client, &[assert_init_tx, tx], true).await?,
-            None => broadcast_tx(ctx.btc_client, &assert_init_tx).await?,
-        };
-        // assert-commit should be broadcasted after assert-init is confirmed (wait for 1 block)
-        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
-        push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-            .await?;
-        return Ok(());
-    }
-    let connector_d_vout = graph.assert_commit_timeout_txns.len() as u64;
-    if outpoint_spent_txid(ctx.btc_client, &assert_init_txid, connector_d_vout).await?.is_some() {
-        tracing::warn!(
-            "Ignore AssertInitReady for {instance_id}:{graph_id}: connector_D already spent"
-        );
-        return Ok(());
-    }
-    // 2. sign & broadcast assert-commit txns
-    if !tx_confirmed(ctx.btc_client, &assert_init_txid).await? {
-        // assert-commit should be broadcasted after assert-init is confirmed (wait for 1 block)
-        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
-        push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-            .await?;
-        return Ok(());
-    } else {
-        let (split_txid_opt, has_pending_fee_input, proof_wait_secs_opt) =
-            operator_send_assert_commit(ctx.local_db, ctx.btc_client, ctx.http_client, &mut graph)
-                .await?;
-        if let Some(wait_secs) = proof_wait_secs_opt {
-            tracing::warn!(
-                "Retry AssertInitReady for {instance_id}:{graph_id} later: operator proof not ready, retry after {wait_secs} seconds"
-            );
-            push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
-            return Ok(());
-        } else if let Some(split_txid) = split_txid_opt {
-            let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network()) * 2;
-            tracing::warn!(
-                "Retry AssertInitReady for {instance_id}:{graph_id} later: fee_inputs_split_tx {split_txid} broadcasted, retry after {delay_secs} seconds"
-            );
-            push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-                .await?;
-        } else if has_pending_fee_input {
-            let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network()) * 2;
-            tracing::warn!(
-                "Retry AssertInitReady for {instance_id}:{graph_id} later: some fee inputs are pending, retry after {delay_secs} seconds",
-            );
-            push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-                .await?;
-        }
-    }
+    let _ = (instance_id, graph_id);
+    // TODO!: after the watchtower challenge flow is complete, build proof and broadcast Assert transaction.
     Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_assert_commit_timeout_challenger(
-    ctx: &mut HandlerContext<'_>,
+async fn handle_assert_sent_verifier(
+    _ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    content: &GOATMessageContent,
+    _assert_txid: Txid,
 ) -> Result<()> {
-    // triggered by timeout task
-    let message = make_message(ctx, content);
-    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    if graph_status != GraphStatus::Challenge {
-        tracing::warn!(
-            "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
-        );
-        return Ok(());
-    }
-    let assert_init_txid = graph.assert_init.tx().compute_txid();
-    let connector_d_vout = graph.assert_commit_timeout_txns.len() as u64;
-    if outpoint_spent_txid(ctx.btc_client, &assert_init_txid, connector_d_vout).await?.is_some() {
-        tracing::warn!(
-            "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: connector_D already spent"
-        );
-        return Ok(());
-    }
-    let assert_init_height = match ctx
-        .btc_client
-        .get_tx_status(&assert_init_txid)
-        .await?
-        .block_height
-    {
-        Some(height) => height,
-        None => {
-            tracing::warn!(
-                "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: assert init tx not confirmed yet"
-            );
-            return Ok(());
-        }
-    };
-    let current_height = ctx.btc_client.get_height().await?;
-    if current_height < assert_init_height + assert_commit_timeout_timelock(get_network()) {
-        tracing::warn!(
-            "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: assert init tx timelock not expired yet"
-        );
-        return Ok(());
-    }
-    let mut commit_index = None;
-    for i in 0..graph.assert_commit_timeout_txns.len() {
-        let assert_commit_vout = i as u64;
-        if outpoint_spent_txid(ctx.btc_client, &assert_init_txid, assert_commit_vout)
-            .await?
-            .is_none()
-        {
-            commit_index = Some(i);
-            break;
-        }
-    }
-    let commit_index = match commit_index {
-        Some(index) => index,
-        None => {
-            tracing::warn!(
-                "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: all assert commit connectors already spent"
-            );
-            return Ok(());
-        }
-    };
-    // 1. broadcast AssertCommitTimeout txn
-    let assert_commit_timeout_tx = graph
-        .assert_commit_timeout_txns
-        .get(commit_index)
-        .ok_or_else(|| {
-            anyhow!("AssertCommitTimeout txn not found for {instance_id}:{graph_id}:{commit_index}")
-        })?
-        .finalize();
-    let anchor_vout = assert_commit_timeout_tx.output.len() as u64 - 1;
-    let assert_commit_timeout_tx_total_input_amount =
-        graph.assert_commit_timeout_txns[commit_index].prev_outs().iter().map(|o| o.value).sum();
-    let child_tx = build_cpfp_txns(
-        ctx.btc_client,
-        &assert_commit_timeout_tx,
-        anchor_vout,
-        assert_commit_timeout_tx_total_input_amount,
-    )
-    .await?;
-    match child_tx {
-        Some(tx) => {
-            broadcast_package(ctx.btc_client, &[assert_commit_timeout_tx, tx], true).await?
-        }
-        None => broadcast_tx(ctx.btc_client, &assert_commit_timeout_tx).await?,
-    };
+    let _ = (instance_id, graph_id);
+    // TODO!: verify Operator DynamicPublicInput and Proof; broadcast PubinDisprove or ChallengeAssert as needed.
     Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_disprove_ready_challenger(
-    ctx: &mut HandlerContext<'_>,
+async fn handle_challenge_assert_sent_operator(
+    _ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    content: &GOATMessageContent,
+    _challenge_assert_txid: Txid,
 ) -> Result<()> {
-    // triggered by AssertCommit tx or OperatorCommitBlockHash tx
-    let message = make_message(ctx, content);
-    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    if graph_status != GraphStatus::Challenge {
-        tracing::warn!(
-            "Ignore DisproveReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
-        );
-        return Ok(());
-    }
-    // 1. get assertions committed by Operator from Bitcoin chain
-    let operator_commit_blockhash_txin = {
-        let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-        let connector_g_vout = 2 * graph.parameters.watchtower_pubkeys.len() as u64;
-        let commit_blockhash_timeout_txid = graph.blockhash_commit_timeout.tx().compute_txid();
-        match outpoint_spent_txin(ctx.btc_client, &watchtower_challenge_init_txid, connector_g_vout)
-            .await?
-        {
-            Some((spent_txid, _, txin)) => {
-                if spent_txid == commit_blockhash_timeout_txid {
-                    tracing::warn!(
-                        "Ignore DisproveReady for {instance_id}:{graph_id}: graph already challenged by CommitBlockHashTimeout: {spent_txid}"
-                    );
-                    return Ok(());
-                }
-                txin
-            }
-            None => {
-                tracing::warn!(
-                    "Ignore DisproveReady for {instance_id}:{graph_id}: operator-commit-blockhash not sent yet"
-                );
-                return Ok(());
-            }
-        }
-    };
-    let operator_assert_commit_txins = {
-        let assert_init_txid = graph.assert_init.tx().compute_txid();
-        let mut txins = vec![];
-        for i in 0..graph.assert_commit_timeout_txns.len() {
-            let assert_commit_vout = i as u64;
-            match outpoint_spent_txin(ctx.btc_client, &assert_init_txid, assert_commit_vout).await?
-            {
-                Some((spent_txid, _, txin)) => {
-                    let assert_commit_timeout_txid =
-                        graph.assert_commit_timeout_txns[i].tx().compute_txid();
-                    if spent_txid == assert_commit_timeout_txid {
-                        tracing::warn!(
-                            "Ignore DisproveReady for {instance_id}:{graph_id}: graph already challenged by AssertCommitTimeout[{i}]: {spent_txid}"
-                        );
-                        return Ok(());
-                    }
-                    txins.push(txin);
-                }
-                None => {
-                    tracing::warn!(
-                        "Ignore DisproveReady for {instance_id}:{graph_id}: assert-commit {i} not sent yet"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        txins
-    };
-    let operator_ack_txins = {
-        let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-        let mut txins = vec![];
-        for watchtower_index in 0..graph.parameters.watchtower_pubkeys.len() {
-            let ack_vout = 1 + 2 * watchtower_index as u64;
-            if let Some((spent_txid, _, txin)) =
-                outpoint_spent_txin(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout)
-                    .await?
-            {
-                let nack_txid = graph.nack_txns[watchtower_index].tx().compute_txid();
-                if spent_txid != nack_txid {
-                    txins.push(txin);
-                }
-            }
-        }
-        txins
-    };
-    // 2. check assertions committed by Operator, if any assertion is invalid, sign & broadcast disprove txn
-    let vk = crate::vk::get_vk().await?;
-    let disprove_scripts = get_disprove_scripts(&graph.parameters).await?;
-    let disprove_scripts =
-        disprove_scripts.try_into().map_err(|_| anyhow!("Mismatch disprove scripts num"))?;
-    if let Some(disprove_witness) = verify_operator_commits(
-        operator_commit_blockhash_txin,
-        operator_assert_commit_txins,
-        operator_ack_txins,
-        graph.parameters.watchtower_pubkeys.len(),
-        &vk,
-        &disprove_scripts,
-    )? {
-        let disprover_evm_address = get_node_goat_address()
-            .ok_or_else(|| anyhow::anyhow!("failed to get node goat address".to_string()))?;
-        let connector_e_input = Input {
-            outpoint: OutPoint { txid: graph.kickoff.tx().compute_txid(), vout: 3 },
-            amount: graph.kickoff.tx().output[3].value,
-        };
-        let disprove_tx = sign_disprove(
-            &graph,
-            &connector_e_input,
-            disprove_witness,
-            disprove_scripts.to_vec(),
-            Some(*disprover_evm_address.as_ref()),
-        )?;
-        let challenger_master_key = ChallengerMasterKey::new(get_bitvm_key()?);
-        let challenger_disprove_keypair = challenger_master_key.keypair_for_nst_disprove();
-        if let Err(e) = build_sign_and_broadcast_non_standard_tx(
-            ctx.btc_client,
-            challenger_disprove_keypair,
-            disprove_tx.clone(),
-            connector_e_input.amount,
-        )
-        .await
-        {
-            if e.downcast_ref::<SpecialError>()
-                .is_some_and(|se| matches!(se, SpecialError::InsufficientBalance(_)))
-            {
-                let disprove_address = node_p2wsh_address(
-                    get_network(),
-                    &challenger_disprove_keypair.public_key().into(),
-                );
-                let disprove_balance = ctx
-                    .btc_client
-                    .get_address_utxo(disprove_address.clone())
-                    .await?
-                    .iter()
-                    .map(|u| u.value)
-                    .sum::<bitcoin::Amount>();
-                let fee_rate = get_fee_rate(ctx.btc_client).await?;
-                let est_fee_sat =
-                    ((disprove_tx.weight().to_vbytes_ceil() + 200) as f64 * fee_rate).ceil() as u64;
-                let target_balance_sat = est_fee_sat + 20_000;
-                let shortfall_sat = target_balance_sat.saturating_sub(disprove_balance.to_sat());
-                if shortfall_sat > 0 {
-                    tracing::info!(
-                        "Top up nst-disprove p2wsh address for {instance_id}:{graph_id}: shortfall={} sats",
-                        shortfall_sat
-                    );
-                    fund_address(
-                        ctx.btc_client,
-                        challenger_master_key.master_keypair(),
-                        disprove_address,
-                        bitcoin::Amount::from_sat(shortfall_sat),
-                    )
-                    .await?;
-                }
-                build_sign_and_broadcast_non_standard_tx(
-                    ctx.btc_client,
-                    challenger_disprove_keypair,
-                    disprove_tx,
-                    connector_e_input.amount,
-                )
-                .await?;
-            } else {
-                return Err(e);
-            }
-        }
-    } else {
-        tracing::info!("All assertions valid for {instance_id}:{graph_id}, no need to disprove");
-        return Ok(());
-    }
+    let _ = (instance_id, graph_id);
+    // TODO!: compute msg after ChallengeAssert is broadcast and broadcast WronglyChallenge transaction.
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_wrongly_challenge_timeout_verifier(
+    _ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    _challenge_assert_txid: Txid,
+) -> Result<()> {
+    let _ = (instance_id, graph_id);
+    // TODO!: broadcast NoWithdraw after the ChallengeAssert timelock expires.
     Ok(())
 }
 
