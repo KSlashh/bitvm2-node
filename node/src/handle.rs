@@ -17,6 +17,7 @@ use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::connectors::connector_z::ConnectorZ;
+use goat::transactions::base::BaseTransaction;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
@@ -387,11 +388,19 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         (
             GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
             Actor::Verifier,
+        )
+        | (
+            GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
+            Actor::Verifier,
         ) => handle_kickoff_sent_verifier(ctx, *instance_id, *graph_id, content).await,
         (GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }), _) => {
             handle_kickoff_sent_default(ctx, *instance_id, *graph_id, content).await
         }
         (
+            GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
+            Actor::Verifier,
+        )
+        | (
             GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
             Actor::Verifier,
         ) => handle_prekickoff_sent_verifier(ctx, *instance_id, *graph_id, content).await,
