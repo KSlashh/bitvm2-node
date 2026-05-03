@@ -2406,11 +2406,11 @@ dependencies = [
  "revm-database-interface",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "state-chain",
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
+ "verifier",
  "zkm-primitives",
  "zkm-verifier",
  "zkm-zkvm",
@@ -2601,7 +2601,6 @@ dependencies = [
  "rand 0.8.5",
  "reqwest 0.12.28",
  "secp256k1 0.29.1",
- "semver 1.0.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3183,7 +3182,7 @@ dependencies = [
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -5413,7 +5412,7 @@ dependencies = [
  "hex-literal",
  "serde",
  "sha2 0.10.9",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -9074,8 +9073,7 @@ name = "proof-builder"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "bitcoin",
- "bitcoin-light-client-circuit",
+ "bitcoin 0.32.8",
  "commit-chain",
  "header-chain",
  "serde",
@@ -9083,9 +9081,7 @@ dependencies = [
  "state-chain",
  "strum 0.26.3",
  "thiserror 1.0.69",
- "zkm-prover",
  "zkm-sdk",
- "zkm-verifier",
 ]
 
 [[package]]
@@ -11751,7 +11747,7 @@ dependencies = [
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -13154,6 +13150,13 @@ dependencies = [
  "git2",
  "rustversion",
  "time",
+]
+
+[[package]]
+name = "verifier"
+version = "0.3.3"
+dependencies = [
+ "zkm-verifier",
 ]
 
 [[package]]
