@@ -19,7 +19,9 @@ use bitcoin::{
     PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     XOnlyPublicKey,
 };
-use bitcoin_light_client_circuit::{VK_HASH_SIZE, build_watchtower_commitment};
+use bitcoin_light_client_circuit::{
+    VK_HASH_SIZE, build_watchtower_commitment, decode_operator_public_outputs, zkm_vk_hash_to_raw,
+};
 use bitvm::treepp::*;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::committee::*;
