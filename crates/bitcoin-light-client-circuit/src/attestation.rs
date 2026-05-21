@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 pub const PART_STARK_VK_TREE_HEIGHT: usize = 6;
 pub const PART_STARK_VK_TREE_LEAFS: usize = 1 << PART_STARK_VK_TREE_HEIGHT;
-pub const PART_STARK_VK_ROOT_SIGNATURE_DOMAIN: &[u8] = b"bitvm2:part_stark_vk_root:v2";
-pub const PART_STARK_VK_PUBLISHER_SET_DOMAIN: &[u8] = b"bitvm2:publisher_set:v1";
+pub const PART_STARK_VK_ROOT_SIGNATURE_DOMAIN: &[u8] = b"bitvm:part_stark_vk_root:v2";
+pub const PART_STARK_VK_PUBLISHER_SET_DOMAIN: &[u8] = b"bitvm:publisher_set:v1";
 pub const PART_STARK_VK_ATTESTATION_DIR_ENV: &str = "PART_STARK_VK_ATTESTATION_DIR";
 pub const DEFAULT_PART_STARK_VK_ATTESTATION_DIR: &str = "data/psv-attestations";
 
@@ -1031,7 +1031,7 @@ mod tests {
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("bitvm2-{prefix}-{nanos}"))
+        std::env::temp_dir().join(format!("bitvm-{prefix}-{nanos}"))
     }
 
     #[test]

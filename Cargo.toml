@@ -8,7 +8,7 @@ members = [
     "node",
     "proof-builder-rpc",
     "crates/cbft-rpc",
-    "crates/bitvm2-ga",
+    "crates/bitvm-gc",
     "crates/store",
     "crates/client",
     "crates/util",
@@ -27,8 +27,8 @@ members = [
 default-members = ["node"]
 
 [workspace.dependencies]
-bitvm = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "GA" }
-goat = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "GA" }
+bitvm = { git = "https://github.com/KSlashh/BitVM.git", branch = "gc" }
+goat = { git = "https://github.com/KSlashh/BitVM.git", branch = "gc" }
 
 libp2p = { version = "0.55.0", features = ["tokio", "dns", "kad", "noise", "tcp", "yamux", "rsa", "ping", "mdns"] }
 libp2p-swarm-derive = "0.35.0"
@@ -55,6 +55,7 @@ chacha20poly1305 = "0.10.1"
 tokio-util = "0.7.15"
 esplora-client = { git = "https://github.com/BitVM/rust-esplora-client" }
 serde_json = "1.0.116"
+serde-big-array = "0.5.1"
 toml = "0.8"
 rand = "0.8.5"
 dotenv = "0.15.0"
@@ -96,7 +97,7 @@ zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] 
 #zkm-sdk = { path = "../Ziren/crates/sdk" }
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
-bitvm2-lib = { path = "crates/bitvm2-ga" }
+bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
 store = { path = "crates/store" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }

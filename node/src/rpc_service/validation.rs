@@ -5,7 +5,7 @@ use alloy::primitives::Address as EvmAddress;
 use axum::Json;
 use axum::http::StatusCode;
 use bitcoin::{Address, AddressType, Network, PublicKey};
-use bitvm2_lib::actors::Actor;
+use bitvm_lib::actors::Actor;
 use libp2p::PeerId;
 use std::str::FromStr;
 use uuid::Uuid;

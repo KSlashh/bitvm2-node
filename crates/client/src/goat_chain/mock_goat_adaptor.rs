@@ -266,7 +266,12 @@ impl ChainAdaptor for MockAdaptor {
         Ok(hex::encode(generate_random_bytes(32)))
     }
 
-    async fn gateway_cancel_withdraw(&self, _graph_id: &[u8; 16]) -> anyhow::Result<String> {
+    async fn gateway_cancel_withdraw(
+        &self,
+        _graph_id: &[u8; 16],
+        _nonce: U256,
+        _committee_signs: &[Vec<u8>],
+    ) -> anyhow::Result<String> {
         info!("call cancel_withdraw");
         Ok(hex::encode(generate_random_bytes(32)))
     }

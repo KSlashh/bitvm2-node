@@ -10,9 +10,9 @@ use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
 use anyhow::{Result, anyhow};
 use bitcoin::{PublicKey, Txid};
-use bitvm2_lib::actors::Actor;
-use bitvm2_lib::committee::*;
-use bitvm2_lib::types::{Bitvm2Graph, SimplifiedBitvm2Graph};
+use bitvm_lib::actors::Actor;
+use bitvm_lib::committee::*;
+use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
 use client::goat_chain::DisproveTxType;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -40,7 +40,7 @@ pub enum GOATMessageContent {
     InitGraph(InitGraph),
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
-    SolideringProof(SolideringProof),
+    SolderingProof(SolderingProof),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -53,11 +53,6 @@ pub enum GOATMessageContent {
     PreKickoffSent(PreKickoffSent),
     ChallengeSent(ChallengeSent),
     WatchtowerChallengeInitSent(WatchtowerChallengeInitSent),
-    WatchtowerChallengeSent(WatchtowerChallengeSent),
-    WatchtowerChallengeTimeout(WatchtowerChallengeTimeout),
-    OperatorAckTimeout(OperatorAckTimeout),
-    OperatorCommitBlockHashReady(OperatorCommitBlockHashReady),
-    OperatorCommitBlockHashTimeout(OperatorCommitBlockHashTimeout),
     AssertReady(AssertReady),
     AssertSent(AssertSent),
     ChallengeAssertSent(ChallengeAssertSent),
@@ -108,7 +103,7 @@ pub struct CutCircuits {
     pub selected_circuit_indexes: Vec<usize>,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SolideringProof {
+pub struct SolderingProof {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_pubkey: PublicKey,
@@ -119,15 +114,14 @@ pub struct CreateGraph {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub graph_nonce: u64,
-    pub graph: SimplifiedBitvm2Graph,
+    pub graph: SimplifiedBitvmGcGraph,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NonceGeneration {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub committee_pubkey: PublicKey,
-    pub watchtower_num: usize,
-    pub assert_commit_num: usize,
+    pub verifier_num: usize,
     pub pub_nonces: CommitteePubNonces,
     pub nonce_sigs: CommitteeNonceSignatures,
 }
@@ -152,7 +146,7 @@ pub struct GraphFinalize {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub graph_nonce: u64,
-    pub graph: SimplifiedBitvm2Graph,
+    pub graph: SimplifiedBitvmGcGraph,
     pub endorse_sigs: Vec<(PublicKey, EvmAddress, Vec<u8>)>,
 }
 #[derive(Serialize, Deserialize, Clone)]
@@ -199,33 +193,6 @@ pub struct ChallengeSent {
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WatchtowerChallengeInitSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WatchtowerChallengeSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub watchtower_challenge_txids: Vec<(usize, Txid)>,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WatchtowerChallengeTimeout {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub watchtower_indexes: Vec<usize>,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorAckTimeout {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorCommitBlockHashReady {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorCommitBlockHashTimeout {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
 }
@@ -306,7 +273,7 @@ pub struct SyncGraphRequest {
 pub struct SyncGraph {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub graph: SimplifiedBitvm2Graph,
+    pub graph: SimplifiedBitvmGcGraph,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -450,7 +417,7 @@ pub async fn try_finalize_graph(
     goat_client: &GOATClient,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: Option<&SimplifiedBitvm2Graph>,
+    graph: Option<&SimplifiedBitvmGcGraph>,
     broadcast_graph_finalize: bool,
 ) -> Result<()> {
     let endorsements =
@@ -464,12 +431,12 @@ pub async fn try_finalize_graph(
         && partial_sigs.len() == committee_pubkeys.len()
     {
         let mut graph = match graph {
-            Some(g) => Bitvm2Graph::from_simplified(g)?,
+            Some(g) => BitvmGcGraph::from_simplified(g)?,
             None => {
                 let g = get_graph(local_db, instance_id, graph_id)
                     .await?
                     .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-                Bitvm2Graph::from_simplified(&g)?
+                BitvmGcGraph::from_simplified(&g)?
             }
         };
         let pub_nonces = pub_nonoces.into_iter().map(|(_, pn)| pn).collect::<Vec<_>>();
@@ -537,7 +504,7 @@ pub(crate) async fn get_graph_or_defer(
     instance_id: Uuid,
     graph_id: Uuid,
     message: &GOATMessage,
-) -> Result<Option<SimplifiedBitvm2Graph>> {
+) -> Result<Option<SimplifiedBitvmGcGraph>> {
     match get_graph(local_db, instance_id, graph_id).await? {
         Some(g) => Ok(Some(g)),
         None => {

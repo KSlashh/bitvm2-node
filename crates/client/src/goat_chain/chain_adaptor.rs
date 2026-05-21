@@ -102,7 +102,12 @@ pub trait ChainAdaptor: Send + Sync {
         instance_id: &[u8; 16],
         graph_id: &[u8; 16],
     ) -> anyhow::Result<String>;
-    async fn gateway_cancel_withdraw(&self, graph_id: &[u8; 16]) -> anyhow::Result<String>;
+    async fn gateway_cancel_withdraw(
+        &self,
+        graph_id: &[u8; 16],
+        nonce: U256,
+        committee_signs: &[Vec<u8>],
+    ) -> anyhow::Result<String>;
     async fn gateway_process_withdraw(
         &self,
         graph_id: &[u8; 16],
@@ -267,9 +272,6 @@ pub enum GoatNetwork {
 
 #[derive(Copy, Eq, PartialEq, Clone, Debug, Serialize, Deserialize, Display, EnumString)]
 pub enum DisproveTxType {
-    AssertTimeout,
-    OperatorCommitTimeout,
-    OperatorNack,
     Disprove,
     QuickChallenge,
     ChallengeIncompleteKickoff,
@@ -363,9 +365,8 @@ pub struct GraphData {
     pub kickoff_txid: [u8; 32],
     pub take1_txid: [u8; 32],
     pub take2_txid: [u8; 32],
-    pub commit_timout_txid: [u8; 32],
-    pub assert_timeout_txids: Vec<[u8; 32]>,
-    pub nack_txids: Vec<[u8; 32]>,
+    pub prover_assert_txid: [u8; 32],
+    pub disprove_txids: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]

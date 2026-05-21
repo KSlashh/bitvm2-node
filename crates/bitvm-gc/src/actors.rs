@@ -6,7 +6,6 @@ pub enum Actor {
     Committee,
     Operator,
     Verifier,
-    Challenger,
     Watchtower,
     Publisher,
     All,

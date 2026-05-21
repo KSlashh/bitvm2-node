@@ -1,5 +1,4 @@
 use anyhow::Result;
-use bitvm2_lib::types::VerifyingKey;
 use std::fs;
 use std::path::PathBuf;
 use zkm_sdk::install::CIRCUIT_ARTIFACTS_URL_BASE;
@@ -10,6 +9,8 @@ use {
     indicatif::{ProgressBar, ProgressStyle},
     std::{cmp::min, process::Command},
 };
+
+pub type VerifyingKey = ark_groth16::VerifyingKey<ark_bn254::Bn254>;
 
 pub(crate) fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
     use tokio::task::block_in_place;

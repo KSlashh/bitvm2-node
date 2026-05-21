@@ -186,8 +186,13 @@ impl EvmChain {
         self.adaptor.gateway_init_withdraw(instance_id.as_bytes(), graph_id.as_bytes()).await
     }
 
-    pub async fn gateway_cancel_withdraw(&self, graph_id: &Uuid) -> anyhow::Result<String> {
-        self.adaptor.gateway_cancel_withdraw(graph_id.as_bytes()).await
+    pub async fn gateway_cancel_withdraw(
+        &self,
+        graph_id: &Uuid,
+        nonce: U256,
+        committee_signs: &[Vec<u8>],
+    ) -> anyhow::Result<String> {
+        self.adaptor.gateway_cancel_withdraw(graph_id.as_bytes(), nonce, committee_signs).await
     }
 
     pub async fn gateway_process_withdraw(

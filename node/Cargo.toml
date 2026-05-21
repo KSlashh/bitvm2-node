@@ -1,10 +1,10 @@
 [package]
-name = "bitvm2-noded"
+name = "bitvm-noded"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "bitvm2-noded"
+name = "bitvm-noded"
 path = "src/main.rs"
 
 [[bin]]
@@ -118,7 +118,7 @@ proof-builder = { workspace = true }
 util = { workspace = true }
 bitvm = { workspace = true }
 goat = { workspace = true }
-bitvm2-lib = { workspace = true }
+bitvm-lib = { workspace = true }
 store = { workspace = true }
 client = { workspace = true }
 bitcoin-light-client-circuit = { workspace = true }

@@ -285,6 +285,7 @@ pub enum GraphStatus {
     PreKickoff,
     OperatorKickOff,
     Challenge,
+    Assert,
     Disprove,
     Obsoleted, // reimbursement by other operators
     Skipped,
@@ -314,7 +315,7 @@ impl GraphStatus {
     }
 
     pub fn get_pegout_started_status() -> Vec<GraphStatus> {
-        vec![GraphStatus::OperatorKickOff, GraphStatus::Challenge]
+        vec![GraphStatus::OperatorKickOff, GraphStatus::Challenge, GraphStatus::Assert]
     }
 
     pub fn is_pegin_finalized(&self) -> bool {
@@ -340,8 +341,9 @@ impl GraphStatus {
             GraphStatus::OperatorKickOff => Some(GraphStatus::PreKickoff),
             GraphStatus::OperatorTake1 => Some(GraphStatus::OperatorKickOff),
             GraphStatus::Challenge => Some(GraphStatus::OperatorKickOff),
-            GraphStatus::Disprove => Some(GraphStatus::Challenge),
-            GraphStatus::OperatorTake2 => Some(GraphStatus::Challenge),
+            GraphStatus::Assert => Some(GraphStatus::Challenge),
+            GraphStatus::Disprove => Some(GraphStatus::Assert),
+            GraphStatus::OperatorTake2 => Some(GraphStatus::Assert),
             // frontend use only
             GraphStatus::Created => None,
             GraphStatus::Presigned => Some(GraphStatus::Created),
@@ -396,16 +398,12 @@ pub struct Graph {
     pub take1_txid: Option<SerializableTxid>,
     pub challenge_txid: Option<SerializableTxid>,
     pub take2_txid: Option<SerializableTxid>,
-    pub disprove_txid: Option<SerializableTxid>,
     pub watchtower_challenge_init_txid: Option<SerializableTxid>,
+    pub operator_assert_txid: Option<SerializableTxid>,
     #[sqlx(json)]
-    pub watchtower_challenge_timeout_txids: Vec<SerializableTxid>,
+    pub verifier_assert_txids: Vec<SerializableTxid>,
     #[sqlx(json)]
-    pub nack_txids: Vec<SerializableTxid>,
-    pub blockhash_commit_timeout_txid: Option<SerializableTxid>,
-    pub assert_init_txid: Option<SerializableTxid>,
-    #[sqlx(json)]
-    pub assert_commit_timeout_txids: Vec<SerializableTxid>,
+    pub disprove_txids: Vec<SerializableTxid>,
     pub init_withdraw_tx_hash: Option<String>,
     pub bridge_out_start_at: i64,
     pub status_updated_at: i64,
@@ -476,7 +474,7 @@ pub enum MessageType {
     InitGraph,
     GenCircuits,
     CutCircuits,
-    SolideringProof,
+    SolderingProof,
     NonceGeneration,
     CommitteePresign,
     GraphFinalize,
@@ -489,12 +487,6 @@ pub enum MessageType {
     PreKickoffSent,
     ChallengeSent,
     WatchtowerChallengeInitSent,
-    WatchtowerChallengeSent,
-    WatchtowerChallengeTimeout,
-    OperatorAckTimeout,
-    OperatorCommitBlockHashReady,
-    OperatorCommitBlockHashSent,
-    OperatorCommitBlockHashTimeout,
     AssertReady,
     AssertSent,
     ChallengeAssertSent,

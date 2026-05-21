@@ -6,8 +6,8 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use base64::Engine;
 use bitcoin::{Network, PublicKey, key::Keypair};
-use bitvm2_lib::actors::Actor;
-use bitvm2_lib::keys::NodeMasterKey;
+use bitvm_lib::actors::Actor;
+use bitvm_lib::keys::NodeMasterKey;
 use client::goat_chain::utils::{
     get_committee_management_contract, get_gateway_relay_contracts, is_validate_committee,
 };
@@ -194,7 +194,7 @@ pub fn get_node_pubkey() -> anyhow::Result<PublicKey> {
 
 pub fn get_actor() -> Actor {
     Actor::from_str(std::env::var(ENV_ACTOR).unwrap_or("Verifier".to_string()).as_str())
-        .expect("Expect one of Committee, Verifier, Challenger, Operator or Relayer")
+        .expect("Expect one of Committee, Verifier, Operator or Relayer")
 }
 
 pub fn get_peer_key() -> String {
@@ -260,11 +260,10 @@ pub async fn check_node_info() {
         panic!("Relayer and Committee must set goat secret key");
     }
     let node_info = get_local_node_info();
-    if [Actor::Operator.to_string(), Actor::Verifier.to_string(), Actor::Challenger.to_string()]
-        .contains(&node_info.actor)
+    if [Actor::Operator.to_string(), Actor::Verifier.to_string()].contains(&node_info.actor)
         && node_info.goat_addr.is_empty()
     {
-        panic!("Operator, Verifier and Challenger must set goat address or goat secret key");
+        panic!("Operator and Verifier must set goat address or goat secret key");
     }
     if Actor::Committee.to_string() == node_info.actor
         || Actor::Operator.to_string() == node_info.actor
@@ -340,12 +339,10 @@ pub enum GraphBtcTxName {
     WatchtowerChallengeInit,
     #[strum(serialize = "pre-kickoff.hex")]
     PreKickoff,
-    #[strum(serialize = "assert-init.hex")]
-    AssertInit,
+    #[strum(serialize = "assert.hex")]
+    Assert,
     #[strum(serialize = "challenge.hex")]
     Challenge,
-    #[strum(serialize = "disprove.hex")]
-    Disprove,
     #[strum(serialize = "kickoff.hex")]
     Kickoff,
     #[strum(serialize = "pegin.hex")]
@@ -431,13 +428,12 @@ pub fn get_goat_swap_event_filter_gap_from_env() -> i64 {
 
 pub fn get_goat_gateway_the_graph_urls_from_env() -> String {
     std::env::var(ENV_GOAT_GATEWAY_EVENT_THE_GRAPH_URL)
-        .unwrap_or("https://graph.goat.network/subgraphs/name/bitvm2_gateway_dev".to_string())
+        .unwrap_or("https://graph.goat.network/subgraphs/name/bitvm_gateway_dev".to_string())
 }
 
 pub fn get_goat_swap_the_graph_urls_from_env() -> String {
-    std::env::var(ENV_GOAT_SWAP_EVENT_THE_GRAPH_URL).unwrap_or(
-        "https://graph.goat.network/subgraphs/name/bitvm2_escrow_manager_dev".to_string(),
-    )
+    std::env::var(ENV_GOAT_SWAP_EVENT_THE_GRAPH_URL)
+        .unwrap_or("https://graph.goat.network/subgraphs/name/bitvm_escrow_manager_dev".to_string())
 }
 
 pub async fn goat_config_from_env() -> GoatInitConfig {
@@ -504,7 +500,7 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
     }
 }
 
-const DEFAULT_PROTO_NAME_BASE: &str = "bitvm2";
+const DEFAULT_PROTO_NAME_BASE: &str = "bitvm";
 pub fn get_proto_base() -> String {
     match std::env::var("PROTO_NAME") {
         Ok(proto_name) => {

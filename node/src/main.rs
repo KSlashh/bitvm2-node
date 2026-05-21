@@ -1,7 +1,7 @@
 #![feature(trivial_bounds)]
 use base64::Engine;
-use bitvm2_lib::actors::Actor;
-use bitvm2_noded::env::{
+use bitvm_lib::actors::Actor;
+use bitvm_noded::env::{
     self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, check_node_info, get_btc_url_from_env,
     get_goat_network, get_network, get_node_pubkey, goat_config_from_env,
 };
@@ -13,16 +13,16 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 
-use bitvm2_noded::utils::{
+use bitvm_noded::utils::{
     self, generate_local_key, save_local_info, set_node_external_socket_addr_env,
 };
-use bitvm2_noded::{
+use bitvm_noded::{
     rpc_service, run_maintenance_tasks, run_sequencer_set_hash_monitor_task, run_watch_event_task,
 };
 
 use anyhow::Result;
-use bitvm2_noded::middleware::swarm::{Bitvm2SwarmConfig, BitvmNetworkManager};
-use bitvm2_noded::p2p_msg_handler::BitvmNodeProcessor;
+use bitvm_noded::middleware::swarm::{BitvmNetworkManager, bitvmSwarmConfig};
+use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
 use client::http_client::async_client::HttpAsyncClient;
 use futures::future;
 use tokio::signal;
@@ -41,7 +41,7 @@ struct Opts {
     pub rpc_addr: String,
 
     /// Local Sqlite database file path
-    #[arg(long, default_value = "sqlite:/tmp/bitvm2-node.db")]
+    #[arg(long, default_value = "sqlite:/tmp/bitvm-node.db")]
     pub db_path: String,
 
     /// Peer nodes as the bootnodes
@@ -52,7 +52,7 @@ struct Opts {
     #[arg(long, default_value = "/metrics")]
     metrics_path: String,
 
-    /// Whether to run the libp2p Kademlia protocol and join the BitVM2 DHT.
+    /// Whether to run the libp2p Kademlia protocol and join the BitVM DHT.
     #[arg(long, default_value = "true")]
     enable_kademlia: bool,
 
@@ -114,9 +114,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             KeyCommands::FundingAddress => {
                 let public_key = get_node_pubkey()?;
                 let p2wsh_addr = utils::node_p2wsh_address(get_network(), &public_key);
-                println!(
-                    "Funding P2WSH address (for operator, verifier and challenger): {p2wsh_addr}"
-                );
+                println!("Funding P2WSH address (for operator and verifier): {p2wsh_addr}");
             }
         }
         return Ok(());
@@ -137,16 +135,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create cancellation token for graceful shutdown
     let cancellation_token = CancellationToken::new();
     let mut task_handles: Vec<JoinHandle<Result<String, String>>> = vec![];
-    // init bitvm2swarm
+    // init bitvmswarm
     let bitvm_network_manager = BitvmNetworkManager::new(
-        Bitvm2SwarmConfig {
+        bitvmSwarmConfig {
             local_key: env::get_peer_key(),
             p2p_port: opt.p2p_port,
             bootnodes: opt.bootnodes,
             topic_names: vec![
                 Actor::Committee.to_string(),
                 Actor::Verifier.to_string(),
-                Actor::Challenger.to_string(),
                 Actor::Operator.to_string(),
                 Actor::Watchtower.to_string(),
                 Actor::All.to_string(),

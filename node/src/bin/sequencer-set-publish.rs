@@ -11,13 +11,13 @@ use bitcoin::{
     Address, Amount, OutPoint, PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn,
     TxOut, Txid, Witness, absolute::LockTime, hashes::Hash, key::Keypair, transaction::Version,
 };
-use bitvm2_noded::env::{
+use bitvm_noded::env::{
     ENV_GOAT_SEQUENCER_SET_MULTI_SIG_VERIFIER_ADDRESS,
     ENV_GOAT_SEQUENCER_SET_PUBLISHER_CONTRACT_ADDRESS, get_goat_address_from_env, get_network,
 };
-use bitvm2_noded::utils::wait_tx_confirmation;
-use bitvm2_noded::utils::{broadcast_tx, get_fee_rate};
-use bitvm2_noded::utils::{node_p2wsh_address, node_sign};
+use bitvm_noded::utils::wait_tx_confirmation;
+use bitvm_noded::utils::{broadcast_tx, get_fee_rate};
+use bitvm_noded::utils::{node_p2wsh_address, node_sign};
 use clap::{Parser, Subcommand};
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
@@ -84,7 +84,7 @@ struct Args {
     #[arg(long, env = "OUTPUT_FILE", default_value = "output.data")]
     output_file: String,
 
-    #[arg(long, env = "DB_PATH", default_value = "sqlite:/tmp/bitvm2-node.db")]
+    #[arg(long, env = "DB_PATH", default_value = "sqlite:/tmp/bitvm-node.db")]
     db_path: String,
 }
 

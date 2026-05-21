@@ -17,7 +17,7 @@ use crate::scheduled_tasks::instance_maintenance_tasks::{
 };
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
-use bitvm2_lib::actors::Actor;
+use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 pub use event_watch_task::{is_processing_gateway_history_events, run_watch_event_task};
@@ -162,7 +162,7 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::InitGraph(_) => MessageType::InitGraph,
         GOATMessageContent::GenCircuits(_) => MessageType::GenCircuits,
         GOATMessageContent::CutCircuits(_) => MessageType::CutCircuits,
-        GOATMessageContent::SolideringProof(_) => MessageType::SolideringProof,
+        GOATMessageContent::SolderingProof(_) => MessageType::SolderingProof,
         GOATMessageContent::NonceGeneration(_) => MessageType::NonceGeneration,
         GOATMessageContent::CommitteePresign(_) => MessageType::CommitteePresign,
         GOATMessageContent::GraphFinalize(_) => MessageType::GraphFinalize,
@@ -176,17 +176,6 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::ChallengeSent(_) => MessageType::ChallengeSent,
         GOATMessageContent::WatchtowerChallengeInitSent(_) => {
             MessageType::WatchtowerChallengeInitSent
-        }
-        GOATMessageContent::WatchtowerChallengeSent(_) => MessageType::WatchtowerChallengeSent,
-        GOATMessageContent::WatchtowerChallengeTimeout(_) => {
-            MessageType::WatchtowerChallengeTimeout
-        }
-        GOATMessageContent::OperatorAckTimeout(_) => MessageType::OperatorAckTimeout,
-        GOATMessageContent::OperatorCommitBlockHashReady(_) => {
-            MessageType::OperatorCommitBlockHashReady
-        }
-        GOATMessageContent::OperatorCommitBlockHashTimeout(_) => {
-            MessageType::OperatorCommitBlockHashTimeout
         }
         GOATMessageContent::AssertReady(_) => MessageType::AssertReady,
         GOATMessageContent::AssertSent(_) => MessageType::AssertSent,

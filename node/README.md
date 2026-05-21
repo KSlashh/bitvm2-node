@@ -1,6 +1,6 @@
-# BitVM2 Node
+# BitVM Node
 
-The main node implementation for GOAT Network's BitVM2 bridge protocol. This module handles P2P networking, message processing, scheduled tasks, and RPC services for secure cross-chain asset transfers between Bitcoin and GOAT L2.
+The main node implementation for GOAT Network's BitVM bridge protocol. This module handles P2P networking, message processing, scheduled tasks, and RPC services for secure cross-chain asset transfers between Bitcoin and GOAT L2.
 
 ## Table of Contents
 
@@ -24,7 +24,7 @@ The main node implementation for GOAT Network's BitVM2 bridge protocol. This mod
 
 ## Overview
 
-The BitVM2 Node (`bitvm2-noded`) is a multi-role distributed node that participates in the BitVM2 cross-chain bridge protocol. It enables trustless Bitcoin-to-L2 transfers through a combination of:
+The BitVM Node (`bitvm-noded`) is a multi-role distributed node that participates in the BitVM cross-chain bridge protocol. It enables trustless Bitcoin-to-L2 transfers through a combination of:
 
 - **Multi-signature Consensus**: Committee-based transaction presigning
 - **Optimistic Verification**: Watchtower monitoring with dispute resolution
@@ -56,7 +56,7 @@ flowchart TB
         PB["Proof Builder RPC"]
     end
 
-    subgraph Node["bitvm2-noded"]
+    subgraph Node["bitvm-noded"]
         subgraph Input["Input Layer"]
             EW["Event Watch Task"]
             P2P["P2P Swarm (libp2p)"]
@@ -135,7 +135,7 @@ flowchart LR
 
 ## Actor System
 
-BitVM2 employs four primary actor roles plus an optional relayer capability:
+BitVM employs four primary actor roles plus an optional relayer capability:
 
 ### Fig-02-1-Actor-Roles
 
@@ -228,7 +228,7 @@ sequenceDiagram
     Committee->>Committee: Validate fees and availability
     Committee->>Operator: ConfirmInstance
 
-    Operator->>Operator: Create SimplifiedBitvm2Graph
+    Operator->>Operator: Create SimplifiedbitvmGraph
     Operator->>DB: Store graph_raw_data (JSON)
     Operator->>Committee: CreateGraph (with graph data)
 
@@ -392,7 +392,7 @@ flowchart TB
 
 ## Graph State Machine
 
-Graph is the core data structure in BitVM2, representing a set of presigned Bitcoin transactions.
+Graph is the core data structure in BitVM, representing a set of presigned Bitcoin transactions.
 
 ### Fig-04-1-Graph-Lifecycle
 
@@ -579,7 +579,7 @@ sequenceDiagram
 | Column | Type | Description |
 |--------|------|-------------|
 | `graph_id` | UUID | Primary key (FK to graph) |
-| `raw_data` | TEXT | JSON-serialized SimplifiedBitvm2Graph |
+| `raw_data` | TEXT | JSON-serialized SimplifiedbitvmGraph |
 | `created_at`, `updated_at` | i64 | Timestamps |
 
 ---
@@ -758,7 +758,7 @@ node/src/
 ├── metrics_service.rs              # Prometheus metrics
 ├── rpc_service/                    # REST API implementation
 │   ├── mod.rs                      # Service orchestration
-│   ├── bitvm2.rs                   # BitVM2-specific endpoints
+│   ├── bitvm.rs                   # BitVM-specific endpoints
 │   ├── routes.rs                   # HTTP route definitions
 │   ├── validation.rs               # Input validation
 │   └── handler/                    # Request handlers
@@ -793,20 +793,20 @@ BITCOIN_NETWORK=regtest cargo build -r
 BITCOIN_NETWORK=testnet4 cargo build -r
 
 # Build only the node binary
-cargo build -r -p bitvm2-noded
+cargo build -r -p bitvm-noded
 ```
 
 ### Generate Node Keys
 
 ```bash
 # Generate P2P peer key
-bitvm2-noded key peer
+bitvm-noded key peer
 # Output:
 # PEER_KEY=<base64-encoded-key>
 # PEER_ID=<peer-id>
 
 # Generate funding address (for Operator/Challenger)
-bitvm2-noded key funding-address
+bitvm-noded key funding-address
 # Output:
 # Funding P2WSH address: bc1q...
 ```
@@ -814,7 +814,7 @@ bitvm2-noded key funding-address
 ### Start Node
 
 ```bash
-bitvm2-noded \
+bitvm-noded \
   --rpc-addr 0.0.0.0:8080 \
   --db-path ./node.db \
   --p2p-port 4001 \
@@ -826,7 +826,7 @@ bitvm2-noded \
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--rpc-addr` | RPC service bind address | `0.0.0.0:8080` |
-| `--db-path` | SQLite database path | `sqlite:/tmp/bitvm2-node.db` |
+| `--db-path` | SQLite database path | `sqlite:/tmp/bitvm-node.db` |
 | `--p2p-port` | P2P listen port | `0` (random) |
 | `--bootnodes` | Bootstrap node addresses | - |
 | `--metrics-path` | Prometheus metrics endpoint | `/metrics` |

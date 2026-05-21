@@ -4,16 +4,14 @@ use crate::env::{
     get_node_goat_address, get_node_pubkey,
 };
 use crate::rpc_service::auth::verify_request_auth;
-use crate::rpc_service::bitvm2::*;
+use crate::rpc_service::bitvm::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;
 use crate::rpc_service::response::{
     ApiErrorExt, ApiResult, ErrorResponse, error_response, ok_response,
 };
 use crate::rpc_service::validation::InputValidator;
 use crate::rpc_service::{AppState, current_time_secs};
-use crate::scheduled_tasks::graph_maintenance_tasks::{
-    AssertInitTxVoutMonitorData, ChallengeSubStatus, WTInitTxVoutMonitorData,
-};
+use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::utils::{
     find_instances_by_escrow_hash, gen_instance_parameters_local, get_bridge_out_global_stats,
     parse_graph_raw_data, send_challenge_tx,
@@ -22,7 +20,7 @@ use alloy::primitives::{Address, U256};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize_hex;
-use bitvm2_lib::types::{Bitvm2Graph, SimplifiedBitvm2Graph};
+use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
 use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use http::{HeaderMap, StatusCode};
@@ -781,12 +779,12 @@ pub async fn get_instances_overview(
 
 /// Get graph by ID
 ///
-/// Returns detailed information for a specific BitVM2 graph including transaction status
+/// Returns detailed information for a specific BitVM graph including transaction status
 /// and waiting time information.
 ///
 /// # Path Parameters
 ///
-/// - `graph_id`: UUID of the BitVM2 graph to retrieve
+/// - `graph_id`: UUID of the BitVM graph to retrieve
 ///
 /// # Returns
 ///
@@ -796,7 +794,7 @@ pub async fn get_instances_overview(
 ///
 /// # Use Case
 ///
-/// Applications use this to retrieve detailed information about a specific BitVM2 graph,
+/// Applications use this to retrieve detailed information about a specific BitVM graph,
 /// including its current status and estimated waiting time.
 ///
 /// # Example
@@ -973,7 +971,7 @@ pub async fn get_graphs(
 
 /// Get ready to kickoff graph
 ///
-/// Returns a BitVM2 graph that is ready for the operator to kickoff. This endpoint is used by
+/// Returns a BitVM graph that is ready for the operator to kickoff. This endpoint is used by
 /// operators to query available graphs that need kickoff processing.
 ///
 /// # Query Parameters
@@ -1114,7 +1112,7 @@ pub async fn get_ready_to_kickoff_graph(
 
 /// Get graph Bitcoin transaction progress data
 ///
-/// Helper function to retrieve progress tracking data for specific BitVM2 graph transactions.
+/// Helper function to retrieve progress tracking data for specific BitVM graph transactions.
 /// This function monitors transaction vout status and extracts progress information for
 /// watchtower challenges and assert operations.
 ///
@@ -1143,148 +1141,18 @@ pub(crate) async fn get_graph_btc_tx_process_data<'a>(
     btc_tx_name: GraphBtcTxName,
     graph: &Graph,
 ) -> anyhow::Result<(Vec<ProgressData>, Option<String>)> {
-    let mut progress_datas: Vec<ProgressData> = vec![];
-    // todo update fail reason
-    let mut fail_reason: Option<String> = None;
-
-    match btc_tx_name {
-        GraphBtcTxName::WatchtowerChallengeInit => {
-            if let Some(tx) = graph.watchtower_challenge_init_txid.clone()
-                && let Some(vout_monitor) =
-                    storage_processor.find_graph_btc_tx_vout_monitor(&graph.graph_id, &tx).await?
-                && let Ok(monitor_data) =
-                    serde_json::from_str::<WTInitTxVoutMonitorData>(&vout_monitor.monitor_data)
-                && let Ok(challenge_status) =
-                    serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status)
-            {
-                progress_datas.push(ProgressData {
-                    name: WATCHTOWER_CHALLENGE_STEP_INIT.to_string(),
-                    current: 1,
-                    total: 1,
-                });
-                let (challenge_current, challenge_total) =
-                    monitor_data.get_challenge_process_desc();
-                progress_datas.push(ProgressData {
-                    name: WATCHTOWER_CHALLENGE_STEP_CHALLENGE.to_string(),
-                    current: challenge_current,
-                    total: challenge_total,
-                });
-
-                let (challenge_timeout_current, challenge_timeout_total) =
-                    monitor_data.get_challenge_timeout_process_desc();
-                progress_datas.push(ProgressData {
-                    name: WATCHTOWER_CHALLENGE_STEP_CHALLENGE_TIMEOUT.to_string(),
-                    current: challenge_timeout_current,
-                    total: challenge_timeout_total,
-                });
-
-                let (ack_current, ack_total) = monitor_data.get_ack_process_desc();
-                if ack_total > 0 {
-                    progress_datas.push(ProgressData {
-                        name: WATCHTOWER_CHALLENGE_STEP_ACK.to_string(),
-                        current: ack_current,
-                        total: ack_total,
-                    });
-                }
-
-                let (block_hash_current, block_hash_total) =
-                    monitor_data.get_commit_block_hash_desc();
-                progress_datas.push(ProgressData {
-                    name: WATCHTOWER_CHALLENGE_STEP_COMMIT_BLOCKHASH.to_string(),
-                    current: block_hash_current,
-                    total: block_hash_total,
-                });
-
-                let (current, total) = monitor_data.get_commit_block_hash_timeout_desc();
-                progress_datas.push(ProgressData {
-                    name: WATCHTOWER_CHALLENGE_STEP_COMMIT_BLOCKHASH_TIMEOUT.to_string(),
-                    current,
-                    total,
-                });
-
-                if let Some(disprove_type) = challenge_status.disprove_type {
-                    match disprove_type {
-                        DisproveTxType::OperatorCommitTimeout => {
-                            fail_reason =
-                                Some("The operator commits blockhash timeout".to_string());
-                        }
-                        DisproveTxType::OperatorNack => {
-                            let (challenge_timeout_num, nack_num) = (
-                                challenge_timeout_total - challenge_timeout_current,
-                                ack_total - ack_current,
-                            );
-
-                            fail_reason = match (challenge_timeout_num > 0, nack_num > 0) {
-                                (true, true) => Some(format!(
-                                    "The operator has {challenge_timeout_num} unsent Challenge-Timeout transactions, and {nack_num} unsent Ack transactions"
-                                )),
-                                (false, true) => Some(format!(
-                                    "The operator has {nack_num} unsent Ack transactions"
-                                )),
-                                (true, false) => Some(format!(
-                                    "The operator has {challenge_timeout_num} unsent Challenge-Timeout transactions"
-                                )),
-                                (false, false) => None,
-                            };
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                progress_datas.push(ProgressData {
-                    name: WATCHTOWER_CHALLENGE_STEP_INIT.to_string(),
-                    current: 0,
-                    total: 1,
-                });
-            }
-        }
-        GraphBtcTxName::AssertInit => {
-            if let Some(tx) = graph.assert_init_txid.clone()
-                && let Some(vout_monitor) =
-                    storage_processor.find_graph_btc_tx_vout_monitor(&graph.graph_id, &tx).await?
-                && let Ok(monitor_data) =
-                    serde_json::from_str::<AssertInitTxVoutMonitorData>(&vout_monitor.monitor_data)
-                && let Ok(challenge_status) =
-                    serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status)
-            {
-                progress_datas.push(ProgressData {
-                    name: ASSERT_STEP_INIT.to_string(),
-                    current: 1,
-                    total: 1,
-                });
-                let (current, total) = monitor_data.get_commit_process_desc();
-                progress_datas.push(ProgressData {
-                    name: ASSERT_STEP_COMMIT.to_string(),
-                    current,
-                    total,
-                });
-
-                if let Some(DisproveTxType::AssertTimeout) = challenge_status.disprove_type {
-                    fail_reason =
-                        Some(format!("The operator has {} unsent assertions", total - current));
-                }
-            } else {
-                progress_datas.push(ProgressData {
-                    name: ASSERT_STEP_INIT.to_string(),
-                    current: 0,
-                    total: 1,
-                });
-            }
-        }
-        _ => {}
-    }
-    Ok((progress_datas, fail_reason))
+    todo!()
 }
 
 /// Get graph transaction by name
 ///
 /// Returns raw Bitcoin transaction data and progress information for a specific transaction
-/// within a BitVM2 graph. Supports querying various transaction types including kickoff,
+/// within a BitVM graph. Supports querying various transaction types including kickoff,
 /// challenge, and take transactions.
 ///
 /// # Path Parameters
 ///
-/// - `graph_id`: UUID of the BitVM2 graph
+/// - `graph_id`: UUID of the BitVM graph
 ///
 /// # Query Parameters
 ///
@@ -1373,23 +1241,23 @@ pub async fn get_graph_tx(
                 .await
                 .api_error("GET_GRAPH_TX_ERROR")?;
 
-        let simplified_bitvm2_graph: SimplifiedBitvm2Graph =
+        let simplified_bitvm_graph: SimplifiedBitvmGcGraph =
             parse_graph_raw_data(graph_raw_data.raw_data.clone(), graph_id_uuid)
                 .await
                 .api_error("GET_GRAPH_TXN_ERROR")?;
 
-        let bitvm2_graph: Bitvm2Graph = Bitvm2Graph::from_simplified(&simplified_bitvm2_graph)
+        let bitvm_graph: BitvmGcGraph = BitvmGcGraph::from_simplified(&simplified_bitvm_graph)
             .api_error("GET_GRAPH_TX_ERROR")?;
 
         let raw_data = match tx_name {
-            GraphBtcTxName::AssertInit => serialize_hex(bitvm2_graph.assert_init.tx()),
-            GraphBtcTxName::PreKickoff => serialize_hex(bitvm2_graph.cur_prekickoff.tx()),
-            GraphBtcTxName::Kickoff => serialize_hex(bitvm2_graph.kickoff.tx()),
-            GraphBtcTxName::Pegin => serialize_hex(bitvm2_graph.pegin.tx()),
-            GraphBtcTxName::Take1 => serialize_hex(bitvm2_graph.take1.tx()),
-            GraphBtcTxName::Take2 => serialize_hex(bitvm2_graph.take2.tx()),
+            GraphBtcTxName::Assert => serialize_hex(bitvm_graph.operator_assert.tx()),
+            GraphBtcTxName::PreKickoff => serialize_hex(bitvm_graph.cur_prekickoff.tx()),
+            GraphBtcTxName::Kickoff => serialize_hex(bitvm_graph.kickoff.tx()),
+            GraphBtcTxName::Pegin => serialize_hex(bitvm_graph.pegin.tx()),
+            GraphBtcTxName::Take1 => serialize_hex(bitvm_graph.take1.tx()),
+            GraphBtcTxName::Take2 => serialize_hex(bitvm_graph.take2.tx()),
             GraphBtcTxName::WatchtowerChallengeInit => {
-                serialize_hex(bitvm2_graph.watchtower_challenge_init.tx())
+                serialize_hex(bitvm_graph.watchtower_challenge_init.tx())
             }
             GraphBtcTxName::Challenge => {
                 if let Some(challenge_txid) = graph.challenge_txid
@@ -1397,16 +1265,7 @@ pub async fn get_graph_tx(
                 {
                     serialize_hex(&tx)
                 } else {
-                    serialize_hex(bitvm2_graph.challenge.tx())
-                }
-            }
-            GraphBtcTxName::Disprove => {
-                if let Some(disprove_txid) = graph.disprove_txid
-                    && let Ok(Some(tx)) = app_state.btc_client.get_tx(&disprove_txid.0).await
-                {
-                    serialize_hex(&tx)
-                } else {
-                    "".to_string()
+                    serialize_hex(bitvm_graph.challenge.tx())
                 }
             }
         };
@@ -1429,12 +1288,12 @@ pub async fn get_graph_tx(
 /// Get all graph transactions
 ///
 /// Returns raw Bitcoin transaction data and progress information for all transactions
-/// in a BitVM2 graph. This includes all transaction types: assert_init, watchtower_challenge_init,
+/// in a BitVM graph. This includes all transaction types: assert_init, watchtower_challenge_init,
 /// pre_kickoff, challenge, disprove, kickoff, pegin, take1, and take2.
 ///
 /// # Path Parameters
 ///
-/// - `graph_id`: UUID of the BitVM2 graph
+/// - `graph_id`: UUID of the BitVM graph
 ///
 /// # Query Parameters
 ///
@@ -1449,7 +1308,7 @@ pub async fn get_graph_tx(
 /// # Use Case
 ///
 /// Applications use this to retrieve all transaction details from a graph in a single request,
-/// which is useful for displaying the complete transaction flow and status of a BitVM2 graph.
+/// which is useful for displaying the complete transaction flow and status of a BitVM graph.
 ///
 /// # Example
 ///
@@ -1595,11 +1454,11 @@ pub async fn get_graph_txn(
                     }),
                 )
             })?;
-        let simplified_bitvm2_graph: SimplifiedBitvm2Graph =
+        let simplified_bitvm_graph: SimplifiedBitvmGcGraph =
             parse_graph_raw_data(graph_raw_data.raw_data.clone(), graph_id_uuid)
                 .await
                 .api_error("GET_GRAPH_TXN_ERROR")?;
-        let bitvm2_graph: Bitvm2Graph = Bitvm2Graph::from_simplified(&simplified_bitvm2_graph)
+        let bitvm_graph: BitvmGcGraph = BitvmGcGraph::from_simplified(&simplified_bitvm_graph)
             .api_error("GET_GRAPH_TXN_ERROR")?;
 
         let (wt_progresses, wt_fail_reason) = get_graph_btc_tx_process_data(
@@ -1610,41 +1469,32 @@ pub async fn get_graph_txn(
         .await
         .api_error("GET_GRAPH_TXN_ERROR")?;
 
-        let (assert_progresses, assert_fail_reason) = get_graph_btc_tx_process_data(
-            &mut storage_processor,
-            GraphBtcTxName::AssertInit,
-            &graph,
-        )
-        .await
-        .api_error("GET_GRAPH_TXN_ERROR")?;
+        let (assert_progresses, assert_fail_reason) =
+            get_graph_btc_tx_process_data(&mut storage_processor, GraphBtcTxName::Assert, &graph)
+                .await
+                .api_error("GET_GRAPH_TXN_ERROR")?;
 
         let mut resp = GraphTxnGetResponse {
-            assert_init: BtcTxData::new(serialize_hex(bitvm2_graph.assert_init.tx()))
+            assert: BtcTxData::new(serialize_hex(bitvm_graph.operator_assert.tx()))
                 .with_progresses(assert_progresses)
                 .with_fail_reason(assert_fail_reason),
             watchtower_challenge_init: BtcTxData::new(serialize_hex(
-                bitvm2_graph.watchtower_challenge_init.tx(),
+                bitvm_graph.watchtower_challenge_init.tx(),
             ))
             .with_progresses(wt_progresses)
             .with_fail_reason(wt_fail_reason),
-            pre_kickoff: BtcTxData::new(serialize_hex(bitvm2_graph.cur_prekickoff.tx())),
-            challenge: BtcTxData::new(serialize_hex(bitvm2_graph.challenge.tx())),
-            disprove: Default::default(),
-            kickoff: BtcTxData::new(serialize_hex(bitvm2_graph.kickoff.tx())),
-            pegin: BtcTxData::new(serialize_hex(bitvm2_graph.pegin.tx())),
-            take1: BtcTxData::new(serialize_hex(bitvm2_graph.take1.tx())),
-            take2: BtcTxData::new(serialize_hex(bitvm2_graph.take2.tx())),
+            pre_kickoff: BtcTxData::new(serialize_hex(bitvm_graph.cur_prekickoff.tx())),
+            challenge: BtcTxData::new(serialize_hex(bitvm_graph.challenge.tx())),
+            kickoff: BtcTxData::new(serialize_hex(bitvm_graph.kickoff.tx())),
+            pegin: BtcTxData::new(serialize_hex(bitvm_graph.pegin.tx())),
+            take1: BtcTxData::new(serialize_hex(bitvm_graph.take1.tx())),
+            take2: BtcTxData::new(serialize_hex(bitvm_graph.take2.tx())),
         };
 
         if let Some(challenge_txid) = graph.challenge_txid
             && let Ok(Some(tx)) = app_state.btc_client.get_tx(&challenge_txid.0).await
         {
             resp.challenge.raw_data = serialize_hex(&tx);
-        }
-        if let Some(disprove_txid) = graph.disprove_txid
-            && let Ok(Some(tx)) = app_state.btc_client.get_tx(&disprove_txid.0).await
-        {
-            resp.disprove.raw_data = serialize_hex(&tx);
         }
 
         ok_response(resp)
@@ -1670,7 +1520,7 @@ pub async fn get_graph_txn(
 ///
 /// # Path Parameters
 ///
-/// - `graph_id`: UUID of the current BitVM2 graph
+/// - `graph_id`: UUID of the current BitVM graph
 ///
 /// # Returns
 ///
@@ -1727,7 +1577,7 @@ pub async fn get_graph_neighbor_ids(
 ///
 /// # Path Parameters
 ///
-/// - `instance_id`: UUID of the BitVM2 instance
+/// - `instance_id`: UUID of the BitVM instance
 ///
 /// # Returns
 ///
@@ -1794,12 +1644,12 @@ pub async fn get_unsigned_pegin_txn(
 
 /// Send challenge transaction for a graph
 ///
-/// Loads the graph from DB, rebuilds the full BitVM2 graph, and broadcasts
+/// Loads the graph from DB, rebuilds the full BitVM graph, and broadcasts
 /// the Challenge transaction on Bitcoin.
 ///
 /// # Path Parameters
 ///
-/// - `graph_id`: UUID of the BitVM2 graph to challenge
+/// - `graph_id`: UUID of the BitVM graph to challenge
 ///
 /// # Returns
 ///
@@ -1831,15 +1681,15 @@ pub async fn send_challenge(
             )
         })?;
 
-    let simplified_bitvm2_graph: SimplifiedBitvm2Graph =
+    let simplified_bitvm_graph: SimplifiedBitvmGcGraph =
         parse_graph_raw_data(graph_raw_data.raw_data, graph_id_uuid)
             .await
             .api_error("SEND_CHALLENGE_ERROR")?;
 
-    let bitvm2_graph: Bitvm2Graph =
-        Bitvm2Graph::from_simplified(&simplified_bitvm2_graph).api_error("SEND_CHALLENGE_ERROR")?;
+    let bitvm_graph: BitvmGcGraph =
+        BitvmGcGraph::from_simplified(&simplified_bitvm_graph).api_error("SEND_CHALLENGE_ERROR")?;
 
-    let txid = send_challenge_tx(&app_state.btc_client, &bitvm2_graph)
+    let txid = send_challenge_tx(&app_state.btc_client, &bitvm_graph)
         .await
         .api_error("SEND_CHALLENGE_ERROR")?;
 

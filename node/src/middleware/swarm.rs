@@ -3,7 +3,7 @@ use crate::middleware::{AllBehaviours, split_topic_name};
 use crate::{env, middleware};
 use anyhow::bail;
 use base64::Engine;
-use bitvm2_lib::actors::Actor;
+use bitvm_lib::actors::Actor;
 use futures::StreamExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::multiaddr::Protocol;
@@ -92,7 +92,7 @@ pub trait P2pMessageHandler {
 }
 
 #[derive(Clone, Debug)]
-pub struct Bitvm2SwarmConfig {
+pub struct bitvmSwarmConfig {
     pub local_key: String,
     pub p2p_port: u16,
     pub bootnodes: Vec<String>,
@@ -102,13 +102,13 @@ pub struct Bitvm2SwarmConfig {
 }
 
 pub struct BitvmNetworkManager {
-    config: Bitvm2SwarmConfig,
+    config: bitvmSwarmConfig,
     peer_id: PeerId,
     swarm: BitvmSwarmWrapper,
 }
 impl BitvmNetworkManager {
     pub fn new(
-        config: Bitvm2SwarmConfig,
+        config: bitvmSwarmConfig,
         metric_registry: &mut Registry,
     ) -> anyhow::Result<BitvmNetworkManager> {
         let key_pair = libp2p::identity::Keypair::from_protobuf_encoding(&Zeroizing::new(

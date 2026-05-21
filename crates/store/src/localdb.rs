@@ -591,7 +591,9 @@ impl GraphUpdate {
             query_builder.set_field("challenge_txid", QueryParam::BTCTxid(challenge_txid.clone()));
         }
         if let Some(ref disprove_txid) = self.disprove_txid {
-            query_builder.set_field("disprove_txid", QueryParam::BTCTxid(disprove_txid.clone()));
+            let disprove_txids_json =
+                serde_json::to_string(&vec![disprove_txid.clone()]).unwrap_or_else(|_| "[]".into());
+            query_builder.set_field("disprove_txids", QueryParam::Text(disprove_txids_json));
         }
         if let Some(bridge_out_start_at) = self.bridge_out_start_at {
             query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
@@ -1095,20 +1097,17 @@ impl<'a> StorageProcessor<'a> {
     /// - Ok(affected_rows) number of rows affected by the operation
     /// - Err if the operation failed
     pub async fn upsert_graph(&mut self, graph: &Graph) -> anyhow::Result<u64> {
-        let nack_txids_json = serde_json::to_string(&graph.nack_txids)?;
-        let watchtower_challenge_timeout_txids_json =
-            serde_json::to_string(&graph.watchtower_challenge_timeout_txids)?;
-        let assert_commit_timeout_txids_json =
-            serde_json::to_string(&graph.assert_commit_timeout_txids)?;
+        let verifier_assert_txids_json = serde_json::to_string(&graph.verifier_assert_txids)?;
+        let disprove_txids_json = serde_json::to_string(&graph.disprove_txids)?;
         let res = sqlx::query!(
             "INSERT OR
              REPLACE INTO graph (graph_id, instance_id, kickoff_index, from_addr, to_addr, amount, challenge_amount,
                     status, sub_status, operator_pubkey, cur_prekickoff_txid, next_prekickoff, force_skip_kickoff_txid,
                     quick_challenge_txid, challenge_incomplete_kickoff_txid, pegin_txid, kickoff_txid, take1_txid,
-                    challenge_txid, take2_txid, disprove_txid,  watchtower_challenge_init_txid, watchtower_challenge_timeout_txids, nack_txids,
-                    blockhash_commit_timeout_txid, assert_init_txid, assert_commit_timeout_txids, init_withdraw_tx_hash,
+                    challenge_txid, take2_txid, watchtower_challenge_init_txid, operator_assert_txid, verifier_assert_txids, disprove_txids,
+                    init_withdraw_tx_hash,
                     bridge_out_start_at, status_updated_at, proceed_withdraw_height,  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             graph.graph_id,
             graph.instance_id,
             graph.kickoff_index,
@@ -1129,13 +1128,10 @@ impl<'a> StorageProcessor<'a> {
             graph.take1_txid,
             graph.challenge_txid,
             graph.take2_txid,
-            graph.disprove_txid,
             graph.watchtower_challenge_init_txid,
-            watchtower_challenge_timeout_txids_json,
-            nack_txids_json,
-            graph.blockhash_commit_timeout_txid,
-            graph.assert_init_txid,
-            assert_commit_timeout_txids_json,
+            graph.operator_assert_txid,
+            verifier_assert_txids_json,
+            disprove_txids_json,
             graph.init_withdraw_tx_hash,
             graph.bridge_out_start_at,
             graph.status_updated_at,
@@ -1212,13 +1208,10 @@ impl<'a> StorageProcessor<'a> {
                     take1_txid,
                     challenge_txid,
                     take2_txid,
-                    disprove_txid,
                     watchtower_challenge_init_txid,
-                    watchtower_challenge_timeout_txids,
-                    nack_txids,
-                    blockhash_commit_timeout_txid,
-                    assert_init_txid,
-                    assert_commit_timeout_txids,
+                    operator_assert_txid,
+                    verifier_assert_txids,
+                    disprove_txids,
                     init_withdraw_tx_hash,
                     bridge_out_start_at,
                     status_updated_at,

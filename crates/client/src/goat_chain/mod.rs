@@ -252,8 +252,13 @@ impl GOATClient {
         self.chain_service.gateway_init_withdraw(instance_id, graph_id).await
     }
 
-    pub async fn gateway_cancel_withdraw(&self, graph_id: &Uuid) -> anyhow::Result<String> {
-        self.chain_service.gateway_cancel_withdraw(graph_id).await
+    pub async fn gateway_cancel_withdraw(
+        &self,
+        graph_id: &Uuid,
+        nonce: U256,
+        committee_signs: &[Vec<u8>],
+    ) -> anyhow::Result<String> {
+        self.chain_service.gateway_cancel_withdraw(graph_id, nonce, committee_signs).await
     }
 
     pub async fn gateway_process_withdraw(

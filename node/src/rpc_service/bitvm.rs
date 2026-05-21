@@ -1,7 +1,7 @@
 use super::utils::{deserialize_u256, serialize_u256};
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
-    AssertCommitStatus, ChallengeSubStatus, WatchtowerChallengeStatus,
+    ChallengeSubStatus, VerifierChallengeStatus,
 };
 use crate::utils::{check_bridge_in_uxto_available_or_self_spent, reflect_goat_address};
 use alloy::hex::ToHexExt;
@@ -486,11 +486,10 @@ pub type GraphGetResponse = GraphExtended;
 
 #[derive(Deserialize, Serialize, Default)]
 pub struct GraphTxnGetResponse {
-    pub assert_init: BtcTxData,
+    pub assert: BtcTxData,
     pub watchtower_challenge_init: BtcTxData,
     pub pre_kickoff: BtcTxData,
     pub challenge: BtcTxData,
-    pub disprove: BtcTxData,
     pub kickoff: BtcTxData,
     pub pegin: BtcTxData,
     pub take1: BtcTxData,
@@ -658,9 +657,12 @@ impl GraphExtended {
         let challenge_sub_status =
             match serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status) {
                 Ok(v) => {
-                    if v.assert_commit_status != AssertCommitStatus::None {
+                    if v.verifier_challenge_status
+                        .iter()
+                        .any(|status| *status != VerifierChallengeStatus::None)
+                    {
                         SimpleChallengeSubStatus::Assert
-                    } else if v.watchtower_challenge_status != WatchtowerChallengeStatus::None {
+                    } else if v.watchtower_challenge_status.iter().any(|status| *status) {
                         SimpleChallengeSubStatus::WatchtowerChallenge
                     } else {
                         SimpleChallengeSubStatus::None
