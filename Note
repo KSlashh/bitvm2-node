@@ -1,0 +1,49 @@
+Note
+bitvm2
+6 watchtower-challenge交易不确认, 获取不了largest watchtower challenge block, 导致commit-blockhash无法发送, 导致disprove
+8 清理废弃的tag
+11 理论上，一旦某个operator被disprove，他的后续所有graph都无法再pegout，目前为了测试方便，并未做这样的限制，是否需要加上
+13 完善 validate_init_graph / validate_finalized_graph
+17 暂时不删除commitee keys
+
+bitvm-gc
+1 wachtower challenge流程简化，只保留watchtower challenge
+2 监控流程修改
+
+
+## Pegin Message
+
+- PeginRequest
+- ConfirmInstance: Operator确认PeginPrepare上链后，广播InitGraph
+- InitGraph: Verifier收到InitGraph后，生成GC，广播GenCircuits
+- GenCircuits: Operator收到GenCircuits后，选取其中一部分，广播CutCircuits
+- CutCircuits: Verifer收到CutCircuits后，为其他的GC生成证明，广播SolderingProof
+- SolderingProof: Operator收到SolderingProof，验证后存储，等收到到所有的Verifier的SolderingProof(或者超时)后，构造Graph，广播CreateGraph
+- CreateGraph
+- NonceGeneration
+- CommitteePresign
+- EndorseGraph
+- GraphFinalize
+- PeginConfirmNonce
+- PeginConfirmPartialSig
+- PostReady
+
+## Pegout Message
+
+- KickoffReady
+- KickoffSent
+- Take1Ready
+- Take1Sent
+- ChallengeSent
+- WatchtowerChallengeInitSent
+- WatchtowerChallengeSent
+- WatchtowerChallengeTimeout
+- OperatorAckTimeout
+- OperatorCommitBlockHashReady
+- OperatorCommitBlockHashTimeout
+- AssertReady: Operator在监控到Watchtower挑战流程结束后，直接构造proof并广播Assert交易
+- AssertSent: Verifier在监控到Assert交易上链后，如果验证Operator的Proof有问题，构造并广播ChallengeAssert交易
+- ChallengeAssertSent: Operator在监控到ChallengeAssert被广播后，计算msg，并广播WronglyChanllenge交易
+- WronglyChallengeTimeout: Verifier如果监控到ChallengeAssert的时间锁到期，就可以广播NoWithdraw交易，完成Disprove
+- Take2Ready
+- Take2Sent

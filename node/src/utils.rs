@@ -1831,105 +1831,13 @@ pub async fn get_watchtower_challenge_info(
 pub async fn get_operator_proof(
     local_db: &LocalDB,
     http_client: &HttpAsyncClient,
-    bitvm_graph: &Bitvm2Graph,
+    bitvm_graph: &BitvmGcGraph,
     btc_client: &BTCClient,
     instance_id: Uuid,
     graph_id: Uuid,
     operator_committed_blockhash: String,
 ) -> Result<(Option<(GuestInputs, Groth16Proof, PublicInputs, VerifyingKey)>, usize)> {
-    let mut storage_processor = local_db.acquire().await?;
-    if let Some(graph) = storage_processor.find_graph(&graph_id).await? {
-        if graph.proceed_withdraw_height <= 0 {
-            warn!("graph {graph_id} proceed_withdraw_height <= 0, waiting to been updated");
-            return Ok((None, get_operator_proof_wait_secs()));
-        }
-
-        let watchtower_challenge_init_txid = graph
-            .watchtower_challenge_init_txid
-            .ok_or_else(|| anyhow::anyhow!("watchtower_challenge_init_txid is none"))?;
-        let num_challenger = bitvm_graph.parameters.watchtower_pubkeys.len();
-        let (watchtower_challenge_txids, included_watchtowers) =
-            match get_watchtower_challenge_info(
-                btc_client,
-                &watchtower_challenge_init_txid,
-                num_challenger,
-            )
-            .await
-            {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("Failed to get watchtower challenge info: {e}");
-                    return Ok((None, get_operator_proof_wait_secs()));
-                }
-            };
-        let base_url = Url::parse(
-            &get_proof_build_rpc_host()
-                .ok_or_else(|| anyhow::anyhow!("failed to get proof_build_rpc_host"))?,
-        )?;
-        let url = base_url.join(NODES_OPERATOR_BASE)?;
-
-        let response = http_client
-            .post_response_json::<OperatorProofResponse, OperatorProofRequest>(
-                url.as_str(),
-                &OperatorProofRequest {
-                    instance_id: instance_id.to_string(),
-                    graph_id: graph_id.to_string(),
-                    operator_committed_blockhash,
-                    execution_layer_block_number: graph.proceed_withdraw_height,
-                    watchtower_challenge_txids,
-                    included_watchtowers,
-                    watchtower_challenge_init_txid: watchtower_challenge_init_txid.0.to_string(),
-                    watchtower_challenge_pubkeys: bitvm_graph
-                        .parameters
-                        .watchtower_pubkeys
-                        .iter()
-                        .map(|pk| pk.public_key(secp256k1::Parity::Even).to_string())
-                        .collect(),
-                },
-            )
-            .await?;
-
-        match response.proof_data {
-            Some(proof_data) => {
-                info!("get_operator_proof get proof successfully");
-                let proof: ZKMProofWithPublicValues =
-                    bincode::deserialize(proof_data.proof.as_slice()).unwrap();
-                let part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
-                let operator_vk_hash =
-                    zkm_vk_hash_to_raw(proof_data.vk.as_bytes()).map_err(|err| anyhow!(err))?;
-                let output = decode_operator_public_outputs(
-                    proof.public_values.as_slice(),
-                    operator_vk_hash,
-                )
-                .map_err(|err| anyhow!(err))?;
-                // TODO: additionally check constant and included_watchtower with included_watchtowers.
-                //proof.public_values.head();
-                info!("get_operator_proof parse proof successfully");
-                let ark_proof = convert_ark_imm_wrap_vk(
-                    &proof,
-                    &proof_data.vk,
-                    &IMM_GROTH16_VK_BYTES,
-                    &part_stark_vk,
-                )
-                .map_err(|e| anyhow!("failed to convert operator proof to ark format: {e}"))?;
-                info!("get_operator_proof parse proof successfully");
-
-                Ok((
-                    Some((
-                        [output.constant, output.included_watchtowers],
-                        ark_proof.proof.clone(),
-                        ark_proof.public_inputs.into(),
-                        ark_proof.groth16_vk.into(),
-                    )),
-                    0,
-                ))
-            }
-            None => Ok((None, get_operator_proof_wait_secs())),
-        }
-    } else {
-        warn!("graph:{graph_id} not found");
-        bail!("No graph in db");
-    }
+    todo!("operator proof assembly is pending the GC refactor")
 }
 
 /// Returns:

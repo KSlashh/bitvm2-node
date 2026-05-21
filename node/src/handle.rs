@@ -2538,6 +2538,8 @@ async fn handle_disprove_sent_committee(
     challenge_finish_txid: Txid,
     content: &GOATMessageContent,
 ) -> Result<()> {
+    // TODO!: update disprove type
+    todo!();
     // triggered by Disprove tx
     // 1. update graph status
     let message = make_message(ctx, content);
