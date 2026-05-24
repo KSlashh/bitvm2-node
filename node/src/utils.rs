@@ -85,8 +85,7 @@ use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus}
 use client::http_client::async_client::HttpAsyncClient;
 use proof_builder::{
     ProofData, WatchtowerProofRequest, WatchtowerProofResponse,
-    WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse,
-    WrapperProofResponse,
+    WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse, WrapperProofResponse,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -1829,13 +1828,13 @@ pub async fn get_watchtower_challenge_info(
 /// - `Ok(Some(OperatorProof), _)` if operator proof is available
 /// - `Ok(None, wait_secs)` if operator proof is not yet available, with suggested wait time
 pub async fn get_operator_proof(
-    local_db: &LocalDB,
-    http_client: &HttpAsyncClient,
-    bitvm_graph: &BitvmGcGraph,
-    btc_client: &BTCClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    operator_committed_blockhash: String,
+    _local_db: &LocalDB,
+    _http_client: &HttpAsyncClient,
+    _bitvm_graph: &BitvmGcGraph,
+    _btc_client: &BTCClient,
+    _instance_id: Uuid,
+    _graph_id: Uuid,
+    _operator_committed_blockhash: String,
 ) -> Result<(Option<(GuestInputs, Groth16Proof, PublicInputs, VerifyingKey)>, usize)> {
     todo!("operator proof assembly is pending the GC refactor")
 }

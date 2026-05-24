@@ -17,7 +17,6 @@ use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::connectors::connector_z::ConnectorZ;
-use goat::transactions::base::BaseTransaction;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
@@ -2538,8 +2537,6 @@ async fn handle_disprove_sent_committee(
     challenge_finish_txid: Txid,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    // TODO!: update disprove type
-    todo!();
     // triggered by Disprove tx
     // 1. update graph status
     let message = make_message(ctx, content);
