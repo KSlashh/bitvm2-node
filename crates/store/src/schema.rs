@@ -285,7 +285,6 @@ pub enum GraphStatus {
     PreKickoff,
     OperatorKickOff,
     Challenge,
-    Assert,
     Disprove,
     Obsoleted, // reimbursement by other operators
     Skipped,
@@ -315,7 +314,7 @@ impl GraphStatus {
     }
 
     pub fn get_pegout_started_status() -> Vec<GraphStatus> {
-        vec![GraphStatus::OperatorKickOff, GraphStatus::Challenge, GraphStatus::Assert]
+        vec![GraphStatus::OperatorKickOff, GraphStatus::Challenge]
     }
 
     pub fn is_pegin_finalized(&self) -> bool {
@@ -341,9 +340,8 @@ impl GraphStatus {
             GraphStatus::OperatorKickOff => Some(GraphStatus::PreKickoff),
             GraphStatus::OperatorTake1 => Some(GraphStatus::OperatorKickOff),
             GraphStatus::Challenge => Some(GraphStatus::OperatorKickOff),
-            GraphStatus::Assert => Some(GraphStatus::Challenge),
-            GraphStatus::Disprove => Some(GraphStatus::Assert),
-            GraphStatus::OperatorTake2 => Some(GraphStatus::Assert),
+            GraphStatus::Disprove => Some(GraphStatus::Challenge),
+            GraphStatus::OperatorTake2 => Some(GraphStatus::Challenge),
             // frontend use only
             GraphStatus::Created => None,
             GraphStatus::Presigned => Some(GraphStatus::Created),
@@ -487,6 +485,7 @@ pub enum MessageType {
     PreKickoffSent,
     ChallengeSent,
     WatchtowerChallengeInitSent,
+    WatchtowerChallengeSent,
     AssertReady,
     AssertSent,
     ChallengeAssertSent,

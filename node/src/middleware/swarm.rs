@@ -92,7 +92,7 @@ pub trait P2pMessageHandler {
 }
 
 #[derive(Clone, Debug)]
-pub struct bitvmSwarmConfig {
+pub struct BitvmSwarmConfig {
     pub local_key: String,
     pub p2p_port: u16,
     pub bootnodes: Vec<String>,
@@ -102,13 +102,13 @@ pub struct bitvmSwarmConfig {
 }
 
 pub struct BitvmNetworkManager {
-    config: bitvmSwarmConfig,
+    config: BitvmSwarmConfig,
     peer_id: PeerId,
     swarm: BitvmSwarmWrapper,
 }
 impl BitvmNetworkManager {
     pub fn new(
-        config: bitvmSwarmConfig,
+        config: BitvmSwarmConfig,
         metric_registry: &mut Registry,
     ) -> anyhow::Result<BitvmNetworkManager> {
         let key_pair = libp2p::identity::Keypair::from_protobuf_encoding(&Zeroizing::new(

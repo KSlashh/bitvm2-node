@@ -37,15 +37,11 @@ const OPERATOR_WOTS_HKDF_SALT: &[u8] = b"bitvm-gc/operator-wots/v1";
 
 #[allow(deprecated)]
 pub fn generate_wots_key(seed: &str) -> (OperatorAssertSecretKey, OperatorAssertPublicKey) {
-    let sec_str = hex::encode(hkdf_derive_bytes(
-        seed.as_bytes(),
-        OPERATOR_WOTS_HKDF_SALT,
-        format!("wots64/0").as_bytes(),
-        64,
-    ));
+    let sec_str =
+        hex::encode(hkdf_derive_bytes(seed.as_bytes(), OPERATOR_WOTS_HKDF_SALT, b"wots64/0", 64));
     let secret = Wots64::secret_from_str(&sec_str);
     let public = Wots64::generate_public_key(&secret);
-    (secret.into(), public.into())
+    (secret, public)
 }
 
 pub fn operator_presig_num() -> usize {

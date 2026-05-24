@@ -177,6 +177,7 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::WatchtowerChallengeInitSent(_) => {
             MessageType::WatchtowerChallengeInitSent
         }
+        GOATMessageContent::WatchtowerChallengeSent(_) => MessageType::WatchtowerChallengeSent,
         GOATMessageContent::AssertReady(_) => MessageType::AssertReady,
         GOATMessageContent::AssertSent(_) => MessageType::AssertSent,
         GOATMessageContent::ChallengeAssertSent(_) => MessageType::ChallengeAssertSent,

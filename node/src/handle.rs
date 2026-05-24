@@ -1,13 +1,10 @@
 use crate::action::*;
-use crate::env::{
-    COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_network, get_node_goat_address, is_relayer,
-};
+use crate::env::{COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_node_goat_address, is_relayer};
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
-use bitcoin::hashes::Hash;
 use bitcoin::{OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
@@ -20,7 +17,6 @@ use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::connectors::connector_z::ConnectorZ;
-use goat::transactions::base::BaseTransaction;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
@@ -664,7 +660,7 @@ async fn refresh_and_compensate(
     scan_from_status: Option<GraphStatus>,
     compensate_from_status: GraphStatus,
 ) -> Result<(GraphStatus, Option<ChallengeSubStatus>)> {
-    let (graph_status, sub_status) = refresh_graph(
+    let (graph_status, sub_status, scan) = refresh_graph(
         ctx.local_db,
         ctx.btc_client,
         ctx.goat_client,
@@ -682,10 +678,10 @@ async fn refresh_and_compensate(
         instance_id,
         graph_id,
         graph,
+        scan.as_ref(),
         scan_from_status,
         compensate_from_status,
         graph_status,
-        sub_status.clone(),
     )
     .await?;
     Ok((graph_status, sub_status))
@@ -891,10 +887,10 @@ async fn handle_confirm_instance_operator(
     let _ = local_operator_pubkey;
     // TODO!: after PeginPrepare is confirmed, broadcast InitGraph and let Verifiers generate GC.
     todo!();
-    let graph_id = Uuid::new_v4(); // store it
-    let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
-    Ok(())
+    // let graph_id = Uuid::new_v4(); // store it
+    // let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
+    // send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+    // Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -1934,7 +1930,7 @@ async fn handle_kickoff_ready_operator(
                 .ok_or_else(|| {
                     anyhow!("Graph status not found for {current_instance_id}:{current_graph_id}")
                 })?;
-        let (current_graph_status, current_graph_sub_status) = refresh_graph(
+        let (current_graph_status, _current_graph_sub_status, current_graph_scan) = refresh_graph(
             ctx.local_db,
             ctx.btc_client,
             ctx.goat_client,
@@ -1951,10 +1947,10 @@ async fn handle_kickoff_ready_operator(
             current_instance_id,
             current_graph_id,
             Some(&current_graph),
+            current_graph_scan.as_ref(),
             Some(current_graph_start_status),
             current_graph_start_status,
             current_graph_status,
-            current_graph_sub_status,
         )
         .await?;
         if current_graph_status.is_closed() {
@@ -2350,6 +2346,12 @@ async fn handle_challenge_sent_operator(
         }
         None => broadcast_tx(ctx.btc_client, &watchtower_challenge_init_tx).await?,
     };
+    let message_content =
+        GOATMessageContent::WatchtowerChallengeInitSent(WatchtowerChallengeInitSent {
+            instance_id,
+            graph_id,
+        });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Watchtower, message_content)).await?;
     Ok(())
 }
 
@@ -2458,6 +2460,15 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
             return Ok(());
         }
     };
+    tracing::info!(
+        "WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower_index={node_index}, txid={watchtower_challenge_txid}"
+    );
+    let message_content = GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
+        instance_id,
+        graph_id,
+        watchtower_index: node_index,
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
     Ok(())
 }
 
@@ -2518,8 +2529,6 @@ async fn handle_disprove_sent_committee(
     challenge_finish_txid: Txid,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    // TODO!: update disprove type
-    todo!();
     // triggered by Disprove tx
     // 1. update graph status
     let message = make_message(ctx, content);
@@ -2571,35 +2580,6 @@ async fn handle_disprove_sent_committee(
             return Ok(());
         }
     };
-    match disprove_type {
-        DisproveTxType::Disprove => {
-            let connector_e_input = OutPoint { txid: kickoff_txid, vout: 3 };
-            if challenge_finish_tx.input[0].previous_output != connector_e_input {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish tx is not a disprove txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::QuickChallenge => {
-            let guardian_connector_input = OutPoint { txid: kickoff_txid, vout: 4 };
-            if challenge_finish_tx.input[0].previous_output != guardian_connector_input {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish tx is not a quick challenge txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::ChallengeIncompleteKickoff => {
-            let guardian_connector_input = OutPoint { txid: kickoff_txid, vout: 4 };
-            if challenge_finish_tx.input[0].previous_output != guardian_connector_input {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish tx is not a challenge incomplete kickoff txn"
-                );
-                return Ok(());
-            }
-        }
-    }
     let challenge_finish_height = match ctx
         .btc_client
         .get_tx_status(&challenge_finish_txid)
@@ -2839,19 +2819,24 @@ async fn handle_take2_ready_operator(
         );
         return Ok(());
     }
-    let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
     let operator_assert_txid = graph.operator_assert.tx().compute_txid();
-    let connector_d_vout = graph.verifier_asserts.len() as u64;
-    let guardian_connector_vout = 3;
-    // check if connector_D, guardian_connector are all unspent
-    if outpoint_spent_txid(ctx.btc_client, &operator_assert_txid, connector_d_vout).await?.is_some()
-        || outpoint_spent_txid(ctx.btc_client, &kickoff_txid, guardian_connector_vout)
-            .await?
-            .is_some()
-    {
-        tracing::warn!("Ignore Take2Ready for {instance_id}:{graph_id}: connectors already spent");
-        return Ok(());
+    // Take2 spends Connector-0, Connector-D, and Guardian Connector. Recheck every input before
+    // signing so a stale Take2Ready cannot race an already-spent connector.
+    let take2_inputs =
+        graph.take2.tx().input.iter().map(|txin| txin.previous_output).collect::<Vec<OutPoint>>();
+    for previous_output in take2_inputs {
+        if let Some(spent_txid) =
+            outpoint_spent_txid(ctx.btc_client, &previous_output.txid, previous_output.vout as u64)
+                .await?
+        {
+            tracing::warn!(
+                "Ignore Take2Ready for {instance_id}:{graph_id}: take2 input {}:{} already spent by {}",
+                previous_output.txid,
+                previous_output.vout,
+                spent_txid
+            );
+            return Ok(());
+        }
     }
     let operator_assert_height = match ctx
         .btc_client

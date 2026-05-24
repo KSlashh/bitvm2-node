@@ -105,8 +105,8 @@ mod tests {
     use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, send_to_peer};
     use crate::env::get_rpc_support_actors;
     use crate::middleware::swarm::{
-        BitvmNetworkManager, BitvmSwarmWrapper, P2pMessageHandler, TickMessageType,
-        bitvmSwarmConfig,
+        BitvmNetworkManager, BitvmSwarmConfig, BitvmSwarmWrapper, P2pMessageHandler,
+        TickMessageType,
     };
     use crate::utils::{generate_local_key, save_node_info};
     use base64::Engine;
@@ -147,7 +147,7 @@ mod tests {
             local_key
         };
         let mut bitvm_network_manager = BitvmNetworkManager::new(
-            bitvmSwarmConfig {
+            BitvmSwarmConfig {
                 local_key,
                 p2p_port,
                 bootnodes,

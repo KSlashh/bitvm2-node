@@ -11,7 +11,6 @@ use crate::rpc_service::response::{
 };
 use crate::rpc_service::validation::InputValidator;
 use crate::rpc_service::{AppState, current_time_secs};
-use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::utils::{
     find_instances_by_escrow_hash, gen_instance_parameters_local, get_bridge_out_global_stats,
     parse_graph_raw_data, send_challenge_tx,
@@ -21,7 +20,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize_hex;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
-use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
+use client::goat_chain::{PeginStatus, WithdrawStatus};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use http::{HeaderMap, StatusCode};
 use sha2::{Digest, Sha256};
@@ -1137,9 +1136,9 @@ pub async fn get_ready_to_kickoff_graph(
 ///
 /// Progress data includes current/total counts for each step in multi-stage transaction processes.
 pub(crate) async fn get_graph_btc_tx_process_data<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    btc_tx_name: GraphBtcTxName,
-    graph: &Graph,
+    _storage_processor: &mut StorageProcessor<'a>,
+    _btc_tx_name: GraphBtcTxName,
+    _graph: &Graph,
 ) -> anyhow::Result<(Vec<ProgressData>, Option<String>)> {
     todo!()
 }

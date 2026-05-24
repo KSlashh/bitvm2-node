@@ -21,7 +21,7 @@ use bitvm_noded::{
 };
 
 use anyhow::Result;
-use bitvm_noded::middleware::swarm::{BitvmNetworkManager, bitvmSwarmConfig};
+use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
 use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
 use client::http_client::async_client::HttpAsyncClient;
 use futures::future;
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut task_handles: Vec<JoinHandle<Result<String, String>>> = vec![];
     // init bitvmswarm
     let bitvm_network_manager = BitvmNetworkManager::new(
-        bitvmSwarmConfig {
+        BitvmSwarmConfig {
             local_key: env::get_peer_key(),
             p2p_port: opt.p2p_port,
             bootnodes: opt.bootnodes,

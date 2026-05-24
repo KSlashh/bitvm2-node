@@ -1,11 +1,11 @@
 use crate::action::{
-    GOATMessage, GOATMessageContent, NodeInfo, push_local_unhandled_messages, send_to_peer,
+    ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, KickoffSent, NodeInfo,
+    PreKickoffSent, Take1Sent, Take2Sent, push_local_unhandled_messages, send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
-use crate::vk::get_vk;
 use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
@@ -34,7 +34,6 @@ use bitvm_lib::watchtower::*;
 use client::Utxo as ClientUtxo;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use esplora_client::Utxo;
-use futures::future::try_join_all;
 use goat::connectors::{
     base::TaprootConnector,
     kickoff_connectors::{ForceSkipConnector, KickoffConnector, PrekickoffConnector},
@@ -52,11 +51,8 @@ use rand::Rng;
 use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub const SELF_SENDER: &str = "self";
@@ -70,23 +66,21 @@ use store::{
     PeginInstanceProcessData, SerializableTxid, UInt64Array3,
 };
 use stun_client::{Attribute, Class, Client};
-use zkm_sdk::ZKMProofWithPublicValues;
-use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_vk};
+use zkm_verifier::Groth16Verifier;
 
 use crate::env;
-use crate::rpc_service::routes::v1::{
-    NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
-};
+use crate::rpc_service::routes::v1::{NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT};
 use crate::scheduled_tasks::get_goat_message_content_type;
-use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
+use crate::scheduled_tasks::graph_maintenance_tasks::{
+    ChallengeSubStatus, VerifierChallengeStatus,
+};
 use bitcoin_light_client_circuit::hash_operator_constant;
 use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use proof_builder::{
-    OperatorProofRequest, OperatorProofResponse, ProofData, WatchtowerProofRequest,
-    WatchtowerProofResponse, WatchtowerProofTimeoutUpdateRequest,
-    WatchtowerProofTimeoutUpdateResponse,
+    ProofData, WatchtowerProofRequest, WatchtowerProofResponse,
+    WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -746,8 +740,440 @@ pub(crate) async fn refresh_graph(
     graph: Option<&BitvmGcGraph>,
     scan_from_status: Option<GraphStatus>,
     scan_from_sub_status: Option<ChallengeSubStatus>,
-) -> Result<(GraphStatus, Option<ChallengeSubStatus>)> {
-    todo!("graph status refresh is pending the GC refactor")
+) -> Result<(GraphStatus, Option<ChallengeSubStatus>, Option<GraphChainScan>)> {
+    let Some(graph) = graph else {
+        let status = scan_from_status.unwrap_or(GraphStatus::OperatorPresigned);
+        return Ok((status, scan_from_sub_status, None));
+    };
+
+    let scan = scan_graph_chain_state(
+        btc_client,
+        goat_client,
+        graph,
+        scan_from_status,
+        scan_from_sub_status,
+    )
+    .await?;
+
+    if let Some(challenge_txid) = scan.challenge_txid {
+        update_graph_challenge_txid_if_needed(local_db, graph_id, challenge_txid).await?;
+    }
+
+    update_graph_status(
+        local_db,
+        instance_id,
+        graph_id,
+        scan.status,
+        Some(scan.sub_status.clone()),
+    )
+    .await?;
+
+    Ok((scan.status, Some(scan.sub_status.clone()), Some(scan)))
+}
+
+#[derive(Clone, Debug)]
+struct DetectedDisprove {
+    disprove_type: DisproveTxType,
+    index: usize,
+    challenge_start_txid: Option<Txid>,
+    challenge_finish_txid: Txid,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GraphChainScan {
+    status: GraphStatus,
+    sub_status: ChallengeSubStatus,
+    challenge_txid: Option<Txid>,
+    #[allow(dead_code)]
+    watchtower_challenge_init_on_chain: bool,
+    #[allow(dead_code)]
+    operator_assert_on_chain: bool,
+    disprove: Option<DetectedDisprove>,
+}
+
+fn normalize_challenge_sub_status(
+    mut sub_status: ChallengeSubStatus,
+    watchtower_num: usize,
+    verifier_num: usize,
+) -> ChallengeSubStatus {
+    sub_status.watchtower_challenge_status.resize(watchtower_num, false);
+    sub_status.verifier_challenge_status.resize(verifier_num, VerifierChallengeStatus::None);
+    sub_status
+}
+
+fn connector_a_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
+    graph
+        .challenge
+        .tx()
+        .input
+        .first()
+        .map(|input| input.previous_output)
+        .ok_or_else(|| anyhow!("graph challenge tx has no inputs"))
+}
+
+#[allow(dead_code)]
+fn connector_d_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
+    graph
+        .take2
+        .tx()
+        .input
+        .get(1)
+        .map(|input| input.previous_output)
+        .ok_or_else(|| anyhow!("graph take2 tx has no connector-d input"))
+}
+
+#[allow(dead_code)]
+fn guardian_connector_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
+    graph
+        .take2
+        .tx()
+        .input
+        .get(2)
+        .map(|input| input.previous_output)
+        .ok_or_else(|| anyhow!("graph take2 tx has no guardian connector input"))
+}
+
+async fn update_graph_challenge_txid_if_needed(
+    local_db: &LocalDB,
+    graph_id: Uuid,
+    challenge_txid: Txid,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    let Some(graph) = storage_processor.find_graph(&graph_id).await? else {
+        warn!("graph: {graph_id} not found, skip updating challenge txid");
+        return Ok(());
+    };
+    if graph.challenge_txid.as_ref().map(|txid| txid.0) != Some(challenge_txid) {
+        storage_processor
+            .update_graph(&GraphUpdate::new(graph_id).with_challenge_txid(challenge_txid.into()))
+            .await?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn detect_guardian_disprove(
+    btc_client: &BTCClient,
+    graph: &BitvmGcGraph,
+    challenge_start_txid: Option<Txid>,
+) -> Result<Option<DetectedDisprove>> {
+    let quick_challenge_txid = graph.quick_challenge.tx().compute_txid();
+    if tx_on_chain(btc_client, &quick_challenge_txid).await? {
+        return Ok(Some(DetectedDisprove {
+            disprove_type: DisproveTxType::QuickChallenge,
+            index: 0,
+            challenge_start_txid,
+            challenge_finish_txid: quick_challenge_txid,
+        }));
+    }
+
+    let challenge_incomplete_kickoff_txid = graph.challenge_incomplete_kickoff.tx().compute_txid();
+    if tx_on_chain(btc_client, &challenge_incomplete_kickoff_txid).await? {
+        return Ok(Some(DetectedDisprove {
+            disprove_type: DisproveTxType::ChallengeIncompleteKickoff,
+            index: 0,
+            challenge_start_txid,
+            challenge_finish_txid: challenge_incomplete_kickoff_txid,
+        }));
+    }
+    Ok(None)
+}
+
+async fn scan_graph_chain_state(
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    graph: &BitvmGcGraph,
+    scan_from_status: Option<GraphStatus>,
+    scan_from_sub_status: Option<ChallengeSubStatus>,
+) -> Result<GraphChainScan> {
+    let instance_id = graph.parameters.instance_parameters.instance_id;
+    let graph_id = graph.parameters.graph_id;
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    let verifier_num = graph.verifier_asserts.len();
+    let mut sub_status = normalize_challenge_sub_status(
+        scan_from_sub_status.unwrap_or_default(),
+        watchtower_num,
+        verifier_num,
+    );
+    let mut current_status = match scan_from_status {
+        Some(s) => s,
+        None => {
+            if graph.committee_pre_signed() {
+                GraphStatus::CommitteePresigned
+            } else {
+                return Ok(GraphChainScan {
+                    status: GraphStatus::OperatorPresigned,
+                    sub_status,
+                    challenge_txid: None,
+                    watchtower_challenge_init_on_chain: false,
+                    operator_assert_on_chain: false,
+                    disprove: None,
+                });
+            }
+        }
+    };
+
+    let prekickoff_txid = graph.cur_prekickoff.tx().compute_txid();
+    let kickoff_txid = graph.kickoff.tx().compute_txid();
+    let take1_txid = graph.take1.tx().compute_txid();
+    let take2_txid = graph.take2.tx().compute_txid();
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let operator_assert_txid = graph.operator_assert.tx().compute_txid();
+
+    // check if Graph has been posted on GoatChain
+    if current_status == GraphStatus::CommitteePresigned {
+        let graph_data_on_goat = goat_client.gateway_get_graph_data(&graph_id).await?;
+        if graph_data_on_goat.operator_pubkey != [0u8; 32] {
+            current_status = GraphStatus::OperatorDataPushed;
+        }
+    }
+    // check if Graph has been obsoleted on GoatChain
+    if current_status == GraphStatus::OperatorDataPushed {
+        let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
+        let withdraw_data = goat_client.gateway_get_withdraw_data(&graph_id).await?;
+        // NOTE: maybe obesolete graph when pegin is claimed rather than processing?
+        if pegin_data.status != PeginStatus::Withdrawable
+            && withdraw_data.status == WithdrawStatus::None
+        {
+            current_status = GraphStatus::Obsoleted;
+        }
+    }
+    // check Prekickoff
+    if matches!(
+        current_status,
+        GraphStatus::OperatorPresigned
+            | GraphStatus::CommitteePresigned
+            | GraphStatus::OperatorDataPushed
+            | GraphStatus::Obsoleted
+    ) {
+        if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+            return Ok(GraphChainScan {
+                status: current_status,
+                sub_status,
+                challenge_txid: None,
+                watchtower_challenge_init_on_chain: false,
+                operator_assert_on_chain: false,
+                disprove: None,
+            });
+        } else {
+            current_status = if current_status == GraphStatus::OperatorDataPushed {
+                GraphStatus::PreKickoff
+            } else {
+                // for GraphStatus::OperatorPresigned/CommitteePresigned:
+                // if prekickoff is on-chain while graph data not yet posted,
+                // it means this graph will never be posted and operator is going to skip it,
+                // mark it as Obsoleted so that it can be skipped later
+                //
+                // for GraphStatus::Obsoleted: if the graph is obsoleted,
+                // keep it as Obsoleted so that it can be skipped later
+                GraphStatus::Obsoleted
+            };
+        }
+    }
+    // check Kickoff/SkipKickoff
+    if matches!(current_status, GraphStatus::PreKickoff | GraphStatus::Obsoleted) {
+        let kickoff_connector_vout = 1;
+        if let Some(spent_txid) =
+            outpoint_spent_txid(btc_client, &prekickoff_txid, kickoff_connector_vout).await?
+        {
+            if spent_txid != kickoff_txid {
+                return Ok(GraphChainScan {
+                    status: GraphStatus::Skipped,
+                    sub_status,
+                    challenge_txid: None,
+                    watchtower_challenge_init_on_chain: false,
+                    operator_assert_on_chain: false,
+                    disprove: None,
+                });
+            } else {
+                current_status = GraphStatus::OperatorKickOff;
+            }
+        } else {
+            return Ok(GraphChainScan {
+                status: current_status,
+                sub_status,
+                challenge_txid: None,
+                watchtower_challenge_init_on_chain: false,
+                operator_assert_on_chain: false,
+                disprove: None,
+            });
+        }
+    }
+
+    let mut challenge_txid = None;
+    if current_status == GraphStatus::OperatorKickOff
+        && let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await?
+    {
+        sub_status.disprove_type = Some(disprove.disprove_type);
+        sub_status.disprove_index = disprove.index as i32;
+        return Ok(GraphChainScan {
+            status: GraphStatus::Disprove,
+            sub_status,
+            challenge_txid,
+            watchtower_challenge_init_on_chain: false,
+            operator_assert_on_chain: false,
+            disprove: Some(disprove),
+        });
+    }
+    if current_status == GraphStatus::OperatorKickOff {
+        let connector_a = connector_a_outpoint(graph)?;
+        if let Some(spent_txid) =
+            outpoint_spent_txid(btc_client, &connector_a.txid, connector_a.vout as u64).await?
+        {
+            if spent_txid != take1_txid {
+                current_status = GraphStatus::Challenge;
+                challenge_txid = Some(spent_txid);
+            } else {
+                return Ok(GraphChainScan {
+                    status: GraphStatus::OperatorTake1,
+                    sub_status,
+                    challenge_txid: None,
+                    watchtower_challenge_init_on_chain: false,
+                    operator_assert_on_chain: false,
+                    disprove: None,
+                });
+            }
+        } else {
+            return Ok(GraphChainScan {
+                status: GraphStatus::OperatorKickOff,
+                sub_status,
+                challenge_txid: None,
+                watchtower_challenge_init_on_chain: false,
+                operator_assert_on_chain: false,
+                disprove: None,
+            });
+        }
+    }
+
+    let mut watchtower_challenge_init_on_chain = false;
+    let mut operator_assert_on_chain = false;
+    if current_status == GraphStatus::Challenge {
+        if let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await? {
+            sub_status.disprove_type = Some(disprove.disprove_type);
+            sub_status.disprove_index = disprove.index as i32;
+            return Ok(GraphChainScan {
+                status: GraphStatus::Disprove,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: Some(disprove),
+            });
+        }
+
+        watchtower_challenge_init_on_chain =
+            tx_on_chain(btc_client, &watchtower_challenge_init_txid).await?;
+        if !watchtower_challenge_init_on_chain {
+            return Ok(GraphChainScan {
+                status: current_status,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain: false,
+                disprove: None,
+            });
+        }
+        for watchtower_index in 0..watchtower_num {
+            if outpoint_spent_txid(
+                btc_client,
+                &watchtower_challenge_init_txid,
+                watchtower_index as u64,
+            )
+            .await?
+            .is_some()
+            {
+                sub_status.watchtower_challenge_status[watchtower_index] = true;
+            }
+        }
+        operator_assert_on_chain = tx_on_chain(btc_client, &operator_assert_txid).await?;
+        if !operator_assert_on_chain {
+            return Ok(GraphChainScan {
+                status: current_status,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: None,
+            });
+        }
+        // TBD: add GraphStatus::Assert
+    }
+
+    if current_status == GraphStatus::Challenge {
+        if let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await? {
+            sub_status.disprove_type = Some(disprove.disprove_type);
+            sub_status.disprove_index = disprove.index as i32;
+            return Ok(GraphChainScan {
+                status: GraphStatus::Disprove,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: Some(disprove),
+            });
+        }
+
+        // TBD: add GraphStatus::Assert
+        let mut detected_disprove = None;
+        for verifier_index in 0..verifier_num {
+            let verifier_assert_txid = graph.verifier_asserts[verifier_index].tx().compute_txid();
+            let disprove_txid = graph.disproves[verifier_index].tx().compute_txid();
+            if tx_on_chain(btc_client, &verifier_assert_txid).await? {
+                if let Some(spent_txid) =
+                    outpoint_spent_txid(btc_client, &verifier_assert_txid, 0).await?
+                {
+                    if spent_txid == disprove_txid {
+                        sub_status.verifier_challenge_status[verifier_index] =
+                            VerifierChallengeStatus::Disproved;
+                        sub_status.disprove_type = Some(DisproveTxType::Disprove);
+                        sub_status.disprove_index = verifier_index as i32;
+                        detected_disprove = Some(DetectedDisprove {
+                            disprove_type: DisproveTxType::Disprove,
+                            index: verifier_index,
+                            challenge_start_txid: challenge_txid,
+                            challenge_finish_txid: spent_txid,
+                        });
+                        current_status = GraphStatus::Disprove;
+                    } else {
+                        sub_status.verifier_challenge_status[verifier_index] =
+                            VerifierChallengeStatus::ProverAnswered;
+                    }
+                } else {
+                    sub_status.verifier_challenge_status[verifier_index] =
+                        VerifierChallengeStatus::VerifierAsserted;
+                }
+            }
+        }
+        if current_status == GraphStatus::Disprove {
+            return Ok(GraphChainScan {
+                status: current_status,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: detected_disprove,
+            });
+        }
+        if tx_on_chain(btc_client, &take2_txid).await? {
+            return Ok(GraphChainScan {
+                status: GraphStatus::OperatorTake2,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: None,
+            });
+        }
+    }
+
+    Ok(GraphChainScan {
+        status: current_status,
+        sub_status,
+        challenge_txid,
+        watchtower_challenge_init_on_chain,
+        operator_assert_on_chain,
+        disprove: None,
+    })
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -769,24 +1195,189 @@ fn map_transition_to_event(from: GraphStatus, to: GraphStatus) -> Option<GraphCo
         (OperatorKickOff, OperatorTake1) => Some(GraphCompensateEventKind::Take1Sent),
         (OperatorKickOff, Challenge) => Some(GraphCompensateEventKind::ChallengeSent),
         (Challenge, Disprove) => Some(GraphCompensateEventKind::DisproveSent),
+        (OperatorKickOff, Disprove) => Some(GraphCompensateEventKind::DisproveSent),
         (Challenge, OperatorTake2) => Some(GraphCompensateEventKind::Take2Sent),
         _ => None,
     }
 }
 
+async fn upsert_graph_compensate_message(
+    local_db: &LocalDB,
+    graph_id: Uuid,
+    sub_type: Option<String>,
+    actor: Actor,
+    message_content: GOATMessageContent,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    upsert_message(
+        &mut storage_processor,
+        false,
+        graph_id,
+        sub_type,
+        SELF_SENDER.to_string(),
+        actor,
+        message_content,
+        0,
+        0,
+    )
+    .await
+}
+
+async fn push_graph_compensate_message(
+    local_db: &LocalDB,
+    graph_id: Uuid,
+    actor: Actor,
+    message_content: GOATMessageContent,
+) -> Result<()> {
+    let message = GOATMessage::new(actor, message_content);
+    push_local_unhandled_messages(local_db, graph_id, &message, 0).await
+}
+
+#[allow(dead_code)]
+async fn should_emit_wrongly_challenge_timeout(
+    btc_client: &BTCClient,
+    challenge_assert_txid: Txid,
+) -> Result<bool> {
+    let status = btc_client.get_tx_status(&challenge_assert_txid).await?;
+    let Some(block_height) = status.block_height else {
+        return Ok(false);
+    };
+    let current_height = btc_client.get_height().await?;
+    Ok(current_height >= block_height + disprove_timelock(get_network()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compensate_graph_events(
     local_db: &LocalDB,
-    btc_client: &BTCClient,
+    _btc_client: &BTCClient,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: Option<&BitvmGcGraph>,
+    _graph: Option<&BitvmGcGraph>,
+    scan: Option<&GraphChainScan>,
     scan_from_status: Option<GraphStatus>,
     compensate_from_status: GraphStatus,
     final_status: GraphStatus,
-    final_sub_status: Option<ChallengeSubStatus>,
 ) -> Result<()> {
-    todo!("graph compensation is pending the GC refactor")
+    let Some(scan) = scan else {
+        tracing::debug!(
+            "Skip graph compensation for {instance_id}:{graph_id}: chain scan result is missing"
+        );
+        return Ok(());
+    };
+
+    let scan_start = scan_from_status.unwrap_or(compensate_from_status);
+    let effective_from = if scan_start.is_after(&compensate_from_status) {
+        scan_start
+    } else {
+        compensate_from_status
+    };
+    if !effective_from.is_before(&final_status) {
+        tracing::debug!(
+            "Skip graph compensation for {instance_id}:{graph_id}: effective_from={effective_from:?}, final_status={final_status:?}"
+        );
+        return Ok(());
+    }
+
+    let mut rev_path = vec![final_status];
+    let mut cursor = final_status;
+    while cursor != effective_from {
+        let Some(prev) = cursor.get_previous_status() else {
+            tracing::debug!(
+                "Skip graph compensation for {instance_id}:{graph_id}: cannot walk from {final_status:?} back to {effective_from:?}"
+            );
+            return Ok(());
+        };
+        rev_path.push(prev);
+        cursor = prev;
+    }
+    rev_path.reverse();
+
+    for window in rev_path.windows(2) {
+        let [from, to] = window else {
+            continue;
+        };
+        let Some(event) = map_transition_to_event(*from, *to) else {
+            continue;
+        };
+
+        match event {
+            GraphCompensateEventKind::PreKickoffSent => {
+                push_graph_compensate_message(
+                    local_db,
+                    graph_id,
+                    Actor::Verifier,
+                    GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
+                )
+                .await?;
+            }
+            GraphCompensateEventKind::KickoffSent => {
+                push_graph_compensate_message(
+                    local_db,
+                    graph_id,
+                    Actor::All,
+                    GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
+                )
+                .await?;
+            }
+            GraphCompensateEventKind::Take1Sent => {
+                push_graph_compensate_message(
+                    local_db,
+                    graph_id,
+                    Actor::Committee,
+                    GOATMessageContent::Take1Sent(Take1Sent { instance_id, graph_id }),
+                )
+                .await?;
+            }
+            GraphCompensateEventKind::ChallengeSent => {
+                if let Some(challenge_txid) = scan.challenge_txid {
+                    push_graph_compensate_message(
+                        local_db,
+                        graph_id,
+                        Actor::Operator,
+                        GOATMessageContent::ChallengeSent(ChallengeSent {
+                            instance_id,
+                            graph_id,
+                            challenge_txid,
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            GraphCompensateEventKind::DisproveSent => {
+                let disprove = scan.disprove.clone().ok_or_else(|| {
+                    anyhow!(
+                        "Graph {instance_id}:{graph_id} reached Disprove but no disprove transaction was detected"
+                    )
+                })?;
+                upsert_graph_compensate_message(
+                    local_db,
+                    graph_id,
+                    Some(disprove.index.to_string()),
+                    Actor::Committee,
+                    GOATMessageContent::DisproveSent(DisproveSent {
+                        instance_id,
+                        graph_id,
+                        disprove_type: disprove.disprove_type,
+                        index: disprove.index,
+                        challenge_start_txid: disprove.challenge_start_txid,
+                        challenge_finish_txid: disprove.challenge_finish_txid,
+                    }),
+                )
+                .await?;
+            }
+            GraphCompensateEventKind::Take2Sent => {
+                push_graph_compensate_message(
+                    local_db,
+                    graph_id,
+                    Actor::Committee,
+                    GOATMessageContent::Take2Sent(Take2Sent { instance_id, graph_id }),
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
@@ -1156,6 +1747,7 @@ fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Ve
     .map_err(|e| anyhow!("failed to build watchtower commitment: {e}"))
 }
 
+#[allow(dead_code)]
 fn load_part_stark_vk_for_zkm_version(zkm_version: &str) -> Result<Vec<u8>> {
     catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version).to_vec()))
         .map_err(|_| anyhow!("failed to load part_stark_vk for zkm_version {zkm_version}"))
@@ -1214,11 +1806,11 @@ pub async fn get_watchtower_commitment(
     }
 }
 
-#[tracing::instrument(name = "get_watchtower_challenge_info", skip(btc_client))]
+#[tracing::instrument(name = "get_watchtower_challenge_info", skip(_btc_client))]
 pub async fn get_watchtower_challenge_info(
-    btc_client: &BTCClient,
-    watchtower_challenge_init_txid: &SerializableTxid,
-    num_watchtowers: usize,
+    _btc_client: &BTCClient,
+    _watchtower_challenge_init_txid: &SerializableTxid,
+    _num_watchtowers: usize,
 ) -> Result<(Vec<String>, Vec<bool>)> {
     todo!("watchtower challenge proof input is pending the GC refactor")
 }
@@ -1226,28 +1818,15 @@ pub async fn get_watchtower_challenge_info(
 /// - `Ok(Some(OperatorProof), _)` if operator proof is available
 /// - `Ok(None, wait_secs)` if operator proof is not yet available, with suggested wait time
 pub async fn get_operator_proof(
-    local_db: &LocalDB,
-    http_client: &HttpAsyncClient,
-    bitvm_graph: &BitvmGcGraph,
-    btc_client: &BTCClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    operator_committed_blockhash: String,
+    _local_db: &LocalDB,
+    _http_client: &HttpAsyncClient,
+    _bitvm_graph: &BitvmGcGraph,
+    _btc_client: &BTCClient,
+    _instance_id: Uuid,
+    _graph_id: Uuid,
+    _operator_committed_blockhash: String,
 ) -> Result<(Option<(GuestInputs, Groth16Proof, PublicInputs, VerifyingKey)>, usize)> {
     todo!("operator proof assembly is pending the GC refactor")
-}
-
-fn embed_txin_into_dummy_tx(txin: &TxIn) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version(2),
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![txin.clone()],
-        output: vec![],
-    }
-}
-
-fn extract_txin_from_dummy_tx(tx: &Transaction) -> TxIn {
-    tx.input[0].clone()
 }
 
 pub async fn verifier_force_skip_kickoff(client: &BTCClient, graph: &BitvmGcGraph) -> Result<Txid> {
@@ -1836,7 +2415,7 @@ pub async fn build_prekickoff_params(
 }
 
 pub async fn build_graph_params(
-    local_db: &LocalDB,
+    _local_db: &LocalDB,
     goat_client: &GOATClient,
     instance_parameters: BitvmGcInstanceParameters,
     prekickoff_parameters: PrekickoffParameters,
@@ -1852,7 +2431,7 @@ pub async fn build_graph_params(
         node_p2wsh_address(instance_parameters.network, &operator_pubkey);
     let operator_wots_pubkeys = operator_master_key.wots_keypair_for_graph(graph_id).1;
     let watchtower_pubkeys = goat_client.committee_mana_get_watchtowers().await?;
-    let guest_constant_value = get_guest_constant_value(instance_id, graph_id)?;
+    let _guest_constant_value = get_guest_constant_value(instance_id, graph_id)?;
     Ok(BitvmGcGraphParameters {
         instance_parameters,
         prekickoff_parameters,
@@ -3585,7 +4164,7 @@ pub async fn get_largest_watchtower_challenge_block(
     let mut largest_watchtower_challenge_block_hash: BlockHash =
         BlockHash::from_slice(&[0u8; 32]).unwrap();
     for watchtower_index in 0..graph.parameters.watchtower_pubkeys.len() {
-        let watchtower_challenge_vout = 2 * watchtower_index as u32;
+        let watchtower_challenge_vout = watchtower_index as u32;
         match outpoint_spent_txid(
             btc_client,
             &watchtower_challenge_init_txid,
@@ -3622,167 +4201,4 @@ pub async fn get_largest_watchtower_challenge_block(
         }
     }
     Ok(largest_watchtower_challenge_block_hash)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    async fn build_large_nonstandard_tx_for_debug(
-        btc_client: &BTCClient,
-        node_keypair: &Keypair,
-        payload_size: usize,
-    ) -> Result<Transaction> {
-        let mut msg = "large_opreturn_msg".to_string().as_bytes().to_vec();
-        msg.extend(vec![0u8; payload_size - msg.len()]);
-        let scr = script! {
-            OP_RETURN
-            {msg}
-        }
-        .compile();
-        let mut tx = Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![TxOut { value: Amount::ZERO, script_pubkey: scr }],
-        };
-
-        let node_pubkey: PublicKey = node_keypair.public_key().into();
-        let node_address = node_p2wsh_address(get_network(), &node_pubkey);
-
-        let (inputs, _, change_amount) = get_proper_utxo_set(
-            btc_client,
-            tx.weight().to_vbytes_ceil(),
-            node_address.clone(),
-            Amount::ZERO,
-            1.0,
-        )
-        .await?
-        .ok_or_else(|| {
-            anyhow!("insufficient UTXOs on {} for debug nonstandard tx test", node_address)
-        })?;
-
-        for input in &inputs {
-            tx.input.push(TxIn {
-                previous_output: input.outpoint,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::default(),
-            });
-        }
-
-        if change_amount > Amount::from_sat(DUST_AMOUNT) {
-            tx.output
-                .push(TxOut { script_pubkey: node_address.script_pubkey(), value: change_amount });
-        }
-
-        for (i, input) in inputs.iter().enumerate() {
-            node_sign(&mut tx, i, input.amount, EcdsaSighashType::All, node_keypair)?;
-        }
-
-        Ok(tx)
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn debug_test_broadcast_nonstandard_tx_and_check_mempool_visibility() -> Result<()> {
-        if std::env::var(ENV_BITVM_SECRET).is_err() {
-            bail!("BITVM_SECRET is required and should correspond to a funded testnet key");
-        }
-
-        let network = get_network();
-        if network != Network::Testnet4 {
-            bail!("refuse to run this debug test on non-testnet4 network: {network}");
-        }
-
-        let btc_url =
-            get_btc_url_from_env().unwrap_or_else(|| "https://mempool.space/testnet4".to_string());
-        let btc_client = BTCClient::new(network, Some(&btc_url));
-        let node_keypair = get_bitvm_key()?;
-
-        // Use an oversized OP_RETURN payload to make tx non-standard for regular mempool relay.
-        let tx = build_large_nonstandard_tx_for_debug(&btc_client, &node_keypair, 200_000).await?;
-        let txid = tx.compute_txid();
-        println!(
-            "debug nonstandard tx built: txid={}, vbytes={}",
-            txid,
-            tx.weight().to_vbytes_ceil()
-        );
-
-        let normal_err = broadcast_tx(&btc_client, &tx).await.err().ok_or_else(|| {
-            anyhow!("expected normal mempool broadcast to fail for non-standard tx")
-        })?;
-        println!("normal broadcast failed as expected: {normal_err:#}");
-
-        broadcast_nonstandard_tx(&btc_client, &tx).await?;
-        println!("broadcast_nonstandard_tx succeeded for non-standard tx");
-
-        let mut found_in_mempool = false;
-        for _ in 0..10 {
-            if btc_client.get_tx(&txid).await?.is_some() {
-                found_in_mempool = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-
-        if found_in_mempool {
-            println!(
-                "successfully found non-standard tx in mempool after broadcast_nonstandard_tx"
-            );
-        } else {
-            println!("failed to find non-standard tx in mempool after broadcast_nonstandard_tx");
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "test on regtest"]
-    async fn test_get_watchtower_challenge_info() {
-        let init_txid =
-            Txid::from_str("2bb03cb075c95d94c298d139242bcd42c366b7105df34591e77e3ac11ac29386")
-                .unwrap();
-        let init_txid = SerializableTxid(init_txid);
-        let number_challenge = 2;
-        let esplora_url = "http://localhost:13002".to_string();
-        let btc_client = BTCClient::new(get_network(), Some(&esplora_url));
-
-        let result =
-            get_watchtower_challenge_info(&btc_client, &init_txid, number_challenge).await.unwrap();
-        println!("result: {result:#?}");
-    }
-
-    #[test]
-    fn test_operator_proof_request_url() {
-        unsafe {
-            std::env::set_var(ENV_PROOF_BUILD_URL, "http://127.0.0.1:8900");
-        }
-
-        let base_url = Url::parse(
-            &get_proof_build_rpc_host()
-                .ok_or_else(|| anyhow::anyhow!("failed to get proof_build_rpc_host"))
-                .unwrap(),
-        )
-        .unwrap();
-        unsafe {
-            std::env::remove_var(ENV_PROOF_BUILD_URL);
-        }
-        let url = base_url.join(NODES_OPERATOR_BASE).unwrap();
-
-        assert_eq!(url.as_str(), "http://127.0.0.1:8900/v1/proofs/operator_proofs");
-    }
-
-    #[test]
-    fn test_load_part_stark_vk_for_zkm_version_accepts_known_version() {
-        let part_stark_vk = load_part_stark_vk_for_zkm_version("v1.2.4").unwrap();
-        assert!(!part_stark_vk.is_empty());
-    }
-
-    #[test]
-    fn test_load_part_stark_vk_for_zkm_version_rejects_unknown_version_without_panic() {
-        let err = load_part_stark_vk_for_zkm_version("v0.0.0-test").unwrap_err();
-        assert!(err.to_string().contains("failed to load part_stark_vk"));
-    }
 }

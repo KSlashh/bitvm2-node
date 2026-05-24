@@ -53,6 +53,7 @@ pub enum GOATMessageContent {
     PreKickoffSent(PreKickoffSent),
     ChallengeSent(ChallengeSent),
     WatchtowerChallengeInitSent(WatchtowerChallengeInitSent),
+    WatchtowerChallengeSent(WatchtowerChallengeSent),
     AssertReady(AssertReady),
     AssertSent(AssertSent),
     ChallengeAssertSent(ChallengeAssertSent),
@@ -195,6 +196,12 @@ pub struct ChallengeSent {
 pub struct WatchtowerChallengeInitSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WatchtowerChallengeSent {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub watchtower_index: usize,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AssertReady {

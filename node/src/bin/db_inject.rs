@@ -97,6 +97,7 @@ fn infer_business_id(content: &GOATMessageContent) -> Option<Uuid> {
         GOATMessageContent::PreKickoffSent(v) => Some(v.graph_id),
         GOATMessageContent::ChallengeSent(v) => Some(v.graph_id),
         GOATMessageContent::WatchtowerChallengeInitSent(v) => Some(v.graph_id),
+        GOATMessageContent::WatchtowerChallengeSent(v) => Some(v.graph_id),
         GOATMessageContent::AssertReady(v) => Some(v.graph_id),
         GOATMessageContent::AssertSent(v) => Some(v.graph_id),
         GOATMessageContent::ChallengeAssertSent(v) => Some(v.graph_id),
