@@ -55,6 +55,7 @@ use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -73,7 +74,8 @@ use zkm_verifier::Groth16Verifier;
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
-    NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT, PROOFS_WRAPPER_PROOF,
+    NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
+    PROOFS_WRAPPER_PROOF,
 };
 use crate::scheduled_tasks::get_goat_message_content_type;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
@@ -99,13 +101,14 @@ use store::{
 use stun_client::{Attribute, Class, Client};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zkm_sdk::ZKMProofWithPublicValues;
+use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_vk};
 
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
 
-pub struct GuestInputs;
-pub struct Groth16Proof;
-pub struct PublicInputs;
-pub struct VerifyingKey;
+pub type VerifyingKey = ark_groth16::VerifyingKey<ark_bn254::Bn254>;
+pub type Groth16Proof = ark_groth16::Proof<ark_bn254::Bn254>;
+pub type PublicInputs = Vec<ark_bn254::Fr>;
 
 pub mod todo_funcs {
     #![allow(dead_code, unreachable_code, unused_variables)]
@@ -1877,13 +1880,18 @@ pub async fn get_operator_proof(
     }
 }
 
+fn load_part_stark_vk_for_zkm_version(zkm_version: &str) -> Result<Vec<u8>> {
+    catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version).to_vec()))
+        .map_err(|_| anyhow!("failed to load part_stark_vk for zkm_version {zkm_version}"))
+}
+
 /// Returns:
 /// - `Ok(Some(WrapperProof), _)` if wrapper proof is available
 /// - `Ok(None, wait_secs)` if operator or wrapper proof is not yet available
 pub async fn get_operator_wrapper_proof(
     local_db: &LocalDB,
     http_client: &HttpAsyncClient,
-    bitvm_graph: &Bitvm2Graph,
+    bitvm_graph: &BitvmGcGraph,
     btc_client: &BTCClient,
     instance_id: Uuid,
     graph_id: Uuid,

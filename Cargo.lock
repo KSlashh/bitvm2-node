@@ -8086,7 +8086,7 @@ version = "0.3.3"
 dependencies = [
  "anyhow",
  "bincode",
- "bitcoin 0.32.8",
+ "bitcoin",
  "bitcoin-light-client-circuit",
  "clap",
  "dotenv",
@@ -9187,7 +9187,7 @@ name = "proof-builder"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "bitcoin 0.32.8",
+ "bitcoin",
  "commit-chain",
  "header-chain",
  "serde",
