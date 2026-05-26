@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Transaction, TxIn, key::Keypair};
 use bitcoin::{Network, OutPoint, PublicKey, Witness, XOnlyPublicKey};
-use goat::assert_scripts::{OperatorAssertPublicKey, OperatorAssertSecretKey};
+use goat::assert_scripts::{Label, OperatorAssertPublicKey, OperatorAssertSecretKey};
 use goat::connectors::assert_connectors::{ProverConnector, VerifierConnector};
 use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_a::ConnectorA;
@@ -234,7 +234,7 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         let prover_connector = ProverConnector::new(
             network,
             n_of_n_taproot_public_key,
-            params.gc_data[i].final_msg_hash,
+            params.gc_data[i].final_msg_hashlocks.clone(),
         );
         let verifier_assert = VerifierAssertTransaction::new_for_validation(
             verifier_connector,
@@ -518,7 +518,7 @@ pub fn operator_sign_assert(
 pub fn operator_sign_wrongly_challenged(
     graph: &BitvmGcGraph,
     verifier_index: usize,
-    final_msg: &[u8],
+    final_msgs: &[Label],
 ) -> Result<(TxIn, Amount)> {
     if verifier_index >= graph.verifier_asserts.len() {
         bail!("invalid verifier index {verifier_index}".to_string())
@@ -530,7 +530,7 @@ pub fn operator_sign_wrongly_challenged(
     let prover_connector = ProverConnector::new(
         network,
         n_of_n_taproot_public_key,
-        graph.parameters.gc_data[verifier_index].final_msg_hash,
+        graph.parameters.gc_data[verifier_index].final_msg_hashlocks.clone(),
     );
     let input = Input {
         outpoint: OutPoint {
@@ -540,7 +540,7 @@ pub fn operator_sign_wrongly_challenged(
         amount: graph.verifier_asserts[verifier_index].tx().output[0].value,
     };
 
-    wrongly_challenged(&prover_connector, &input, final_msg)
+    wrongly_challenged(&prover_connector, &input, final_msgs)
         .map(|txin| (txin, input.amount))
         .map_err(|e| anyhow::anyhow!("failed to sign wrongly challenged: {e}"))
 }

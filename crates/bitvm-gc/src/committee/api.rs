@@ -313,7 +313,7 @@ pub fn push_committee_pre_signatures(
         let prover_connector = ProverConnector::new(
             network,
             n_of_n_taproot_public_key,
-            graph.parameters.gc_data[i].final_msg_hash,
+            graph.parameters.gc_data[i].final_msg_hashlocks.clone(),
         );
         disprove_tx.push_pre_sigs(
             &prover_connector,
