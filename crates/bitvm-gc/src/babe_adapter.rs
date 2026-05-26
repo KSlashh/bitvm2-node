@@ -8,7 +8,7 @@ use ark_bn254::{Bn254, Fq, Fr};
 use ark_groth16::VerifyingKey as Groth16VerifyingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use garbled_snark_verifier::bag::S;
-use goat::assert_scripts::{INPUT_WIRE_NUM, WireHash};
+use goat::assert_scripts::{INPUT_WIRE_NUM, WireHash, label_hash};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use verifiable_circuit_babe::babe::WeKnownPi1SetupCt as RealSetupCt;
@@ -33,6 +33,9 @@ use crate::types::BitvmGcCircuitData;
 
 /// Number of Lamport signature fragments expected by the current operator assert witness.
 pub const LAMPORT_SIG_COUNT: usize = 508;
+pub const BABE_N_CC: usize = 181;
+// TODO: use verifiable_circuit_babe::babe::M_CC instead
+pub const BABE_M_CC: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CACSetupPackage {
@@ -144,7 +147,7 @@ pub struct BabeChallengeAssertWitness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BabeWronglyChallengedWitness {
     pub verifier_index: usize,
-    pub msg: Vec<u8>,
+    pub final_msgs: Vec<Vec<u8>>,
 }
 
 impl CACInstanceCommit {
@@ -360,8 +363,8 @@ pub fn extract_gc_circuit_data(
     soldering: &SolderingData,
     verifier_pubkey: bitcoin::PublicKey,
 ) -> Result<BitvmGcCircuitData> {
-    if finalized.len() != 1 {
-        bail!("each verifier must contribute exactly one finalized GC slot");
+    if finalized.len() != BABE_M_CC {
+        bail!("each verifier must contribute exactly {BABE_M_CC} finalized BABE instances");
     }
     if soldering.finalized_indices != finalized.iter().map(|data| data.index).collect::<Vec<_>>() {
         bail!("soldering finalized indices mismatch");
@@ -374,7 +377,11 @@ pub fn extract_gc_circuit_data(
                 wire_hashes.len()
             )
         })?;
-    Ok(BitvmGcCircuitData { verifier_pubkey, final_msg_hash: data.final_msg_hash, wire_hashes })
+    Ok(BitvmGcCircuitData {
+        verifier_pubkey,
+        final_msg_hashes: finalized.iter().map(|data| data.final_msg_hash).collect(),
+        wire_hashes,
+    })
 }
 
 /// Builds a placeholder BABE assert witness from serialized proof bytes.
@@ -396,8 +403,8 @@ pub fn build_challenge_assert_witness(
     assert_witness: &BabeAssertWitness,
     verifier_index: usize,
 ) -> Result<BabeChallengeAssertWitness> {
-    if verifier_index >= verifier_state.finalized_indices.len() {
-        bail!("verifier index {verifier_index} out of range");
+    if verifier_state.finalized_indices.len() != BABE_M_CC {
+        bail!("verifier state must contain exactly {BABE_M_CC} finalized BABE instances");
     }
     if assert_witness.pi1.is_empty() || assert_witness.lamport_sig.is_empty() {
         bail!("invalid assert witness");
@@ -411,25 +418,36 @@ pub fn build_challenge_assert_witness(
     })
 }
 
-/// Builds a placeholder wrongly-challenged witness for the challenged verifier index.
+/// Builds a wrongly-challenged witness from all recovered finalized-message preimages.
 pub fn build_wrongly_challenged_witness(
     prover_state: &BabeProverState,
     challenge_witness: &BabeChallengeAssertWitness,
+    final_msgs: Vec<Vec<u8>>,
 ) -> Result<BabeWronglyChallengedWitness> {
-    build_wrongly_challenged_witness_from_h_msgs(&prover_state.h_msgs, challenge_witness)
+    build_wrongly_challenged_witness_from_preimages(
+        &prover_state.h_msgs,
+        challenge_witness,
+        final_msgs,
+    )
 }
 
-/// Builds a placeholder wrongly-challenged witness directly from finalized message hashes.
-pub fn build_wrongly_challenged_witness_from_h_msgs(
+/// Builds a wrongly-challenged witness after validating all preimages in finalized order.
+pub fn build_wrongly_challenged_witness_from_preimages(
     h_msgs: &[[u8; 20]],
     challenge_witness: &BabeChallengeAssertWitness,
+    final_msgs: Vec<Vec<u8>>,
 ) -> Result<BabeWronglyChallengedWitness> {
-    let Some(msg) = h_msgs.get(challenge_witness.verifier_index) else {
-        bail!("challenge verifier index out of range");
-    };
+    if h_msgs.len() != BABE_M_CC || final_msgs.len() != BABE_M_CC {
+        bail!("wrongly challenged witness must contain exactly {BABE_M_CC} finalized preimages");
+    }
+    for (position, (expected_hash, msg)) in h_msgs.iter().zip(&final_msgs).enumerate() {
+        if label_hash(msg) != *expected_hash {
+            bail!("message at finalized position {position} is not a valid preimage");
+        }
+    }
     Ok(BabeWronglyChallengedWitness {
         verifier_index: challenge_witness.verifier_index,
-        msg: msg.to_vec(),
+        final_msgs,
     })
 }
 

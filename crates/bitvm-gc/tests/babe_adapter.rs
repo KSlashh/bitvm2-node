@@ -1,11 +1,12 @@
 use ark_bn254::Fr;
 use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
 use ark_groth16::Groth16;
+use bitvm_gc::assert_scripts::label_hash;
 use bitvm_gc::babe_adapter::{
-    BabeChallengeAssertWitness, BabeProverState, BabeVerifierState, CACInstanceCommit,
+    BABE_M_CC, BabeChallengeAssertWitness, BabeProverState, BabeVerifierState, CACInstanceCommit,
     CACSetupPackage, FinalizedInstanceData, LAMPORT_SIG_COUNT, SolderingData, build_assert_witness,
     build_challenge_assert_witness, build_real_setup_package, build_setup_package,
-    build_wrongly_challenged_witness, build_wrongly_challenged_witness_from_h_msgs,
+    build_wrongly_challenged_witness, build_wrongly_challenged_witness_from_preimages,
     derive_finalized_indices, extract_gc_circuit_data, open_and_solder, open_real_setup_and_solder,
     verify_real_setup, verify_setup,
 };
@@ -36,16 +37,17 @@ fn real_setup_restores_private_state_and_refuses_unverified_soldering_proof() {
     let public_inputs = vec![a * b];
 
     let (package, private_state) =
-        build_real_setup_package(1, &vk, &public_inputs).expect("real setup");
+        build_real_setup_package(BABE_M_CC, &vk, &public_inputs).expect("real setup");
     let restored =
         serde_json::from_slice(&serde_json::to_vec(&private_state).expect("serialize state"))
             .expect("deserialize state");
+    let finalized_indices = (0..BABE_M_CC).collect::<Vec<_>>();
     let (opened, finalized, soldering) =
-        open_real_setup_and_solder(&restored, &package, &[0], &vk, &public_inputs)
+        open_real_setup_and_solder(&restored, &package, &finalized_indices, &vk, &public_inputs)
             .expect("open real setup");
 
     assert!(opened.is_empty());
-    assert_eq!(finalized.len(), 1);
+    assert_eq!(finalized.len(), BABE_M_CC);
     let error = verify_real_setup(&package, &opened, &finalized, &soldering, &vk, &public_inputs)
         .expect_err("soldering proof must not be treated as verified");
     assert!(error.to_string().contains("soldering proof"));
@@ -59,40 +61,69 @@ fn real_setup_restores_private_state_and_refuses_unverified_soldering_proof() {
 #[test]
 fn babe_setup_payload_round_trips_and_derives_gc_data() {
     let package = CACSetupPackage {
-        commits: vec![
-            CACInstanceCommit::sample(1),
-            CACInstanceCommit::sample(2),
-            CACInstanceCommit::sample(3),
-            CACInstanceCommit::sample(4),
-        ],
+        commits: (0..BABE_M_CC).map(|index| CACInstanceCommit::sample(index as u8)).collect(),
     };
 
     let encoded = serde_json::to_vec(&package).expect("serialize package");
     let decoded: CACSetupPackage = serde_json::from_slice(&encoded).expect("deserialize package");
     assert_eq!(decoded, package);
 
-    let finalized_indices = derive_finalized_indices(&decoded, 1).expect("derive finalized");
-    assert_eq!(finalized_indices.len(), 1);
+    let finalized_indices =
+        derive_finalized_indices(&decoded, BABE_M_CC).expect("derive finalized");
+    assert_eq!(finalized_indices.len(), BABE_M_CC);
 
-    let finalized = vec![FinalizedInstanceData::sample(finalized_indices[0])];
+    let finalized = finalized_indices
+        .iter()
+        .map(|index| FinalizedInstanceData::sample(*index))
+        .collect::<Vec<_>>();
     let soldering = SolderingData::sample(finalized_indices);
     let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey())
         .expect("extract gc data");
 
     assert_eq!(gc_data.verifier_pubkey, verifier_pubkey());
+    assert_eq!(gc_data.final_msg_hashes.len(), BABE_M_CC);
 }
 
 #[test]
-fn each_verifier_contributes_exactly_one_gc_slot() {
-    let finalized = vec![FinalizedInstanceData::sample(0), FinalizedInstanceData::sample(1)];
-    let soldering = SolderingData::sample(vec![0, 1]);
+fn protocol_finalized_instances_contribute_one_base_wire_slot() {
+    let finalized = (0..BABE_M_CC).map(FinalizedInstanceData::sample).collect::<Vec<_>>();
+    let soldering = SolderingData::sample((0..BABE_M_CC).collect());
 
-    let error = match extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey()) {
-        Ok(_) => panic!("multiple graph slots from one verifier must be rejected"),
+    let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey())
+        .expect("one verifier graph slot");
+
+    assert_eq!(BABE_M_CC, 4);
+    assert_eq!(
+        gc_data.final_msg_hashes,
+        finalized.iter().map(|data| data.final_msg_hash).collect::<Vec<_>>()
+    );
+    assert!(gc_data.wire_hashes.as_slice() == finalized[0].wire_hashes.as_slice());
+}
+
+#[test]
+fn gc_slot_rejects_invalid_finalized_counts_and_soldering_order() {
+    for count in [1, 3, 5, 8] {
+        let finalized = (0..count).map(FinalizedInstanceData::sample).collect::<Vec<_>>();
+        let soldering = SolderingData::sample((0..count).collect());
+        let error = match extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey()) {
+            Ok(_) => panic!("invalid finalized count"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&format!("exactly {BABE_M_CC} finalized")));
+    }
+
+    let finalized = (0..BABE_M_CC).map(FinalizedInstanceData::sample).collect::<Vec<_>>();
+    let mut indices = (0..BABE_M_CC).collect::<Vec<_>>();
+    indices.swap(0, 1);
+    let error = match extract_gc_circuit_data(
+        &finalized,
+        &SolderingData::sample(indices),
+        verifier_pubkey(),
+    ) {
+        Ok(_) => panic!("mismatched soldering order"),
         Err(error) => error,
     };
-
-    assert!(error.to_string().contains("exactly one finalized"));
+    assert!(error.to_string().contains("soldering finalized indices mismatch"));
 }
 
 #[test]
@@ -146,54 +177,79 @@ fn witness_builders_validate_inputs_and_indices() {
     assert!(build_assert_witness(&[]).is_err());
 
     let verifier_state = BabeVerifierState {
-        package: build_setup_package(3).expect("setup package"),
-        finalized_indices: vec![0, 1],
+        package: build_setup_package(BABE_M_CC).expect("setup package"),
+        finalized_indices: (0..BABE_M_CC).collect(),
         verifier_pubkey: verifier_pubkey(),
     };
-    let challenge_witness = build_challenge_assert_witness(&verifier_state, &assert_witness, 1)
+    let challenge_witness = build_challenge_assert_witness(&verifier_state, &assert_witness, 12)
         .expect("challenge witness");
-    assert_eq!(challenge_witness.verifier_index, 1);
-    assert!(build_challenge_assert_witness(&verifier_state, &assert_witness, 2).is_err());
+    assert_eq!(challenge_witness.verifier_index, 12);
 
+    let final_msgs = (0..BABE_M_CC)
+        .map(|index| format!("finalized-preimage-{index}").into_bytes())
+        .collect::<Vec<_>>();
+    let h_msgs = final_msgs.iter().map(label_hash).collect::<Vec<_>>();
     let prover_state = BabeProverState {
-        package: build_setup_package(3).expect("setup package"),
-        finalized: vec![FinalizedInstanceData::sample(0), FinalizedInstanceData::sample(1)],
-        soldering: SolderingData::sample(vec![0, 1]),
-        h_msgs: vec![[1u8; 20], [2u8; 20]],
+        package: build_setup_package(BABE_M_CC).expect("setup package"),
+        finalized: (0..BABE_M_CC).map(FinalizedInstanceData::sample).collect(),
+        soldering: SolderingData::sample((0..BABE_M_CC).collect()),
+        h_msgs,
     };
-    let wrongly_challenged = build_wrongly_challenged_witness(&prover_state, &challenge_witness)
-        .expect("wrongly challenged witness");
-    assert_eq!(wrongly_challenged.msg, vec![2u8; 20]);
-
-    let out_of_range_challenge =
-        BabeChallengeAssertWitness { verifier_index: 3, input_labels: vec![], lamport_sig: vec![] };
-    assert!(build_wrongly_challenged_witness(&prover_state, &out_of_range_challenge).is_err());
+    let wrongly_challenged =
+        build_wrongly_challenged_witness(&prover_state, &challenge_witness, final_msgs.clone())
+            .expect("wrongly challenged witness");
+    assert_eq!(wrongly_challenged.verifier_index, 12);
+    assert_eq!(wrongly_challenged.final_msgs, final_msgs);
+    assert!(
+        build_wrongly_challenged_witness(
+            &prover_state,
+            &challenge_witness,
+            vec![b"missing-preimage".to_vec()],
+        )
+        .is_err()
+    );
 }
 
 #[test]
-fn wrongly_challenged_witness_can_be_built_directly_from_h_msgs() {
-    let h_msgs = vec![[1u8; 20], [2u8; 20]];
+fn wrongly_challenged_witness_requires_all_preimages_in_finalized_order() {
+    let final_msgs = (0..BABE_M_CC)
+        .map(|index| format!("finalized-preimage-{index}").into_bytes())
+        .collect::<Vec<_>>();
+    let h_msgs = final_msgs.iter().map(label_hash).collect::<Vec<_>>();
     let challenge_witness =
-        BabeChallengeAssertWitness { verifier_index: 1, input_labels: vec![], lamport_sig: vec![] };
+        BabeChallengeAssertWitness { verifier_index: 0, input_labels: vec![], lamport_sig: vec![] };
 
-    let from_h_msgs = build_wrongly_challenged_witness_from_h_msgs(&h_msgs, &challenge_witness)
-        .expect("wrongly challenged witness");
-    assert_eq!(from_h_msgs.verifier_index, 1);
-    assert_eq!(from_h_msgs.msg, vec![2u8; 20]);
+    let from_preimages = build_wrongly_challenged_witness_from_preimages(
+        &h_msgs,
+        &challenge_witness,
+        final_msgs.clone(),
+    )
+    .expect("wrongly challenged witness");
+    assert_eq!(from_preimages.verifier_index, 0);
+    assert_eq!(from_preimages.final_msgs, final_msgs);
 
     let prover_state = BabeProverState {
-        package: build_setup_package(2).expect("setup package"),
-        finalized: vec![FinalizedInstanceData::sample(0), FinalizedInstanceData::sample(1)],
-        soldering: SolderingData::sample(vec![0, 1]),
+        package: build_setup_package(BABE_M_CC).expect("setup package"),
+        finalized: (0..BABE_M_CC).map(FinalizedInstanceData::sample).collect(),
+        soldering: SolderingData::sample((0..BABE_M_CC).collect()),
         h_msgs,
     };
-    let delegated = build_wrongly_challenged_witness(&prover_state, &challenge_witness)
-        .expect("delegated wrongly challenged witness");
-    assert_eq!(delegated, from_h_msgs);
+    let delegated = build_wrongly_challenged_witness(
+        &prover_state,
+        &challenge_witness,
+        from_preimages.final_msgs.clone(),
+    )
+    .expect("delegated wrongly challenged witness");
+    assert_eq!(delegated, from_preimages);
 
-    let out_of_range =
-        BabeChallengeAssertWitness { verifier_index: 2, input_labels: vec![], lamport_sig: vec![] };
+    let mut wrong_order = from_preimages.final_msgs.clone();
+    wrong_order.swap(0, 1);
     assert!(
-        build_wrongly_challenged_witness_from_h_msgs(&prover_state.h_msgs, &out_of_range).is_err()
+        build_wrongly_challenged_witness_from_preimages(
+            &prover_state.h_msgs,
+            &challenge_witness,
+            wrong_order,
+        )
+        .is_err()
     );
 }

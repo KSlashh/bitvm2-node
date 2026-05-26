@@ -83,8 +83,6 @@ pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
 // TODO: remove it
 pub const ENV_BABE_SETUP_PUBLIC_INPUTS: &str = "BABE_SETUP_PUBLIC_INPUTS";
-pub const BABE_N_CC: usize = 181;
-pub const BABE_M_CC: usize = 4;
 pub const ENV_GC_GATES_PATH: &str = "GC_GATES_PATH";
 pub const ENV_GC_INDICES_PATH: &str = "GC_INDICES_PATH";
 

@@ -81,7 +81,8 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
 };
 use bitcoin_light_client_circuit::hash_operator_constant;
 use bitvm_lib::babe_adapter::{
-    BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData, SolderingData,
+    BabeProverState, BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData,
+    SolderingData,
 };
 use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
@@ -4487,6 +4488,8 @@ pub struct OperatorVerifierCandidate {
     pub verifier_index: Option<usize>,
     pub selected_circuit_indexes: Vec<usize>,
     pub gc_data: Option<BitvmGcCircuitData>,
+    #[serde(default)]
+    pub prover_state: Option<BabeProverState>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

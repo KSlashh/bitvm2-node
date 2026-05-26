@@ -1,7 +1,7 @@
 use crate::action::*;
 use crate::env::{
-    BABE_M_CC, BABE_N_CC, COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths,
-    get_babe_setup_public_inputs, get_bitvm_key, get_node_goat_address, is_relayer,
+    COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_babe_setup_public_inputs,
+    get_bitvm_key, get_node_goat_address, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
@@ -12,9 +12,10 @@ use bitcoin::{OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
-    BabeAssertWitness, BabeChallengeAssertWitness, CACSetupPackage, FinalizedInstanceData,
-    SolderingData, build_assert_witness, build_real_setup_package, derive_finalized_indices,
-    extract_gc_circuit_data, open_real_setup_and_solder, verify_real_setup,
+    BABE_M_CC, BABE_N_CC, BabeAssertWitness, BabeChallengeAssertWitness, BabeProverState,
+    CACSetupPackage, FinalizedInstanceData, SolderingData, build_assert_witness,
+    build_real_setup_package, derive_finalized_indices, extract_gc_circuit_data,
+    open_real_setup_and_solder, verify_real_setup,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::*;
@@ -607,6 +608,7 @@ fn record_candidate_gc_data(
     verifier_index: usize,
     setup_package: &CACSetupPackage,
     gc_data: BitvmGcCircuitData,
+    prover_state: BabeProverState,
 ) -> Result<Option<Vec<BitvmGcCircuitData>>> {
     let frozen = state
         .frozen_verifier_pubkeys
@@ -632,12 +634,33 @@ fn record_candidate_gc_data(
     if candidate.setup_package != *setup_package {
         bail!("soldering proof setup package does not match selected verifier candidate");
     }
+    if prover_state.package != *setup_package {
+        bail!("BABE prover state setup package does not match selected verifier candidate");
+    }
+    if candidate.selected_circuit_indexes != prover_state.soldering.finalized_indices {
+        bail!("BABE prover state finalized indices do not match selected verifier cut");
+    }
+    if prover_state.finalized.len() != BABE_M_CC || prover_state.h_msgs.len() != BABE_M_CC {
+        bail!("BABE prover state must contain exactly {BABE_M_CC} finalized instances and hashes");
+    }
+    if prover_state.h_msgs != gc_data.final_msg_hashes {
+        bail!("BABE prover state hashes do not match GC slot hashes");
+    }
     if let Some(existing) = &candidate.gc_data {
         if existing != &gc_data {
             bail!("conflicting GC slot received for selected verifier");
         }
-    } else {
+    }
+    if let Some(existing) = &candidate.prover_state {
+        if existing != &prover_state {
+            bail!("conflicting BABE prover state received for selected verifier");
+        }
+    }
+    if candidate.gc_data.is_none() {
         candidate.gc_data = Some(gc_data);
+    }
+    if candidate.prover_state.is_none() {
+        candidate.prover_state = Some(prover_state);
     }
     if state.candidates.iter().any(|candidate| candidate.gc_data.is_none()) {
         return Ok(None);
@@ -1238,6 +1261,7 @@ async fn handle_gen_circuits_operator(
             verifier_index: None,
             selected_circuit_indexes: vec![],
             gc_data: None,
+            prover_state: None,
         });
     }
 
@@ -1456,12 +1480,19 @@ async fn handle_soldering_proof_operator(
     .context("real BABE setup verification task failed")??;
 
     let gc_data = extract_gc_circuit_data(finalized, soldering, *verifier_pubkey)?;
+    let prover_state = BabeProverState {
+        package: setup_package.clone(),
+        finalized: finalized.clone(),
+        soldering: soldering.clone(),
+        h_msgs: gc_data.final_msg_hashes.clone(),
+    };
     let Some(bitvm_gc_circuit_datas) = record_candidate_gc_data(
         operator_state,
         *verifier_pubkey,
         verifier_index,
         setup_package,
         gc_data,
+        prover_state,
     )?
     else {
         // TODO(protocol): Add timeout and replacement for a selected verifier that does not deliver a valid soldering proof.
@@ -3198,9 +3229,9 @@ async fn handle_challenge_assert_sent_operator(
         return Ok(());
     }
 
-    // TODO(protocol): Recover the BABE hashlock preimage before broadcasting WronglyChallenged.
+    // TODO(protocol): Recover all BABE hashlock preimages before broadcasting WronglyChallenged.
     tracing::warn!(
-        "Stop ChallengeAssertSent for {instance_id}:{graph_id} slot {verifier_index}: BABE hashlock preimage recovery is not integrated"
+        "Stop ChallengeAssertSent for {instance_id}:{graph_id} slot {verifier_index}: BABE hashlock preimage recovery is not integrated for all finalized instances"
     );
 
     Ok(())
@@ -3822,4 +3853,126 @@ async fn handle_response_node_info(
 ) -> Result<()> {
     save_node_info(ctx.local_db, node_info).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use bitvm_lib::babe_adapter::{
+        BABE_M_CC, BabeProverState, build_setup_package, open_and_solder,
+    };
+
+    use super::*;
+
+    fn verifier_pubkey() -> PublicKey {
+        PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap()
+    }
+
+    fn gc_submission() -> (CACSetupPackage, BitvmGcCircuitData, BabeProverState) {
+        let package = build_setup_package(BABE_M_CC + 1).unwrap();
+        let selected = (0..BABE_M_CC).collect::<Vec<_>>();
+        let (_, finalized, soldering) = open_and_solder(&package, &selected).unwrap();
+        let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey()).unwrap();
+        let prover_state = BabeProverState {
+            package: package.clone(),
+            finalized,
+            soldering,
+            h_msgs: gc_data.final_msg_hashes.clone(),
+        };
+        (package, gc_data, prover_state)
+    }
+
+    fn operator_state(package: CACSetupPackage) -> OperatorBabeSetupState {
+        OperatorBabeSetupState {
+            frozen_verifier_pubkeys: Some(vec![verifier_pubkey()]),
+            candidates: vec![OperatorVerifierCandidate {
+                verifier_pubkey: verifier_pubkey(),
+                setup_package: package,
+                verifier_index: Some(0),
+                selected_circuit_indexes: (0..BABE_M_CC).collect(),
+                gc_data: None,
+                prover_state: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn freeze_operator_candidate_selects_protocol_finalized_count() {
+        let package = build_setup_package(BABE_M_CC + 1).unwrap();
+        let mut state = OperatorBabeSetupState {
+            frozen_verifier_pubkeys: None,
+            candidates: vec![OperatorVerifierCandidate {
+                verifier_pubkey: verifier_pubkey(),
+                setup_package: package,
+                verifier_index: None,
+                selected_circuit_indexes: vec![],
+                gc_data: None,
+                prover_state: None,
+            }],
+        };
+
+        freeze_operator_candidates(&mut state).unwrap();
+
+        assert_eq!(state.candidates[0].selected_circuit_indexes.len(), BABE_M_CC);
+    }
+
+    #[test]
+    fn candidate_records_one_slot_and_full_prover_state_idempotently() {
+        let (package, gc_data, prover_state) = gc_submission();
+        let mut state = operator_state(package.clone());
+
+        let graph_data = record_candidate_gc_data(
+            &mut state,
+            verifier_pubkey(),
+            0,
+            &package,
+            gc_data.clone(),
+            prover_state.clone(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(graph_data.len(), 1);
+        assert_eq!(graph_data[0].final_msg_hashes.len(), BABE_M_CC);
+        assert_eq!(state.candidates[0].prover_state.as_ref().unwrap().finalized.len(), BABE_M_CC);
+
+        let duplicate = record_candidate_gc_data(
+            &mut state,
+            verifier_pubkey(),
+            0,
+            &package,
+            gc_data.clone(),
+            prover_state.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(duplicate.len(), 1);
+
+        let mut conflict = prover_state;
+        conflict.h_msgs[0][0] ^= 1;
+        assert!(
+            record_candidate_gc_data(
+                &mut state,
+                verifier_pubkey(),
+                0,
+                &package,
+                gc_data,
+                conflict,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_operator_candidate_without_prover_state_deserializes() {
+        let (package, _, _) = gc_submission();
+        let mut value = serde_json::to_value(operator_state(package)).unwrap();
+        value["candidates"][0].as_object_mut().unwrap().remove("prover_state");
+
+        let restored: OperatorBabeSetupState = serde_json::from_value(value).unwrap();
+
+        assert!(restored.candidates[0].prover_state.is_none());
+    }
 }
