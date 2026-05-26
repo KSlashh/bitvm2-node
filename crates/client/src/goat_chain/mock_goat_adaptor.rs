@@ -466,6 +466,14 @@ impl ChainAdaptor for MockAdaptor {
         Ok(vec![])
     }
 
+    async fn committee_mana_get_verifiers(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+        Ok(vec![])
+    }
+
+    async fn committee_mana_is_verifier(&self, _peer_id: &[u8]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn committee_mana_add_watchtower(
         &self,
         _watchtower: &[u8; 32],

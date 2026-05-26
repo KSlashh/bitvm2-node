@@ -1256,7 +1256,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "commit-chain"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "alloy-primitives",
  "base64 0.21.7",

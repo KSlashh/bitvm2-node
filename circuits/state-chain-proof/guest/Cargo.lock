@@ -2376,7 +2376,7 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "header-chain"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bitcoin",
  "borsh",
@@ -5114,7 +5114,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "state-chain"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",

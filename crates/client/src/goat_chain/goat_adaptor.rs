@@ -320,6 +320,8 @@ sol!(
         function getCommitteePeerId(address member) external view returns (bytes);
         function isValidPeerId(bytes calldata peerId) external view returns (bool);
         function getWatchtowers() external view returns (bytes32[] memory);
+        function getVerifiers() external view returns (bytes[] memory);
+        function isVerifier(bytes calldata peerId) external view returns (bool);
         function addWatchtower(bytes32 watchtower, uint256 nonce, bytes[] memory authSignatures) external;
         function removeWatchtower(bytes32 watchtower, uint256 nonce, bytes[] memory authSignatures) external;
         function getNoncedDigest(bytes32 msgHash, uint256 nonce) external view returns (bytes32);
@@ -1498,6 +1500,22 @@ impl ChainAdaptor for GoatAdaptor {
             .into_iter()
             .map(|w| w.0)
             .collect::<Vec<[u8; 32]>>())
+    }
+
+    async fn committee_mana_get_verifiers(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+        let committee_management = self.get_committee_management()?;
+        Ok(committee_management
+            .getVerifiers()
+            .call()
+            .await?
+            .into_iter()
+            .map(|v| v.to_vec())
+            .collect::<Vec<Vec<u8>>>())
+    }
+
+    async fn committee_mana_is_verifier(&self, peer_id: &[u8]) -> anyhow::Result<bool> {
+        let committee_management = self.get_committee_management()?;
+        Ok(committee_management.isVerifier(Bytes::copy_from_slice(peer_id)).call().await?)
     }
 
     async fn committee_mana_add_watchtower(

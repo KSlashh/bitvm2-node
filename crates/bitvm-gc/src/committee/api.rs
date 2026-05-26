@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use bitcoin::XOnlyPublicKey;
 use bitcoin::{PublicKey, Transaction, key::Keypair, taproot::Signature as TaprootSignature};
 use goat::connectors::assert_connectors::ProverConnector;
@@ -85,18 +85,13 @@ pub type CommitteeSignatures = CommitteeMusig2Data<TaprootSignature>;
 
 impl<T> CommitteeMusig2Data<T> {
     pub fn validate_length(&self, verifier_num: usize) -> Result<()> {
-        if self.take1.len() != take1_pre_sign_num() {
-            bail!("invalid number of take1");
-        }
-        if self.take2.len() != take2_pre_sign_num() {
-            bail!("invalid number of take2");
-        }
-        if self.challenge.len() != challenge_pre_sign_num() {
-            bail!("invalid number of challenge");
-        }
-        if self.disprove.len() != disprove_pre_sign_num(verifier_num) {
-            bail!("invalid number of disprove");
-        }
+        ensure!(self.take1.len() == take1_pre_sign_num(), "invalid number of take1");
+        ensure!(self.take2.len() == take2_pre_sign_num(), "invalid number of take2");
+        ensure!(self.challenge.len() == challenge_pre_sign_num(), "invalid number of challenge");
+        ensure!(
+            self.disprove.len() == disprove_pre_sign_num(verifier_num),
+            "invalid number of disprove"
+        );
         Ok(())
     }
 

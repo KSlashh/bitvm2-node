@@ -224,6 +224,8 @@ pub trait ChainAdaptor: Send + Sync {
     async fn committee_mana_is_validate_peer_id(&self, peer_id: &[u8]) -> anyhow::Result<bool>;
 
     async fn committee_mana_get_watchtowers(&self) -> anyhow::Result<Vec<[u8; 32]>>;
+    async fn committee_mana_get_verifiers(&self) -> anyhow::Result<Vec<Vec<u8>>>;
+    async fn committee_mana_is_verifier(&self, peer_id: &[u8]) -> anyhow::Result<bool>;
     async fn committee_mana_add_watchtower(
         &self,
         watchtower: &[u8; 32],

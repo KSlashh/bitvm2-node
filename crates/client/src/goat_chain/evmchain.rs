@@ -428,6 +428,15 @@ impl EvmChain {
     pub async fn committee_mana_get_watchtowers(&self) -> anyhow::Result<Vec<[u8; 32]>> {
         self.adaptor.committee_mana_get_watchtowers().await
     }
+
+    pub async fn committee_mana_get_verifiers(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.adaptor.committee_mana_get_verifiers().await
+    }
+
+    pub async fn committee_mana_is_verifier(&self, peer_id: &[u8]) -> anyhow::Result<bool> {
+        self.adaptor.committee_mana_is_verifier(peer_id).await
+    }
+
     pub async fn committee_mana_add_watchtower(
         &self,
         watchtower: &[u8; 32],
