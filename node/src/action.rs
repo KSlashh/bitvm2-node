@@ -11,6 +11,10 @@ use alloy::primitives::Address as EvmAddress;
 use anyhow::{Result, anyhow};
 use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::{
+    BabeAssertWitness, BabeChallengeAssertWitness, BabeWronglyChallengedWitness, CACSetupPackage,
+    FinalizedInstanceData, SolderingData,
+};
 use bitvm_lib::committee::*;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
 use client::goat_chain::DisproveTxType;
@@ -94,13 +98,14 @@ pub struct GenCircuits {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_pubkey: PublicKey,
-    pub garbled_circuits: Vec<Vec<u8>>,
+    pub setup_package: CACSetupPackage,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CutCircuits {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_pubkey: PublicKey,
+    pub verifier_index: usize,
     pub selected_circuit_indexes: Vec<usize>,
 }
 #[derive(Serialize, Deserialize, Clone)]
@@ -108,7 +113,11 @@ pub struct SolderingProof {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_pubkey: PublicKey,
-    pub proofs: Vec<Vec<u8>>,
+    pub verifier_index: usize,
+    pub setup_package: CACSetupPackage,
+    pub opened: Vec<(usize, u64)>,
+    pub finalized: Vec<FinalizedInstanceData>,
+    pub soldering: SolderingData,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
@@ -213,18 +222,23 @@ pub struct AssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub assert_txid: Txid,
+    pub assert_witness: Option<BabeAssertWitness>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChallengeAssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub challenge_assert_txid: Txid,
+    pub verifier_index: usize,
+    pub challenge_witness: Option<BabeChallengeAssertWitness>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WronglyChallengeTimeout {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub challenge_assert_txid: Txid,
+    pub verifier_index: usize,
+    pub wrongly_challenged_witness: Option<BabeWronglyChallengedWitness>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DisproveSent {

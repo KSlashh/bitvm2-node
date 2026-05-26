@@ -463,6 +463,15 @@ pub struct PeginGraphProcessData {
     pub created_at: i64,
 }
 
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct PendingGraphInit {
+    pub instance_id: Uuid,
+    pub operator_pubkey: String,
+    pub graph_id: Uuid,
+    pub updated_at: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Display, EnumString)]
 pub enum MessageType {
     None,

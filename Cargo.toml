@@ -48,6 +48,8 @@ hex = "0.4.3"
 indexmap = { version = "2.11.0", features = ["serde"] }
 ark-bn254 = { version = "0.5.0", features = ["curve", "scalar_field"], default-features = false }
 ark-groth16 = "0.5.0"
+ark-ff = "0.5.0"
+ark-crypto-primitives = "0.5.0"
 base64 = "0.21"
 ark-serialize = "0.5.0"
 sha2 = "0.10.9"
@@ -60,6 +62,7 @@ serde_json = "1.0.116"
 serde-big-array = "0.5.1"
 toml = "0.8"
 rand = "0.8.5"
+rand_chacha = { version = "0.3", default-features = false }
 dotenv = "0.15.0"
 blake3 = "=1.5.1"
 musig2 = { version = "0.1.0", features = ["serde", "rand"] }
@@ -100,6 +103,8 @@ zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] 
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
 bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm2-gc", rev = "150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5", package = "verifiable-circuit-babe" }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm2-gc", rev = "150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5", package = "garbled-snark-verifier" }
 store = { path = "crates/store" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }

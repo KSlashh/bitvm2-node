@@ -2,7 +2,7 @@ use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
     BridgeOutGlobalStats, GoatTxRecord, Graph, GraphBtcTxVoutMonitor, GraphRawData, Instance,
     LongRunningTaskProof, Message, Node, NodesOverview, OperatorProof, PeginGraphProcessData,
-    PeginInstanceProcessData, ProofState, SequencerSetHashChange, SequencerSetScanState,
+    PeginInstanceProcessData, PendingGraphInit, ProofState, SequencerSetHashChange, SequencerSetScanState,
     SerializableTxid, WatchContract, WatchtowerProof, WrapperProof,
 };
 
@@ -1082,6 +1082,76 @@ impl<'a> StorageProcessor<'a> {
                 .fetch_optional(self.conn())
                 .await?;
         Ok(res.and_then(|record| record.parameters))
+    }
+
+    pub async fn upsert_pending_graph_init(
+        &mut self,
+        instance_id: &Uuid,
+        operator_pubkey: &str,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<u64> {
+        let current_time = get_current_timestamp_secs();
+        let result = sqlx::query(
+            "INSERT INTO pending_graph_init
+             (instance_id, operator_pubkey, graph_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(instance_id, operator_pubkey) DO UPDATE SET
+                 graph_id = excluded.graph_id,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(instance_id)
+        .bind(operator_pubkey)
+        .bind(graph_id)
+        .bind(current_time)
+        .bind(current_time)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn find_pending_graph_init_by_instance_and_operator_pubkey(
+        &mut self,
+        instance_id: &Uuid,
+        operator_pubkey: &str,
+    ) -> anyhow::Result<Option<PendingGraphInit>> {
+        Ok(sqlx::query_as::<_, PendingGraphInit>(
+            "SELECT instance_id, operator_pubkey, graph_id, created_at, updated_at
+             FROM pending_graph_init
+             WHERE instance_id = ? AND operator_pubkey = ?",
+        )
+        .bind(instance_id)
+        .bind(operator_pubkey)
+        .fetch_optional(self.conn())
+        .await?)
+    }
+
+    pub async fn find_pending_graph_init_by_graph_id(
+        &mut self,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<Option<PendingGraphInit>> {
+        Ok(sqlx::query_as::<_, PendingGraphInit>(
+            "SELECT instance_id, operator_pubkey, graph_id, created_at, updated_at
+             FROM pending_graph_init
+             WHERE graph_id = ?",
+        )
+        .bind(graph_id)
+        .fetch_optional(self.conn())
+        .await?)
+    }
+
+    pub async fn delete_pending_graph_init(
+        &mut self,
+        instance_id: &Uuid,
+        operator_pubkey: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM pending_graph_init WHERE instance_id = ? AND operator_pubkey = ?",
+        )
+        .bind(instance_id)
+        .bind(operator_pubkey)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Insert or update a graph

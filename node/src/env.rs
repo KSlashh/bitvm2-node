@@ -16,6 +16,7 @@ use goat::constants::{CONNECTOR_Z_TIMELOCK, NUM_BLOCKS_PER_HOUR};
 use libp2p::PeerId;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::str::FromStr;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
@@ -80,6 +81,12 @@ pub const ENV_OPERATOR_PROOF_WAIT_SECS: &str = "OPERATOR_PROOF_WAIT_SECS";
 pub const ENV_OPERATOR_VK_HASH: &str = "OPERATOR_VK_HASH";
 pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
+// TODO: remove it
+pub const ENV_BABE_SETUP_PUBLIC_INPUTS: &str = "BABE_SETUP_PUBLIC_INPUTS";
+pub const BABE_N_CC: usize = 181;
+pub const BABE_M_CC: usize = 4;
+pub const ENV_GC_GATES_PATH: &str = "GC_GATES_PATH";
+pub const ENV_GC_INDICES_PATH: &str = "GC_INDICES_PATH";
 
 pub const ENV_ALWAYS_CHALLENGE: &str = "ALWAYS_CHALLENGE";
 pub const ENV_GENESIS_SEQUENCER_COMMIT_TXID: &str = "GENESIS_SEQUENCER_COMMIT_TXID";
@@ -560,6 +567,64 @@ pub fn get_operator_vk_hash() -> anyhow::Result<[u8; 32]> {
     let value = std::env::var(ENV_OPERATOR_VK_HASH)
         .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_VK_HASH} needs to be set"))?;
     hex_parse::<32>(&value).map_err(|err| anyhow::anyhow!("invalid {ENV_OPERATOR_VK_HASH}: {err}"))
+}
+
+/// Parses configured field elements that bind the real BABE setup statement.
+pub fn parse_babe_setup_public_inputs(value: &str) -> anyhow::Result<Vec<ark_bn254::Fr>> {
+    use ark_serialize::CanonicalDeserialize;
+
+    let encoded: Vec<String> = serde_json::from_str(value)
+        .map_err(|err| anyhow::anyhow!("invalid {ENV_BABE_SETUP_PUBLIC_INPUTS} JSON: {err}"))?;
+    if encoded.is_empty() {
+        anyhow::bail!("{ENV_BABE_SETUP_PUBLIC_INPUTS} must contain at least one field element");
+    }
+    encoded
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let bytes = hex::decode(field).map_err(|err| {
+                anyhow::anyhow!(
+                    "invalid {ENV_BABE_SETUP_PUBLIC_INPUTS}[{index}] hex encoding: {err}"
+                )
+            })?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "{ENV_BABE_SETUP_PUBLIC_INPUTS}[{index}] must contain a 32-byte canonical BN254 scalar"
+                );
+            }
+            ark_bn254::Fr::deserialize_compressed(bytes.as_slice()).map_err(|err| {
+                anyhow::anyhow!(
+                    "invalid {ENV_BABE_SETUP_PUBLIC_INPUTS}[{index}] BN254 scalar: {err}"
+                )
+            })
+        })
+        .collect()
+}
+
+// TODO: use instance id and graph id to generate groth16 public inputs
+pub fn get_babe_setup_public_inputs() -> anyhow::Result<Vec<ark_bn254::Fr>> {
+    let value = std::env::var(ENV_BABE_SETUP_PUBLIC_INPUTS)
+        .map_err(|_| anyhow::anyhow!("{ENV_BABE_SETUP_PUBLIC_INPUTS} is missing"))?;
+    parse_babe_setup_public_inputs(&value)
+}
+
+/// Returns the configured GC asset paths after checking that they are readable files.
+/// TODO: maybe multi files
+pub fn get_babe_gc_asset_paths() -> anyhow::Result<(PathBuf, PathBuf)> {
+    let gates_path = PathBuf::from(
+        std::env::var(ENV_GC_GATES_PATH)
+            .map_err(|_| anyhow::anyhow!("{ENV_GC_GATES_PATH} is missing"))?,
+    );
+    let indices_path = PathBuf::from(
+        std::env::var(ENV_GC_INDICES_PATH)
+            .map_err(|_| anyhow::anyhow!("{ENV_GC_INDICES_PATH} is missing"))?,
+    );
+    for (name, path) in [(ENV_GC_GATES_PATH, &gates_path), (ENV_GC_INDICES_PATH, &indices_path)] {
+        if !path.is_file() {
+            anyhow::bail!("{name} does not point to a readable file: {}", path.display());
+        }
+    }
+    Ok((gates_path, indices_path))
 }
 
 pub fn get_instance_maintenance_batch_size() -> u32 {

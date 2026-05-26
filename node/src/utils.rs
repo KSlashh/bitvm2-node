@@ -9,7 +9,7 @@ use crate::rpc_service::current_time_secs;
 use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
@@ -55,7 +55,7 @@ use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub const SELF_SENDER: &str = "self";
@@ -80,6 +80,9 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
     ChallengeSubStatus, VerifierChallengeStatus,
 };
 use bitcoin_light_client_circuit::hash_operator_constant;
+use bitvm_lib::babe_adapter::{
+    BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData, SolderingData,
+};
 use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
@@ -87,8 +90,15 @@ use proof_builder::{
     ProofData, WatchtowerProofRequest, WatchtowerProofResponse,
     WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse, WrapperProofResponse,
 };
+use store::{
+    BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, Instance,
+    InstanceBridgeInStatus, Message, MessageState, MessageType, Node, PeginGraphProcessData,
+    PeginInstanceProcessData, SerializableTxid, UInt64Array3,
+};
+use stun_client::{Attribute, Class, Client};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
 
 pub struct GuestInputs;
@@ -121,6 +131,7 @@ pub mod todo_funcs {
         // todo!("get min required watchtower number")
         1
     }
+    #[inline]
     pub fn verifier_num() -> usize {
         // todo!("get verifier num")
         1
@@ -1757,12 +1768,6 @@ fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Ve
     ))
 }
 
-#[allow(dead_code)]
-fn load_part_stark_vk_for_zkm_version(zkm_version: &str) -> Result<Vec<u8>> {
-    catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version).to_vec()))
-        .map_err(|_| anyhow!("failed to load part_stark_vk for zkm_version {zkm_version}"))
-}
-
 // proof network
 /// Returns:
 /// - `Ok(Some(WatchtowerCommitment), _)` if watchtower proof is available
@@ -1829,14 +1834,46 @@ pub async fn get_watchtower_challenge_info(
 /// - `Ok(None, wait_secs)` if operator proof is not yet available, with suggested wait time
 pub async fn get_operator_proof(
     _local_db: &LocalDB,
-    _http_client: &HttpAsyncClient,
-    _bitvm_graph: &BitvmGcGraph,
+    http_client: &HttpAsyncClient,
+    bitvm_graph: &BitvmGcGraph,
     _btc_client: &BTCClient,
-    _instance_id: Uuid,
-    _graph_id: Uuid,
-    _operator_committed_blockhash: String,
-) -> Result<(Option<(GuestInputs, Groth16Proof, PublicInputs, VerifyingKey)>, usize)> {
-    todo!("operator proof assembly is pending the GC refactor")
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_committed_blockhash: String,
+) -> Result<(Option<ProofData>, usize)> {
+    let Some(base_url) = get_proof_build_rpc_host() else {
+        tracing::warn!("Operator proof builder URL is not configured for {instance_id}:{graph_id}");
+        return Ok((None, env::get_operator_proof_wait_secs()));
+    };
+    let url = Url::parse(&base_url)?.join(NODES_OPERATOR_BASE)?;
+    let response = http_client
+        .post_response_json::<OperatorProofResponse, OperatorProofRequest>(
+            url.as_str(),
+            &OperatorProofRequest {
+                instance_id: instance_id.to_string(),
+                graph_id: graph_id.to_string(),
+                operator_committed_blockhash,
+                execution_layer_block_number: 0,
+                watchtower_challenge_txids: vec![],
+                included_watchtowers: vec![],
+                watchtower_challenge_init_txid: bitvm_graph
+                    .watchtower_challenge_init
+                    .tx()
+                    .compute_txid()
+                    .to_string(),
+                watchtower_challenge_pubkeys: bitvm_graph
+                    .parameters
+                    .watchtower_pubkeys
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            },
+        )
+        .await?;
+    match response.proof_data {
+        Some(proof_data) if !proof_data.proof.is_empty() => Ok((Some(proof_data), 0)),
+        _ => Ok((None, env::get_operator_proof_wait_secs())),
+    }
 }
 
 /// Returns:
@@ -4358,4 +4395,102 @@ pub async fn get_largest_watchtower_challenge_block(
         }
     }
     Ok(largest_watchtower_challenge_block_hash)
+}
+
+fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> PathBuf {
+    let root = if local_db.is_mem {
+        std::env::temp_dir().join("bitvm2-node-babe-state")
+    } else {
+        let db_path = local_db
+            .path
+            .strip_prefix("sqlite://")
+            .or_else(|| local_db.path.strip_prefix("sqlite:"))
+            .unwrap_or(&local_db.path);
+        PathBuf::from(db_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".bitvm-babe-state")
+    };
+    root.join(instance_id.to_string()).join(format!("{graph_id}.json"))
+}
+
+fn load_babe_setup_state_from_path(path: &Path) -> Result<Option<BabeSetupState>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read BABE setup state {}", path.display())),
+    }
+}
+
+fn save_babe_setup_state_to_path(path: &Path, state: &BabeSetupState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create BABE setup state dir {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(state)?;
+    std::fs::write(path, bytes)
+        .with_context(|| format!("write BABE setup state {}", path.display()))
+}
+
+pub(crate) fn load_babe_setup_state(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<Option<BabeSetupState>> {
+    load_babe_setup_state_from_path(&babe_setup_state_path(local_db, instance_id, graph_id))
+}
+
+pub(crate) fn save_babe_setup_state(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    state: &BabeSetupState,
+) -> Result<()> {
+    save_babe_setup_state_to_path(&babe_setup_state_path(local_db, instance_id, graph_id), state)
+}
+
+pub(crate) fn update_babe_setup_state(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    update: impl FnOnce(&mut BabeSetupState),
+) -> Result<BabeSetupState> {
+    let mut state = load_babe_setup_state(local_db, instance_id, graph_id)?.unwrap_or_default();
+    update(&mut state);
+    save_babe_setup_state(local_db, instance_id, graph_id, &state)?;
+    Ok(state)
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct BabeSetupState {
+    pub verifier: Option<VerifierBabeSetupState>,
+    pub operator: Option<OperatorBabeSetupState>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VerifierBabeSetupState {
+    pub verifier_pubkey: PublicKey,
+    pub setup_package: CACSetupPackage,
+    pub private_state: BabeVerifierPrivateState,
+    pub verifier_index: Option<usize>,
+    pub finalized_indices: Vec<usize>,
+    pub opened: Vec<(usize, u64)>,
+    pub finalized: Vec<FinalizedInstanceData>,
+    pub soldering: Option<SolderingData>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OperatorVerifierCandidate {
+    pub verifier_pubkey: PublicKey,
+    pub setup_package: CACSetupPackage,
+    pub verifier_index: Option<usize>,
+    pub selected_circuit_indexes: Vec<usize>,
+    pub gc_data: Option<BitvmGcCircuitData>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OperatorBabeSetupState {
+    pub frozen_verifier_pubkeys: Option<Vec<PublicKey>>,
+    pub candidates: Vec<OperatorVerifierCandidate>,
 }
