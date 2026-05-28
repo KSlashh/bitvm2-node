@@ -11,11 +11,15 @@ fn parse_xonly_key(raw: &str) -> Result<[u8; 32], String> {
 }
 
 fn fixed_watchtower_keys_from_env() -> Vec<[u8; 32]> {
-    let value = env::var(ENV_FIXED_WATCHTOWER_KEYS).unwrap_or_else(|_| {
-        panic!(
-            "{ENV_FIXED_WATCHTOWER_KEYS} is required when building operator guest; run fetch-watchtower-xonly-pubkeys first"
-        )
-    });
+    let value = match env::var(ENV_FIXED_WATCHTOWER_KEYS) {
+        Ok(value) => value,
+        Err(_) => {
+            println!(
+                "cargo:warning={ENV_FIXED_WATCHTOWER_KEYS} is not set; building operator guest with an empty fixed watchtower list"
+            );
+            return Vec::new();
+        }
+    };
     let keys = value
         .split(',')
         .map(str::trim)
@@ -25,7 +29,10 @@ fn fixed_watchtower_keys_from_env() -> Vec<[u8; 32]> {
         .unwrap_or_else(|err| panic!("invalid {ENV_FIXED_WATCHTOWER_KEYS}: {err}"));
 
     if keys.is_empty() {
-        panic!("{ENV_FIXED_WATCHTOWER_KEYS} must contain at least one key");
+        println!(
+            "cargo:warning={ENV_FIXED_WATCHTOWER_KEYS} contains no keys; building operator guest with an empty fixed watchtower list"
+        );
+        return Vec::new();
     }
     if keys.len() > 256 {
         panic!("{ENV_FIXED_WATCHTOWER_KEYS} contains {} keys, max 256", keys.len());
