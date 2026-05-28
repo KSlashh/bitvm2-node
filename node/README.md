@@ -108,7 +108,7 @@ flowchart LR
     subgraph Actors["Actor Roles"]
         C["Committee"]
         O["Operator"]
-        CH["Challenger"]
+        V["Verifier"]
         W["Watchtower"]
         R["Relayer\n(Committee + Flag)"]
     end
@@ -116,16 +116,16 @@ flowchart LR
     subgraph Network["P2P Topics"]
         TC["/goat/topic/Committee"]
         TO["/goat/topic/Operator"]
-        TCH["/goat/topic/Challenger"]
+        TV["/goat/topic/Verifier"]
         TW["/goat/topic/Watchtower"]
         TA["/goat/topic/All"]
     end
 
     C <--> TC
     O <--> TO
-    CH <--> TCH
+    V <--> TV
     W <--> TW
-    C & O & CH & W & R <--> TA
+    C & O & V & W & R <--> TA
     R -.->|"SyncGraph"| TA
 ```
 
@@ -145,7 +145,7 @@ classDiagram
         <<enumeration>>
         Committee
         Operator
-        Challenger
+        Verifier
         Watchtower
         All
     }
@@ -164,7 +164,7 @@ classDiagram
         +send_take1_take2()
     }
 
-    class Challenger {
+    class Verifier {
         +monitor_timeouts()
         +submit_disprove()
     }
@@ -183,7 +183,7 @@ classDiagram
 
     Actor <|-- Committee
     Actor <|-- Operator
-    Actor <|-- Challenger
+    Actor <|-- Verifier
     Actor <|-- Watchtower
     Committee <|-- Relayer : ENABLE_RELAYER=true
 ```
@@ -196,7 +196,7 @@ classDiagram
 |------|------------------|--------------|
 | **Committee** | Multi-sig committee member, responsible for presigning and graph endorsement | `NonceGeneration`, `CommitteePresign`, `EndorseGraph` |
 | **Operator** | Bridge operator, creates graphs and executes withdrawal transactions | `CreateGraph`, `KickoffSent`, `Take1Sent`, `Take2Sent` |
-| **Challenger** | Dispute challenger, monitors timeouts and submits disproofs | `DisproveReady`, `DisproveSent` |
+| **Verifier** | Dispute verifier, monitors timeouts and submits disproofs | `DisproveReady`, `DisproveSent` |
 | **Watchtower** | Chain monitor, validates block headers and submits challenges | `WatchtowerChallengeSent` |
 | **Relayer** | Graph data distributor, responds to sync requests | `SyncGraphRequest`, `SyncGraph` |
 
@@ -311,7 +311,7 @@ sequenceDiagram
     participant GOAT as GOAT L2
     participant Operator
     participant Watchtower
-    participant Challenger
+    participant Verifier
     participant BTC as Bitcoin
 
     User->>GOAT: InitWithdraw
@@ -327,7 +327,7 @@ sequenceDiagram
                 Operator->>BTC: ACK response
             else Operator rejects
                 Operator->>BTC: NACK response
-                Challenger->>BTC: DisproveTx
+                Verifier->>BTC: DisproveTx
             end
         end
 
@@ -340,7 +340,7 @@ sequenceDiagram
         Operator->>BTC: Take2 transaction
         BTC->>User: BTC transferred to user address
     else Challenge failed
-        Challenger->>BTC: DisproveTx
+        Verifier->>BTC: DisproveTx
         Note over User,BTC: User funds safe, Operator penalized
     end
 ```
@@ -622,7 +622,7 @@ classDiagram
         <<enumeration>>
         Committee
         Operator
-        Challenger
+        Verifier
         Watchtower
         All
     }
@@ -665,9 +665,9 @@ classDiagram
 | `WatchtowerChallengeInitSent` | Operator | Watchtower | WT challenge initialization |
 | `WatchtowerChallengeSent` | Watchtower | Operator | WT challenge submission |
 | `WatchtowerChallengeTimeout` | System | Operator | WT challenge timeout |
-| `OperatorAckTimeout` | System | Challenger | Operator ACK timeout |
-| `DisproveReady` | System | Challenger | Disprove ready |
-| `DisproveSent` | Challenger | All | Disprove transaction broadcast |
+| `OperatorAckTimeout` | System | Verifier | Operator ACK timeout |
+| `DisproveReady` | System | Verifier | Disprove ready |
+| `DisproveSent` | Verifier | All | Disprove transaction broadcast |
 
 #### Synchronization Messages
 
@@ -805,7 +805,7 @@ bitvm-noded key peer
 # PEER_KEY=<base64-encoded-key>
 # PEER_ID=<peer-id>
 
-# Generate funding address (for Operator/Challenger)
+# Generate funding address (for Operator/Verifier)
 bitvm-noded key funding-address
 # Output:
 # Funding P2WSH address: bc1q...
@@ -820,6 +820,28 @@ bitvm-noded \
   --p2p-port 4001 \
   --bootnodes /ip4/x.x.x.x/tcp/4001/p2p/<peer_id>
 ```
+
+### Start Local Mock RPC
+
+Use this when you only need to test HTTP interfaces. It starts the RPC routes without
+P2P, chain watchers, or maintenance tasks, and seeds a local SQLite database with
+mock nodes, instances, graphs, and overview data.
+
+```bash
+cargo run -p bitvm-noded --bin mock-rpc -- --rpc-addr 127.0.0.1:18080
+```
+
+Useful test calls:
+
+```bash
+curl http://127.0.0.1:18080/v1/nodes/overview
+curl 'http://127.0.0.1:18080/v1/instances?is_bridge_in=true'
+curl http://127.0.0.1:18080/v1/graphs
+```
+
+The mock binary prints seeded instance and graph IDs on startup. Endpoints that
+require real `graph_raw_data`, such as graph transaction hex export, still need
+real graph raw data in the database.
 
 ### CLI Options
 
@@ -840,7 +862,7 @@ bitvm-noded \
 
 | Variable | Required | Description | Default |
 |----------|----------|-------------|---------|
-| `ACTOR` | Yes | Node role: `Committee`, `Operator`, `Challenger`, `Watchtower` | `Challenger` |
+| `ACTOR` | Yes | Node role: `Committee`, `Operator`, `Verifier`, `Watchtower` | `Verifier` |
 | `BITCOIN_NETWORK` | Yes | Bitcoin network: `bitcoin`, `testnet4`, `signet`, `regtest` | `testnet4` |
 | `GOAT_NETWORK` | Yes | GOAT network: `main`, `test` | `test` |
 | `GOAT_CHAIN_URL` | Yes | GOAT L2 RPC endpoint | - |
@@ -848,7 +870,7 @@ bitvm-noded \
 | `BITVM_SECRET` | Yes | Node private key or seed (`seed:xxx` format) | - |
 | `PEER_KEY` | Yes | libp2p node key (Base64 encoded) | - |
 | `GOAT_PRIVATE_KEY` | Conditional | GOAT chain private key (required for Committee) | - |
-| `GOAT_ADDRESS` | Conditional | GOAT address (required for Operator/Challenger) | - |
+| `GOAT_ADDRESS` | Conditional | GOAT address (required for Operator/Verifier) | - |
 | `ENABLE_RELAYER` | No | Enable relayer mode for Committee nodes | `false` |
 | `BTC_CHAIN_URL` | No | Bitcoin Esplora API endpoint | Public Esplora |
 | `MARA_SLIPSTREAM_API_URL` | No | MARA slipstream API base URL (used for non-standard tx broadcast) | mainnet: `https://slipstream.mara.com/api`; testnet4: `https://teststream.mara.com/api` |
@@ -888,11 +910,11 @@ Relayer nodes should:
 | `/instances` | GET | List all instances |
 | `/instance/:id` | GET | Get instance details |
 | `/instances/overview` | GET | Instance statistics overview |
-| `/graphs` | GET | List all graphs |
-| `/graph/:id` | GET | Get graph details |
-| `/graph/:id/txn` | GET | Get graph transaction list |
-| `/graph/:id/tx/:txid` | GET | Get specific transaction |
-| `/graph/ready_to_kickoff` | GET | Get graphs ready for kickoff |
+| `/v1/graphs` | GET | List all graphs |
+| `/v1/graphs/:id` | GET | Get graph details |
+| `/v1/graphs/:id/txn?cursor=0` | GET | Get graph transaction list |
+| `/v1/graphs/:id/tx?tx_name=cur-pre-kickoff.hex` | GET | Get specific transaction hex |
+| `/v1/graphs/ready-to-kickoff` | GET | Get graphs ready for kickoff |
 | `/bridge_in_request` | POST | Initiate Bridge-In request |
 | `/bridge_out_init` | POST | Initiate Bridge-Out request |
 | `/challenge` | POST | Submit challenge |

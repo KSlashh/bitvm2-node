@@ -340,22 +340,34 @@ pub fn get_committee_member_num() -> usize {
     COMMITTEE_MEMBER_NUMBER
 }
 
-#[derive(Clone, Display, EnumString)]
+#[derive(Clone, Copy, Display, EnumString)]
 pub enum GraphBtcTxName {
-    #[strum(serialize = "watchtower-challenge-init.hex")]
-    WatchtowerChallengeInit,
-    #[strum(serialize = "pre-kickoff.hex")]
-    PreKickoff,
-    #[strum(serialize = "assert.hex")]
-    Assert,
-    #[strum(serialize = "challenge.hex")]
-    Challenge,
-    #[strum(serialize = "kickoff.hex")]
-    Kickoff,
+    #[strum(serialize = "cur-pre-kickoff.hex")]
+    CurPreKickoff,
+    #[strum(serialize = "next-pre-kickoff.hex")]
+    NextPreKickoff,
+    #[strum(serialize = "force-skip-kickoff.hex")]
+    ForceSkipKickoff,
+    #[strum(serialize = "quick-challenge.hex")]
+    QuickChallenge,
+    #[strum(serialize = "challenge-incomplete-kickoff.hex")]
+    ChallengeIncompleteKickoff,
     #[strum(serialize = "pegin.hex")]
     Pegin,
+    #[strum(serialize = "kickoff.hex")]
+    Kickoff,
     #[strum(serialize = "take1.hex")]
     Take1,
+    #[strum(serialize = "challenge.hex")]
+    Challenge,
+    #[strum(serialize = "watchtower-challenge-init.hex")]
+    WatchtowerChallengeInit,
+    #[strum(serialize = "operator-assert.hex")]
+    OperatorAssert,
+    #[strum(serialize = "verifier-assert.hex")]
+    VerifierAssert,
+    #[strum(serialize = "disprove.hex")]
+    Disprove,
     #[strum(serialize = "take2.hex")]
     Take2,
 }

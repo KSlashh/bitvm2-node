@@ -39,6 +39,10 @@ path = "src/bin/db_inject.rs"
 name = "fetch-watchtower-xonly-pubkeys"
 path = "src/bin/fetch_watchtower_xonly_pubkeys.rs"
 
+[[bin]]
+name = "mock-rpc"
+path = "src/bin/mock_rpc.rs"
+
 [dependencies]
 libp2p = { workspace = true, features = [
     "autonat",

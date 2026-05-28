@@ -120,6 +120,7 @@ pub struct PegoutResponse {
 #[derive(Debug, Deserialize)]
 pub struct GraphTxGetParams {
     pub tx_name: String,
+    pub index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,13 +495,19 @@ pub type GraphGetResponse = GraphExtended;
 
 #[derive(Deserialize, Serialize, Default)]
 pub struct GraphTxnGetResponse {
-    pub assert: BtcTxData,
-    pub watchtower_challenge_init: BtcTxData,
-    pub pre_kickoff: BtcTxData,
-    pub challenge: BtcTxData,
-    pub kickoff: BtcTxData,
+    pub cur_prekickoff: BtcTxData,
+    pub next_prekickoff: BtcTxData,
+    pub force_skip_kickoff: BtcTxData,
+    pub quick_challenge: BtcTxData,
+    pub challenge_incomplete_kickoff: BtcTxData,
     pub pegin: BtcTxData,
+    pub kickoff: BtcTxData,
     pub take1: BtcTxData,
+    pub challenge: BtcTxData,
+    pub watchtower_challenge_init: BtcTxData,
+    pub operator_assert: BtcTxData,
+    pub verifier_asserts: Vec<BtcTxData>,
+    pub disproves: Vec<BtcTxData>,
     pub take2: BtcTxData,
 }
 #[derive(Deserialize, Serialize, Default)]

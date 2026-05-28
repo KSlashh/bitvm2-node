@@ -93,6 +93,30 @@ impl AppState {
             http_client,
         }))
     }
+
+    pub async fn create_arc_mock_app_state(
+        local_db: LocalDB,
+        actor: Actor,
+        peer_id: String,
+        registry: Arc<Mutex<Registry>>,
+    ) -> anyhow::Result<Arc<AppState>> {
+        let (btc_client, btc_mock_adaptor) = BTCClient::new_mock_client();
+        btc_mock_adaptor.set_height(900_000);
+
+        let (goat_client, goat_mock_adaptor) = GOATClient::new_mock_client();
+        goat_mock_adaptor.set_latest_block_number(1_000_000);
+        goat_mock_adaptor.set_finalized_block_number(999_990);
+
+        Ok(Arc::new(AppState {
+            local_db,
+            btc_client,
+            goat_client,
+            metrics_state: MetricsState::new(registry),
+            actor,
+            peer_id,
+            http_client: HttpAsyncClient::new(None),
+        }))
+    }
 }
 
 /// Root path handler
@@ -115,15 +139,11 @@ async fn root() -> &'static str {
     "Hello, World!"
 }
 
-pub async fn serve(
+pub async fn serve_with_app_state(
     addr: String,
-    local_db: LocalDB,
-    actor: Actor,
-    peer_id: String,
-    registry: Arc<Mutex<Registry>>,
+    app_state: Arc<AppState>,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
-    let app_state = AppState::create_arc_app_state(local_db, actor, peer_id, registry).await?;
     let server = Router::new()
         .route(routes::ROOT, get(root))
         .route(routes::v1::NODES_BASE, get(get_nodes))
@@ -199,6 +219,18 @@ pub async fn serve(
             Ok("rpc_shutdown".to_string())
         }
     }
+}
+
+pub async fn serve(
+    addr: String,
+    local_db: LocalDB,
+    actor: Actor,
+    peer_id: String,
+    registry: Arc<Mutex<Registry>>,
+    cancellation_token: CancellationToken,
+) -> anyhow::Result<String> {
+    let app_state = AppState::create_arc_app_state(local_db, actor, peer_id, registry).await?;
+    serve_with_app_state(addr, app_state, cancellation_token).await
 }
 
 /// This method introduces performance overhead and is temporarily used for debugging with the frontend.
@@ -456,7 +488,7 @@ mod tests {
                 resp_validation: Some(Box::new(|text| -> bool {
                     matches!(
                         serde_json::from_str::<NodeOverViewResponse>(&text),
-                        Ok(node_overview) if node_overview.nodes_overview.online_challengers == 1 &&
+                        Ok(node_overview) if node_overview.nodes_overview.online_verifiers == 1 &&
                         node_overview.nodes_overview.online_committees == 1
                     )
                 })),

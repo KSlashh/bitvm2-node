@@ -503,7 +503,7 @@ pub struct GraphUpdate {
     pub status: Option<String>,
     pub sub_status: Option<String>,
     pub challenge_txid: Option<SerializableTxid>,
-    pub disprove_txid: Option<SerializableTxid>,
+    pub disprove_txids: Option<Vec<SerializableTxid>>,
     pub bridge_out_start_at: Option<i64>,
     pub init_withdraw_tx_hash: Option<String>,
     pub proceed_withdraw_height: Option<i64>,
@@ -517,7 +517,7 @@ impl GraphUpdate {
             status: None,
             sub_status: None,
             challenge_txid: None,
-            disprove_txid: None,
+            disprove_txids: None,
             bridge_out_start_at: None,
             init_withdraw_tx_hash: None,
             proceed_withdraw_height: None,
@@ -541,9 +541,9 @@ impl GraphUpdate {
         self
     }
 
-    /// Set disprove transaction ID
-    pub fn with_disprove_txid(mut self, disprove_txid: SerializableTxid) -> Self {
-        self.disprove_txid = Some(disprove_txid);
+    /// Set disprove transaction IDs
+    pub fn with_disprove_txids(mut self, disprove_txids: Vec<SerializableTxid>) -> Self {
+        self.disprove_txids = Some(disprove_txids);
         self
     }
 
@@ -570,7 +570,7 @@ impl GraphUpdate {
         self.status.is_some()
             || self.sub_status.is_some()
             || self.challenge_txid.is_some()
-            || self.disprove_txid.is_some()
+            || self.disprove_txids.is_some()
             || self.bridge_out_start_at.is_some()
             || self.init_withdraw_tx_hash.is_some()
             || self.proceed_withdraw_height.is_some()
@@ -590,9 +590,9 @@ impl GraphUpdate {
         if let Some(ref challenge_txid) = self.challenge_txid {
             query_builder.set_field("challenge_txid", QueryParam::BTCTxid(challenge_txid.clone()));
         }
-        if let Some(ref disprove_txid) = self.disprove_txid {
+        if let Some(ref disprove_txids) = self.disprove_txids {
             let disprove_txids_json =
-                serde_json::to_string(&vec![disprove_txid.clone()]).unwrap_or_else(|_| "[]".into());
+                serde_json::to_string(disprove_txids).unwrap_or_else(|_| "[]".into());
             query_builder.set_field("disprove_txids", QueryParam::Text(disprove_txids_json));
         }
         if let Some(bridge_out_start_at) = self.bridge_out_start_at {
@@ -1619,8 +1619,8 @@ impl<'a> StorageProcessor<'a> {
             res.total += record.total;
             match record.actor.as_str() {
                 "Verifier" => {
-                    (res.offline_challengers, res.online_challengers) =
-                        (record.offline, record.online);
+                    res.offline_verifiers += record.offline;
+                    res.online_verifiers += record.online;
                 }
                 "Operator" => {
                     (res.offline_operators, res.online_operators) = (record.offline, record.online);
