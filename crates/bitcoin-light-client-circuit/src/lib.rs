@@ -301,7 +301,7 @@ pub fn propose_longest_chain(
                 .input
                 .first()
                 .and_then(|input| input.witness.iter().next())
-                .map(|sig| bitcoin::taproot::Signature::from_slice(sig))
+                .map(bitcoin::taproot::Signature::from_slice)
             {
                 Some(Ok(sig)) => sig,
                 Some(Err(err)) => {

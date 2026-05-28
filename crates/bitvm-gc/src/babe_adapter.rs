@@ -48,6 +48,10 @@ pub const BABE_N_CC: usize = 181;
 // TODO: use verifiable_circuit_babe::babe::M_CC instead
 pub const BABE_M_CC: usize = 4;
 
+pub type OpenedInstanceSeeds = Vec<(usize, u64)>;
+pub type FinalizedInstances = Vec<FinalizedInstanceData>;
+pub type SetupAndSolderingData = (OpenedInstanceSeeds, FinalizedInstances, SolderingData);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CACSetupPackage {
     pub commits: Vec<CACInstanceCommit>,
@@ -254,7 +258,7 @@ pub fn open_real_setup_and_solder(
     finalized_indices: &[usize],
     vk: &Groth16VerifyingKey<Bn254>,
     public_inputs: &[Fr],
-) -> Result<(Vec<(usize, u64)>, Vec<FinalizedInstanceData>, SolderingData)> {
+) -> Result<SetupAndSolderingData> {
     ensure_real_gc_assets_configured()?;
     if private_state.statement_digest != statement_digest(vk, public_inputs)? {
         bail!("BABE setup statement does not match persisted verifier state");
@@ -318,7 +322,7 @@ pub fn derive_finalized_indices(package: &CACSetupPackage, m_cc: usize) -> Resul
 pub fn open_and_solder(
     package: &CACSetupPackage,
     finalized_indices: &[usize],
-) -> Result<(Vec<(usize, u64)>, Vec<FinalizedInstanceData>, SolderingData)> {
+) -> Result<SetupAndSolderingData> {
     let finalized_set = finalized_indices.iter().copied().collect::<HashSet<_>>();
     if finalized_set.len() != finalized_indices.len() {
         bail!("duplicate finalized index");
@@ -440,6 +444,7 @@ pub fn build_challenge_assert_witness(
 }
 
 /// Verifies a native operator assertion and reveals the real base-instance labels.
+#[allow(clippy::too_many_arguments)]
 pub fn build_real_challenge_assert_witness(
     private_state: &BabeVerifierPrivateState,
     package: &CACSetupPackage,
@@ -465,7 +470,7 @@ pub fn build_real_challenge_assert_witness(
         verifier,
         package: to_real_package(package),
         finalized_indices: finalized_indices.to_vec(),
-        wots_pk_p: operator_wots_pubkey.clone(),
+        wots_pk_p: *operator_wots_pubkey,
         presigs_p: babe_prover_presign(),
     };
     let real_witness = babe_verifier_challenge_assert_cac(

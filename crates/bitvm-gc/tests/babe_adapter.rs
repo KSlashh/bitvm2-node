@@ -3,8 +3,8 @@ use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
 use ark_groth16::Groth16;
 use bitvm_gc::assert_scripts::label_hash;
 use bitvm_gc::babe_adapter::{
-    BABE_M_CC, BabeChallengeAssertWitness, BabeProverState, BabeVerifierState, CACInstanceCommit,
-    CACSetupPackage, FinalizedInstanceData, SolderingData, BabeBundleBuilder, WOTS_SIG_COUNT,
+    BABE_M_CC, BabeBundleBuilder, BabeChallengeAssertWitness, BabeProverState, BabeVerifierState,
+    CACInstanceCommit, CACSetupPackage, FinalizedInstanceData, SolderingData, WOTS_SIG_COUNT,
     build_assert_witness, build_challenge_assert_witness, build_real_setup_package,
     build_setup_package, build_wrongly_challenged_witness,
     build_wrongly_challenged_witness_from_preimages, derive_finalized_indices,
@@ -94,7 +94,7 @@ fn babe_setup_payload_round_trips_and_derives_gc_data() {
         .expect("extract gc data");
 
     assert_eq!(gc_data.verifier_pubkey, verifier_pubkey());
-    assert_eq!(gc_data.final_msg_hashes.len(), BABE_M_CC);
+    assert_eq!(gc_data.final_msg_hashlocks.len(), BABE_M_CC);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn protocol_finalized_instances_contribute_one_base_wire_slot() {
 
     assert_eq!(BABE_M_CC, 4);
     assert_eq!(
-        gc_data.final_msg_hashes,
+        gc_data.final_msg_hashlocks,
         finalized.iter().map(|data| data.final_msg_hash).collect::<Vec<_>>()
     );
     assert!(gc_data.wire_hashes.as_slice() == finalized[0].wire_hashes.as_slice());

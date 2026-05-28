@@ -642,15 +642,15 @@ fn record_candidate_gc_data(
     if prover_state.h_msgs != gc_data.final_msg_hashlocks {
         bail!("BABE prover state hashes do not match GC slot hashes");
     }
-    if let Some(existing) = &candidate.gc_data {
-        if existing != &gc_data {
-            bail!("conflicting GC slot received for selected verifier");
-        }
+    if let Some(existing) = &candidate.gc_data
+        && existing != &gc_data
+    {
+        bail!("conflicting GC slot received for selected verifier");
     }
-    if let Some(existing) = &candidate.prover_state {
-        if existing != &prover_state {
-            bail!("conflicting BABE prover state received for selected verifier");
-        }
+    if let Some(existing) = &candidate.prover_state
+        && existing != &prover_state
+    {
+        bail!("conflicting BABE prover state received for selected verifier");
     }
     if candidate.gc_data.is_none() {
         candidate.gc_data = Some(gc_data);
@@ -1399,6 +1399,7 @@ async fn handle_cut_circuits_verifier(
 }
 
 // verify Verifier SolderingProof, build Graph and broadcast CreateGraph.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_soldering_proof_operator(
     ctx: &mut HandlerContext<'_>,
@@ -1407,8 +1408,8 @@ async fn handle_soldering_proof_operator(
     verifier_pubkey: &PublicKey,
     verifier_index: usize,
     setup_package: &CACSetupPackage,
-    opened: &Vec<(usize, u64)>,
-    finalized: &Vec<FinalizedInstanceData>,
+    opened: &[(usize, u64)],
+    finalized: &[FinalizedInstanceData],
     soldering: &SolderingData,
 ) -> Result<()> {
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
@@ -1454,8 +1455,8 @@ async fn handle_soldering_proof_operator(
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE validation")?;
     let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
     let package_for_validation = setup_package.clone();
-    let opened_for_validation = opened.clone();
-    let finalized_for_validation = finalized.clone();
+    let opened_for_validation = opened.to_vec();
+    let finalized_for_validation = finalized.to_vec();
     let soldering_for_validation = soldering.clone();
     let soldering_builder = Arc::clone(ctx.soldering_builder);
 
@@ -1476,7 +1477,7 @@ async fn handle_soldering_proof_operator(
     let gc_data = extract_gc_circuit_data(finalized, soldering, *verifier_pubkey)?;
     let prover_state = BabeProverState {
         package: setup_package.clone(),
-        finalized: finalized.clone(),
+        finalized: finalized.to_vec(),
         soldering: soldering.clone(),
         h_msgs: gc_data.final_msg_hashlocks.clone(),
     };
@@ -3994,7 +3995,7 @@ mod tests {
             package: package.clone(),
             finalized,
             soldering,
-            h_msgs: gc_data.final_msg_hashes.clone(),
+            h_msgs: gc_data.final_msg_hashlocks.clone(),
         };
         (package, gc_data, prover_state)
     }
@@ -4052,7 +4053,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(graph_data.len(), 1);
-        assert_eq!(graph_data[0].final_msg_hashes.len(), BABE_M_CC);
+        assert_eq!(graph_data[0].final_msg_hashlocks.len(), BABE_M_CC);
         assert_eq!(state.candidates[0].prover_state.as_ref().unwrap().finalized.len(), BABE_M_CC);
 
         let duplicate = record_candidate_gc_data(

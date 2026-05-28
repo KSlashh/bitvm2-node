@@ -12,8 +12,8 @@ use anyhow::{Result, anyhow};
 use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
-    BabeAssertWitness, BabeChallengeAssertWitness, BabeWronglyChallengedWitness, CACSetupPackage,
-    FinalizedInstanceData, SolderingData, BabeBundleBuilder,
+    BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness, BabeWronglyChallengedWitness,
+    CACSetupPackage, FinalizedInstanceData, SolderingData,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
