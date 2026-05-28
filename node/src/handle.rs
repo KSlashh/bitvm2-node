@@ -1,21 +1,23 @@
 use crate::action::*;
 use crate::env::{
-    COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_babe_setup_public_inputs,
-    get_bitvm_key, get_node_goat_address, is_relayer,
+    COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
+    is_relayer,
 };
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use bitcoin::{OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
-    BABE_M_CC, BABE_N_CC, BabeAssertWitness, BabeChallengeAssertWitness, BabeProverState,
-    CACSetupPackage, FinalizedInstanceData, SolderingData, build_assert_witness,
-    build_real_setup_package, derive_finalized_indices, extract_gc_circuit_data,
-    open_real_setup_and_solder, verify_real_setup,
+    BABE_M_CC, BABE_N_CC, BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness,
+    BabeProverState, CACSetupPackage, FinalizedInstanceData, SolderingData, assert_wots_message,
+    build_assert_witness, build_real_challenge_assert_witness, build_real_setup_package,
+    derive_finalized_indices, extract_gc_circuit_data, open_real_setup_and_solder,
+    recover_real_wrongly_challenged_witness, verify_real_setup,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::*;
@@ -30,6 +32,7 @@ use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm};
+use std::sync::Arc;
 use store::GraphStatus;
 use store::localdb::LocalDB;
 use uuid::Uuid;
@@ -40,6 +43,7 @@ pub struct HandlerContext<'a> {
     pub btc_client: &'a BTCClient,
     pub goat_client: &'a GOATClient,
     pub http_client: &'a HttpAsyncClient,
+    pub soldering_builder: &'a Arc<BabeBundleBuilder>,
     pub actor: Actor,
     pub from_peer_id: PeerId,
     pub id: MessageId,
@@ -1154,6 +1158,7 @@ async fn handle_confirm_instance_operator(
     Ok(())
 }
 
+// generate garbled circuits and broadcast GenCircuits.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_init_graph_verifier(
     ctx: &mut HandlerContext<'_>,
@@ -1171,7 +1176,7 @@ async fn handle_init_graph_verifier(
     } else {
         get_babe_gc_asset_paths()?;
         let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE setup")?;
-        let public_inputs = get_babe_setup_public_inputs()?;
+        let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
         let (setup_package, private_state) = tokio::task::spawn_blocking(move || {
             build_real_setup_package(BABE_N_CC, &vk, &public_inputs)
         })
@@ -1205,6 +1210,7 @@ async fn handle_init_graph_verifier(
     Ok(())
 }
 
+//  select a subset of GC and broadcast CutCircuits.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_gen_circuits_operator(
     ctx: &mut HandlerContext<'_>,
@@ -1237,6 +1243,7 @@ async fn handle_gen_circuits_operator(
     let operator_state = state.operator.get_or_insert_with(|| OperatorBabeSetupState {
         frozen_verifier_pubkeys: None,
         candidates: vec![],
+        asserted_wrapper_proof: None,
     });
 
     let was_frozen = operator_state.frozen_verifier_pubkeys.is_some();
@@ -1300,6 +1307,7 @@ async fn handle_gen_circuits_operator(
     Ok(())
 }
 
+// generate proofs for the choosen GC and broadcast SolderingProof.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_cut_circuits_verifier(
     ctx: &mut HandlerContext<'_>,
@@ -1366,12 +1374,14 @@ async fn handle_cut_circuits_verifier(
     get_babe_gc_asset_paths()?;
 
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE opening")?;
-    let public_inputs = get_babe_setup_public_inputs()?;
+    let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
     let private_state = verifier_state.private_state.clone();
     let selected_indices = selected_circuit_indexes.clone();
     let package_for_opening = setup_package.clone();
+    let soldering_builder = Arc::clone(ctx.soldering_builder);
     let (opened, finalized, soldering) = tokio::task::spawn_blocking(move || {
         open_real_setup_and_solder(
+            &soldering_builder,
             &private_state,
             &package_for_opening,
             &selected_indices,
@@ -1407,6 +1417,7 @@ async fn handle_cut_circuits_verifier(
     Ok(())
 }
 
+// verify Verifier SolderingProof, build Graph and broadcast CreateGraph.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_soldering_proof_operator(
     ctx: &mut HandlerContext<'_>,
@@ -1460,14 +1471,16 @@ async fn handle_soldering_proof_operator(
     }
 
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE validation")?;
-    let public_inputs = get_babe_setup_public_inputs()?;
+    let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
     let package_for_validation = setup_package.clone();
     let opened_for_validation = opened.clone();
     let finalized_for_validation = finalized.clone();
     let soldering_for_validation = soldering.clone();
+    let soldering_builder = Arc::clone(ctx.soldering_builder);
 
     tokio::task::spawn_blocking(move || {
         verify_real_setup(
+            &soldering_builder,
             &package_for_validation,
             &opened_for_validation,
             &finalized_for_validation,
@@ -1495,7 +1508,6 @@ async fn handle_soldering_proof_operator(
         prover_state,
     )?
     else {
-        // TODO(protocol): Add timeout and replacement for a selected verifier that does not deliver a valid soldering proof.
         save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
         return Ok(());
     };
@@ -3073,6 +3085,7 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
     Ok(())
 }
 
+// after the watchtower challenge flow is complete, build proof and broadcast Assert transaction.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_assert_ready_operator(
     ctx: &mut HandlerContext<'_>,
@@ -3089,14 +3102,13 @@ async fn handle_assert_ready_operator(
             Some(v) => v,
             None => return Ok(()),
         };
-    let (operator_proof, wait_secs) = get_operator_proof(
+    let (operator_wrapper_proof, wait_secs) = get_operator_wrapper_proof(
         ctx.local_db,
         ctx.http_client,
         &graph,
         ctx.btc_client,
         instance_id,
         graph_id,
-        String::new(),
     )
     .await?;
 
@@ -3108,15 +3120,30 @@ async fn handle_assert_ready_operator(
         return Ok(());
     }
 
-    let Some(operator_proof) = operator_proof else {
+    let Some(operator_wrapper_proof) = operator_wrapper_proof else {
         return Ok(());
     };
-    let assert_witness = build_assert_witness(&operator_proof.proof)?;
-    let operator_assert_proof = operator_assert_proof_from_witness(&assert_witness)?;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let wots_secret_key = operator_master_key.wots_keypair_for_graph(graph_id).0;
+    let assert_secret_key = operator_master_key.wots_keypair_for_graph(graph_id).0;
+    let assert_witness = build_assert_witness(&operator_wrapper_proof.proof, &assert_secret_key)?;
+    let assert_message = assert_wots_message(&assert_witness)?;
+    let mut asserted_wrapper_proof = Vec::new();
+    operator_wrapper_proof.proof.serialize_compressed(&mut asserted_wrapper_proof)?;
+    let mut setup_state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    let operator_state = setup_state
+        .operator
+        .as_mut()
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    if let Some(existing) = &operator_state.asserted_wrapper_proof
+        && existing != &asserted_wrapper_proof
+    {
+        bail!("operator assertion wrapper proof conflicts with persisted proof");
+    }
+    operator_state.asserted_wrapper_proof = Some(asserted_wrapper_proof);
+    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &setup_state)?;
 
-    let assert_tx = operator_sign_assert(&mut graph, &wots_secret_key, &operator_assert_proof)?;
+    let assert_tx = operator_sign_assert(&mut graph, &assert_secret_key, &assert_message)?;
     broadcast_nonstandard_tx(ctx.btc_client, &assert_tx).await?;
 
     let message_content = GOATMessageContent::AssertSent(AssertSent {
@@ -3130,6 +3157,7 @@ async fn handle_assert_ready_operator(
     Ok(())
 }
 
+// verify Operator DynamicPublicInput and Proof; broadcast PubinDisprove or ChallengeAssert as needed.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_assert_sent_verifier(
     ctx: &mut HandlerContext<'_>,
@@ -3144,13 +3172,14 @@ async fn handle_assert_sent_verifier(
             Some(v) => v,
             None => return Ok(()),
         };
-    let Some(_assert_tx) = ctx.btc_client.get_tx(&assert_txid).await? else {
+
+    let Some(assert_tx) = ctx.btc_client.get_tx(&assert_txid).await? else {
         tracing::warn!(
             "Ignore AssertSent for {instance_id}:{graph_id}: assert tx {assert_txid} not found on chain"
         );
         return Ok(());
     };
-    let Some(_assert_witness) = assert_witness else {
+    let Some(assert_witness) = assert_witness else {
         tracing::warn!(
             "Ignore AssertSent for {instance_id}:{graph_id}: assert witness is not available in message"
         );
@@ -3183,14 +3212,52 @@ async fn handle_assert_sent_verifier(
         );
         return Ok(());
     }
-    // TODO(protocol): Verify the Operator assertion against bound public inputs before enabling verifier challenge broadcast.
-    tracing::warn!(
-        "Stop AssertSent for {instance_id}:{graph_id} slot {verifier_index}: Operator assertion verification is not integrated"
-    );
+    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE challenge")?;
+    let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
+    let challenge_witness = build_real_challenge_assert_witness(
+        &saved_verifier_state.private_state,
+        &saved_verifier_state.setup_package,
+        &saved_verifier_state.finalized_indices,
+        &vk,
+        &public_inputs,
+        &graph.parameters.operator_wots_pubkeys,
+        assert_witness,
+        verifier_index,
+    )?;
+    let labels: [Vec<u8>; goat::assert_scripts::INPUT_WIRE_NUM] = challenge_witness
+        .input_labels
+        .iter()
+        .map(|label| label.to_vec())
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|labels: Vec<Vec<u8>>| {
+            anyhow!(
+                "BABE challenge witness exposes {} labels; expected {}",
+                labels.len(),
+                goat::assert_scripts::INPUT_WIRE_NUM
+            )
+        })?;
+    let operator_assert_txin = assert_tx
+        .input
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
+    let challenge_assert_tx =
+        build_verifier_assert_tx(&graph, operator_assert_txin, verifier_index, labels)?;
+    broadcast_nonstandard_tx(ctx.btc_client, &challenge_assert_tx).await?;
+    let message_content = GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
+        instance_id,
+        graph_id,
+        challenge_assert_txid: challenge_assert_tx.compute_txid(),
+        verifier_index,
+        challenge_witness: Some(challenge_witness),
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
 
     Ok(())
 }
 
+// compute msg after ChallengeAssert is broadcast and broadcast WronglyChallenge transaction.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_challenge_assert_sent_operator(
     ctx: &mut HandlerContext<'_>,
@@ -3218,7 +3285,7 @@ async fn handle_challenge_assert_sent_operator(
     validate_challenge_witness_index(verifier_index, challenge_witness)?;
     validate_expected_challenge_assert_txid(&graph, verifier_index, challenge_assert_txid)?;
 
-    if ctx.btc_client.get_tx(&challenge_assert_txid).await?.is_none() {
+    let Some(challenge_assert_tx) = ctx.btc_client.get_tx(&challenge_assert_txid).await? else {
         let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
         let message = make_message(ctx, content);
         push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
@@ -3227,16 +3294,83 @@ async fn handle_challenge_assert_sent_operator(
             "Retry ChallengeAssertSent later for {instance_id}:{graph_id}: challenge assert tx {challenge_assert_txid} not found on chain"
         );
         return Ok(());
+    };
+
+    let labels: [Vec<u8>; goat::assert_scripts::INPUT_WIRE_NUM] = challenge_witness
+        .input_labels
+        .iter()
+        .map(|label| label.to_vec())
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|labels: Vec<Vec<u8>>| {
+            anyhow!(
+                "BABE challenge witness exposes {} labels; expected {}",
+                labels.len(),
+                goat::assert_scripts::INPUT_WIRE_NUM
+            )
+        })?;
+    let operator_assert_txid = challenge_assert_tx
+        .input
+        .first()
+        .ok_or_else(|| anyhow!("published verifier assert transaction has no input"))?
+        .previous_output
+        .txid;
+    let operator_assert_tx =
+        ctx.btc_client.get_tx(&operator_assert_txid).await?.ok_or_else(|| {
+            anyhow!("published operator assert transaction {operator_assert_txid} is unavailable")
+        })?;
+    let operator_assert_txin = operator_assert_tx
+        .input
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("published operator assert transaction has no input"))?;
+    let expected_challenge_assert =
+        build_verifier_assert_tx(&graph, operator_assert_txin, verifier_index, labels)?;
+    if expected_challenge_assert.input.first().map(|input| &input.witness)
+        != challenge_assert_tx.input.first().map(|input| &input.witness)
+    {
+        bail!("published verifier assert witness does not match BABE challenge labels");
     }
 
-    // TODO(protocol): Recover all BABE hashlock preimages before broadcasting WronglyChallenged.
-    tracing::warn!(
-        "Stop ChallengeAssertSent for {instance_id}:{graph_id} slot {verifier_index}: BABE hashlock preimage recovery is not integrated for all finalized instances"
-    );
+    let setup_state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    let operator_state = setup_state
+        .operator
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    let candidate = operator_state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_index == Some(verifier_index))
+        .ok_or_else(|| anyhow!("missing BABE prover state for verifier slot {verifier_index}"))?;
+    let prover_state = candidate
+        .prover_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing BABE prover state for verifier slot {verifier_index}"))?;
+    let proof_bytes = operator_state
+        .asserted_wrapper_proof
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing asserted wrapper proof for graph {graph_id}"))?;
+    let proof = Groth16Proof::deserialize_compressed(proof_bytes.as_slice())
+        .context("deserialize asserted wrapper proof")?;
+    let wrongly_challenged_witness =
+        recover_real_wrongly_challenged_witness(prover_state, challenge_witness, &proof)?;
+    let (wrongly_challenged_input, _amount) = operator_sign_wrongly_challenged(
+        &graph,
+        verifier_index,
+        &wrongly_challenged_witness.final_msgs,
+    )?;
+    let wrongly_challenged_tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![wrongly_challenged_input],
+        output: vec![goat::scripts::p2a_output()],
+    };
+    broadcast_nonstandard_tx(ctx.btc_client, &wrongly_challenged_tx).await?;
 
     Ok(())
 }
 
+// broadcast NoWithdraw after the ChallengeAssert timelock expires.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_wrongly_challenge_timeout_verifier(
     ctx: &mut HandlerContext<'_>,
@@ -3895,6 +4029,7 @@ mod tests {
                 gc_data: None,
                 prover_state: None,
             }],
+            asserted_wrapper_proof: None,
         }
     }
 
@@ -3911,6 +4046,7 @@ mod tests {
                 gc_data: None,
                 prover_state: None,
             }],
+            asserted_wrapper_proof: None,
         };
 
         freeze_operator_candidates(&mut state).unwrap();

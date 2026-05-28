@@ -2289,7 +2289,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease 0.2.37",
  "proc-macro2",
@@ -2504,6 +2504,37 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
+source = "git+https://github.com/GOATNetwork/BitVM.git?branch=GA#26b0bd61b61b24b50b2d2443a7fda8e58412edfa"
+dependencies = [
+ "ark-bn254",
+ "ark-crypto-primitives",
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-groth16",
+ "ark-relations",
+ "ark-serialize 0.5.0",
+ "ark-std 0.5.0",
+ "bitcoin",
+ "bitcoin-script",
+ "bitcoin-script-stack",
+ "bitcoin-scriptexec",
+ "blake3",
+ "colored",
+ "itertools 0.13.0",
+ "num-bigint 0.4.6",
+ "num-traits",
+ "paste",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "regex",
+ "serde",
+ "sha2 0.10.9",
+ "tqdm",
+]
+
+[[package]]
+name = "bitvm"
+version = "0.1.0"
 source = "git+https://github.com/KSlashh/BitVM.git?branch=gc#c9ce9539642d804f6c3e5083fe210e25c5b3663a"
 dependencies = [
  "ark-bn254",
@@ -2545,7 +2576,7 @@ dependencies = [
  "bincode",
  "bitcoin",
  "bitcoin-script",
- "bitvm",
+ "bitvm 0.1.0 (git+https://github.com/KSlashh/BitVM.git?branch=gc)",
  "chacha20poly1305",
  "clap",
  "garbled-snark-verifier",
@@ -2560,6 +2591,7 @@ dependencies = [
  "serde-big-array",
  "serde_json",
  "sha2 0.10.9",
+ "soldering-host",
  "strum 0.26.3",
  "tracing",
  "uuid 1.23.0",
@@ -2582,7 +2614,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-light-client-circuit",
  "bitcoin-script",
- "bitvm",
+ "bitvm 0.1.0 (git+https://github.com/KSlashh/BitVM.git?branch=gc)",
  "bitvm-gc",
  "borsh",
  "cbft-rpc",
@@ -2604,6 +2636,8 @@ dependencies = [
  "libp2p-swarm-derive",
  "musig2",
  "once_cell",
+ "p3-bn254-fr",
+ "p3-field",
  "prometheus-client",
  "proof-builder",
  "rand 0.8.5",
@@ -2626,7 +2660,9 @@ dependencies = [
  "util",
  "uuid 1.23.0",
  "zeroize",
+ "zkm-recursion-core",
  "zkm-sdk",
+ "zkm-stark",
  "zkm-verifier",
 ]
 
@@ -4279,7 +4315,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5031,7 +5067,7 @@ dependencies = [
 [[package]]
 name = "garbled-snark-verifier"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm2-gc?rev=150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5#150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5"
+source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fbabe#834d4337341e14da569c8c98c9fff546c9aedab6"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5207,7 +5243,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-script",
  "bitcoin-scriptexec",
- "bitvm",
+ "bitvm 0.1.0 (git+https://github.com/KSlashh/BitVM.git?branch=gc)",
  "clap",
  "colored",
  "hex",
@@ -7616,7 +7652,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9303,7 +9339,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap 0.10.1",
@@ -10753,7 +10789,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10856,7 +10892,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11591,7 +11627,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11621,6 +11657,25 @@ dependencies = [
  "phf 0.11.3",
  "thiserror 1.0.69",
  "unicode-xid",
+]
+
+[[package]]
+name = "soldering-host"
+version = "1.1.0"
+source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fbabe#834d4337341e14da569c8c98c9fff546c9aedab6"
+dependencies = [
+ "ark-bn254",
+ "ark-crypto-primitives",
+ "ark-ff 0.5.0",
+ "ark-groth16",
+ "ark-relations",
+ "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=GA)",
+ "garbled-snark-verifier",
+ "rand 0.8.5",
+ "tracing",
+ "verifiable-circuit-babe",
+ "zkm-build",
+ "zkm-sdk",
 ]
 
 [[package]]
@@ -12058,7 +12113,7 @@ dependencies = [
 [[package]]
 name = "substrate-bn"
 version = "0.6.0"
-source = "git+https://github.com/ziren-patches/bn.git?branch=patch-0.6.0#aba71380457d798039111e6cc0fdf2e0718c6766"
+source = "git+https://github.com/ziren-patches/bn?branch=patch-0.6.0#aba71380457d798039111e6cc0fdf2e0718c6766"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -12251,7 +12306,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13280,7 +13335,7 @@ dependencies = [
 [[package]]
 name = "verifiable-circuit-babe"
 version = "0.0.1"
-source = "git+https://github.com/GOATNetwork/bitvm2-gc?rev=150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5#150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5"
+source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fbabe#834d4337341e14da569c8c98c9fff546c9aedab6"
 dependencies = [
  "aes",
  "ark-bn254",
@@ -13291,6 +13346,8 @@ dependencies = [
  "ark-relations",
  "ark-serialize 0.5.0",
  "bincode",
+ "bitcoin",
+ "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=GA)",
  "blake3",
  "cfg-if",
  "garbled-snark-verifier",
@@ -13300,6 +13357,7 @@ dependencies = [
  "ripemd 0.2.0",
  "serde",
  "sha2 0.10.9",
+ "zkm-sdk",
  "zkm-zkvm",
 ]
 
@@ -13639,7 +13697,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14492,7 +14550,7 @@ dependencies = [
 [[package]]
 name = "zkm-build"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -14503,7 +14561,7 @@ dependencies = [
 [[package]]
 name = "zkm-core-executor"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "anyhow",
  "bincode",
@@ -14544,7 +14602,7 @@ dependencies = [
 [[package]]
 name = "zkm-core-machine"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -14596,7 +14654,7 @@ dependencies = [
 [[package]]
 name = "zkm-cuda"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "bincode",
  "ctrlc",
@@ -14614,7 +14672,7 @@ dependencies = [
 [[package]]
 name = "zkm-curves"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "cfg-if",
  "curve25519-dalek",
@@ -14638,7 +14696,7 @@ dependencies = [
 [[package]]
 name = "zkm-derive"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14648,7 +14706,7 @@ dependencies = [
 [[package]]
 name = "zkm-lib"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -14661,7 +14719,7 @@ dependencies = [
 [[package]]
 name = "zkm-primitives"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "bincode",
  "hex",
@@ -14679,7 +14737,7 @@ dependencies = [
 [[package]]
 name = "zkm-prover"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "anyhow",
  "bincode",
@@ -14716,7 +14774,7 @@ dependencies = [
 [[package]]
 name = "zkm-recursion-circuit"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "hashbrown 0.14.5",
  "itertools 0.13.0",
@@ -14749,7 +14807,7 @@ dependencies = [
 [[package]]
 name = "zkm-recursion-compiler"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "backtrace",
  "itertools 0.13.0",
@@ -14770,7 +14828,7 @@ dependencies = [
 [[package]]
 name = "zkm-recursion-core"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "backtrace",
  "ff 0.13.1",
@@ -14807,7 +14865,7 @@ dependencies = [
 [[package]]
 name = "zkm-recursion-derive"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "quote",
  "syn 1.0.109",
@@ -14816,7 +14874,7 @@ dependencies = [
 [[package]]
 name = "zkm-recursion-gnark-ffi"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "anyhow",
  "bincode",
@@ -14840,7 +14898,7 @@ dependencies = [
 [[package]]
 name = "zkm-sdk"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "alloy-primitives",
  "alloy-signer 1.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -14887,7 +14945,7 @@ dependencies = [
 [[package]]
 name = "zkm-stark"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "arrayref",
  "hashbrown 0.14.5",
@@ -14952,7 +15010,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "strum_macros 0.26.4",
- "substrate-bn 0.6.0 (git+https://github.com/ziren-patches/bn.git?branch=patch-0.6.0)",
+ "substrate-bn 0.6.0 (git+https://github.com/ziren-patches/bn?branch=patch-0.6.0)",
  "thiserror 2.0.18",
  "zkm-core-executor",
  "zkm-core-machine",
@@ -14965,7 +15023,7 @@ dependencies = [
 [[package]]
 name = "zkm-zkvm"
 version = "1.2.5"
-source = "git+https://github.com/ProjectZKM/Ziren#c736a41cccd623427295f89b53306673adc89966"
+source = "git+https://github.com/ProjectZKM/Ziren#53a8eff4e716d6091c2ced0401b7b9537535392a"
 dependencies = [
  "bincode",
  "cfg-if",

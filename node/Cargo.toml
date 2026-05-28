@@ -111,6 +111,10 @@ dirs = "5.0.1"
 
 zkm-sdk = { workspace = true }
 zkm-verifier = { workspace = true, features = ["ark"] }
+zkm-recursion-core = { workspace = true }
+zkm-stark = { workspace = true }
+p3-bn254-fr = { workspace = true }
+p3-field = { workspace = true }
 borsh = {version = "1.5.3", features = ["derive"] }
 
 proof-builder = { workspace = true }

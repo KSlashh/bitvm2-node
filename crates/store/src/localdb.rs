@@ -2,8 +2,8 @@ use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
     BridgeOutGlobalStats, GoatTxRecord, Graph, GraphBtcTxVoutMonitor, GraphRawData, Instance,
     LongRunningTaskProof, Message, Node, NodesOverview, OperatorProof, PeginGraphProcessData,
-    PeginInstanceProcessData, PendingGraphInit, ProofState, SequencerSetHashChange, SequencerSetScanState,
-    SerializableTxid, WatchContract, WatchtowerProof, WrapperProof,
+    PeginInstanceProcessData, PendingGraphInit, ProofState, SequencerSetHashChange,
+    SequencerSetScanState, SerializableTxid, WatchContract, WatchtowerProof, WrapperProof,
 };
 
 use indexmap::IndexMap;
@@ -1618,7 +1618,7 @@ impl<'a> StorageProcessor<'a> {
         for record in records {
             res.total += record.total;
             match record.actor.as_str() {
-                "Challenger" => {
+                "Verifier" => {
                     (res.offline_challengers, res.online_challengers) =
                         (record.offline, record.online);
                 }

@@ -79,10 +79,10 @@ pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
 pub const ENV_WATCHTOWER_PROOF_WAIT_SECS: &str = "WATCHTOWER_PROOF_WAIT_SECS";
 pub const ENV_OPERATOR_PROOF_WAIT_SECS: &str = "OPERATOR_PROOF_WAIT_SECS";
 pub const ENV_OPERATOR_VK_HASH: &str = "OPERATOR_VK_HASH";
+pub const ENV_OPERATOR_WRAPPER_VK_HASH: &str = "OPERATOR_WRAPPER_VK_HASH";
+pub const ENV_OPERATOR_WRAPPER_ZKM_VERSION: &str = "OPERATOR_WRAPPER_ZKM_VERSION";
 pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
-// TODO: remove it
-pub const ENV_BABE_SETUP_PUBLIC_INPUTS: &str = "BABE_SETUP_PUBLIC_INPUTS";
 pub const ENV_GC_GATES_PATH: &str = "GC_GATES_PATH";
 pub const ENV_GC_INDICES_PATH: &str = "GC_INDICES_PATH";
 
@@ -567,43 +567,14 @@ pub fn get_operator_vk_hash() -> anyhow::Result<[u8; 32]> {
     hex_parse::<32>(&value).map_err(|err| anyhow::anyhow!("invalid {ENV_OPERATOR_VK_HASH}: {err}"))
 }
 
-/// Parses configured field elements that bind the real BABE setup statement.
-pub fn parse_babe_setup_public_inputs(value: &str) -> anyhow::Result<Vec<ark_bn254::Fr>> {
-    use ark_serialize::CanonicalDeserialize;
-
-    let encoded: Vec<String> = serde_json::from_str(value)
-        .map_err(|err| anyhow::anyhow!("invalid {ENV_BABE_SETUP_PUBLIC_INPUTS} JSON: {err}"))?;
-    if encoded.is_empty() {
-        anyhow::bail!("{ENV_BABE_SETUP_PUBLIC_INPUTS} must contain at least one field element");
-    }
-    encoded
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let bytes = hex::decode(field).map_err(|err| {
-                anyhow::anyhow!(
-                    "invalid {ENV_BABE_SETUP_PUBLIC_INPUTS}[{index}] hex encoding: {err}"
-                )
-            })?;
-            if bytes.len() != 32 {
-                anyhow::bail!(
-                    "{ENV_BABE_SETUP_PUBLIC_INPUTS}[{index}] must contain a 32-byte canonical BN254 scalar"
-                );
-            }
-            ark_bn254::Fr::deserialize_compressed(bytes.as_slice()).map_err(|err| {
-                anyhow::anyhow!(
-                    "invalid {ENV_BABE_SETUP_PUBLIC_INPUTS}[{index}] BN254 scalar: {err}"
-                )
-            })
-        })
-        .collect()
+pub fn get_operator_wrapper_vk_hash() -> anyhow::Result<String> {
+    std::env::var(ENV_OPERATOR_WRAPPER_VK_HASH)
+        .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_WRAPPER_VK_HASH} needs to be set"))
 }
 
-// TODO: use instance id and graph id to generate groth16 public inputs
-pub fn get_babe_setup_public_inputs() -> anyhow::Result<Vec<ark_bn254::Fr>> {
-    let value = std::env::var(ENV_BABE_SETUP_PUBLIC_INPUTS)
-        .map_err(|_| anyhow::anyhow!("{ENV_BABE_SETUP_PUBLIC_INPUTS} is missing"))?;
-    parse_babe_setup_public_inputs(&value)
+pub fn get_operator_wrapper_zkm_version() -> anyhow::Result<String> {
+    std::env::var(ENV_OPERATOR_WRAPPER_ZKM_VERSION)
+        .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_WRAPPER_ZKM_VERSION} needs to be set"))
 }
 
 /// Returns the configured GC asset paths after checking that they are readable files.

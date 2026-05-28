@@ -16,6 +16,7 @@ use ::header_chain_proof::HeaderChainProofBuilder;
 use ::state_chain_proof::StateChainProofBuilder;
 use bitcoin::{BlockHash, Network, Txid};
 use client::btc_chain::BTCClient;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
@@ -245,7 +246,7 @@ async fn read_watchtower_challenge_details<'a>(
     i64,
     i64,
     Option<String>,
-    Vec<String>,
+    Vec<Option<String>>,
     Vec<bool>,
     Vec<String>,
     Option<String>,
@@ -265,8 +266,8 @@ async fn read_watchtower_challenge_details<'a>(
             Some(task) => {
                 tracing::info!("watchtower task: {task:?}");
                 // NOTE: we use watchtower challenge init txid to calculate the height
-                let watchtower_challenge_txids: Vec<String> =
-                    vec![task.challenge_init_txid.0.to_string()];
+                let watchtower_challenge_txids: Vec<Option<String>> =
+                    vec![Some(task.challenge_init_txid.0.to_string())];
                 let pubkeys: Vec<String> = vec![task.public_key.clone()];
                 (
                     task.id,
@@ -312,8 +313,10 @@ async fn read_watchtower_challenge_details<'a>(
                 );
             }
         }
-        let challenge_txids: Vec<String> =
-            watchtower_info.iter().map(|w| w.challenge_txid.0.to_string()).collect::<Vec<_>>();
+        let challenge_txids: Vec<Option<String>> = watchtower_info
+            .iter()
+            .map(|w| w.included.then(|| w.challenge_txid.0.to_string()))
+            .collect::<Vec<_>>();
         let challenge_public_keys: Vec<String> =
             watchtower_info.iter().map(|w| w.public_key.clone()).collect::<Vec<_>>();
         let included_watchtowers: Vec<bool> =
@@ -381,7 +384,7 @@ pub(crate) async fn fetch_on_demand_task(
 
     let mut largest_btc_block_height = 0;
     let btc_client = BTCClient::new(bitcoin_network, Some(esplora_url));
-    for txid in &watchtower_challenge_txids {
+    for txid in watchtower_challenge_txids.iter().flatten() {
         let txid = Txid::from_str(txid)?;
         let block_height = match btc_client.get_tx_status(&txid).await {
             Ok(tx_status) => {
@@ -772,18 +775,23 @@ pub(crate) async fn add_operator_task(
     graph_id: Uuid,
     operator_committed_blockhash: String,
     execution_layer_block_number: i64,
-    watchtower_challenge_txids: Vec<String>,
+    watchtower_challenge_txids: Vec<Option<String>>,
     included_watchtowers: Vec<bool>,
     watchtower_challenge_init_txid: String,
     watchtower_challenge_pubkeys: Vec<String>,
 ) -> anyhow::Result<u64> {
+    validate_indexed_watchtower_challenges(
+        &watchtower_challenge_txids,
+        &included_watchtowers,
+        &watchtower_challenge_pubkeys,
+    )?;
     let mut storage_processor = local_db.start_transaction().await?;
 
     let existing_watchtower_proof_task = storage_processor
         .find_watchtower_proof_by_instance_and_graph(&instance_id, &graph_id)
         .await?;
     tracing::info!("existing_watchtower_proof_task: {:?}", existing_watchtower_proof_task);
-    let timeout_watchtower_challenge_txids: Vec<String> = watchtower_challenge_txids
+    let missing_watchtower_indices: Vec<usize> = watchtower_challenge_txids
         .iter()
         .enumerate()
         .filter(|(node_index, _)| {
@@ -791,40 +799,44 @@ pub(crate) async fn add_operator_task(
                 .iter()
                 .any(|task| task.node_index as usize == *node_index)
         })
-        .map(|(_, txid)| txid.clone())
+        .map(|(node_index, _)| node_index)
         .collect();
-    tracing::info!("timeout_watchtower_challenge_txids: {:?}", timeout_watchtower_challenge_txids);
+    tracing::info!("missing_watchtower_indices: {:?}", missing_watchtower_indices);
     // insert timeout watchtower proof task with failed state.
-    for txid in timeout_watchtower_challenge_txids.iter() {
-        let node_index = watchtower_challenge_txids.iter().position(|t| t == txid).unwrap() as i32;
+    for node_index in missing_watchtower_indices {
+        let stored_txid = watchtower_challenge_txids[node_index]
+            .as_deref()
+            .unwrap_or(&watchtower_challenge_init_txid);
         let task = WatchtowerProof {
             id: 1,
             instance_id,
             graph_id,
             challenge_init_txid: Txid::from_str(&watchtower_challenge_init_txid)?.into(),
-            challenge_txid: Txid::from_str(txid)?.into(),
+            challenge_txid: Txid::from_str(stored_txid)?.into(),
             proof_state: ProofState::Failed.to_i64(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
             execution_layer_block_number,
-            public_key: watchtower_challenge_pubkeys[node_index as usize].clone(), // Note: this is a fake public key.
-            node_index,
+            public_key: watchtower_challenge_pubkeys[node_index].clone(), // Note: this is a fake public key.
+            node_index: node_index as i32,
+            included: included_watchtowers[node_index],
             ..Default::default()
         };
         let affected = storage_processor.create_watchtower_proof(&task).await?;
         tracing::info!(
-            "mark timeout watchtower proof as failed, txid: {txid}, affected rows: {affected}",
+            "mark timeout watchtower proof as failed, node_index: {node_index}, affected rows: {affected}",
         );
     }
 
     // update watchtower's challenge txid.
     for (i, txid) in watchtower_challenge_txids.iter().enumerate() {
+        let stored_txid = txid.as_deref().unwrap_or(&watchtower_challenge_init_txid);
         let affected = storage_processor
             .update_watchtower_proof_challenge_txid(
                 &instance_id,
                 &graph_id,
                 i as i32,
-                txid,
+                stored_txid,
                 included_watchtowers[i],
             )
             .await?;
@@ -847,6 +859,39 @@ pub(crate) async fn add_operator_task(
         .await?;
     storage_processor.commit().await?;
     Ok(affected_rows)
+}
+
+fn validate_indexed_watchtower_challenges(
+    challenge_txids: &[Option<String>],
+    included_watchtowers: &[bool],
+    challenge_pubkeys: &[String],
+) -> anyhow::Result<()> {
+    if challenge_txids.len() != included_watchtowers.len()
+        || challenge_txids.len() != challenge_pubkeys.len()
+    {
+        anyhow::bail!(
+            "watchtower challenge txids, included bitmap, and public keys must have equal lengths"
+        );
+    }
+
+    let mut seen = HashSet::new();
+    for (index, (txid, included)) in challenge_txids.iter().zip(included_watchtowers).enumerate() {
+        match (txid, included) {
+            (Some(txid), true) => {
+                Txid::from_str(txid)?;
+                if !seen.insert(txid) {
+                    anyhow::bail!("duplicate watchtower challenge txid at index {index}");
+                }
+            }
+            (None, false) => {}
+            (Some(_), false) | (None, true) => {
+                anyhow::bail!(
+                    "watchtower challenge txid and included flag disagree at index {index}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn find_operator_task(
@@ -950,8 +995,8 @@ mod tests {
         let graph_id = Uuid::from_str("00112233445566778899aabbccddeeff").unwrap();
         let number = 9511055;
         let watchtower_challenge_txids = vec![
-            "4506cf35cd70b3006fe3ce4a87ca1f9b0a76f348cfb529423e2d4c163c28d604".to_string(),
-            "f16286f143430a229c6d068798cd9ba751e83202de5045cc788aab227114cdb2".to_string(),
+            Some("4506cf35cd70b3006fe3ce4a87ca1f9b0a76f348cfb529423e2d4c163c28d604".to_string()),
+            None,
         ];
         let operator_committed_blockhash =
             "7f7b4344adb1b8937ddb7124e4f8bba80ee9adf5e8119de76ca8736816bda246".to_string();

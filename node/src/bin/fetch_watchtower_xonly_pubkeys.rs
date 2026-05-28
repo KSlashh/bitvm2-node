@@ -1,6 +1,6 @@
 use alloy::primitives::Address as EvmAddress;
 use anyhow::{Context, Result, anyhow};
-use bitvm2_noded::env::{
+use bitvm_noded::env::{
     ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_GOAT_NETWORK,
     get_goat_gateway_contract_from_env, get_goat_network, goat_config_from_env,
 };

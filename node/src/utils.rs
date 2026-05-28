@@ -20,8 +20,7 @@ use bitcoin::{
     XOnlyPublicKey,
 };
 use bitcoin_light_client_circuit::{
-    VK_HASH_SIZE, build_watchtower_commitment, decode_operator_public_outputs,
-    wrapper_public_values, zkm_vk_hash_to_raw,
+    VK_HASH_SIZE, build_watchtower_commitment, wrapper_public_values,
 };
 use bitvm::treepp::*;
 use bitvm_lib::actors::Actor;
@@ -50,6 +49,8 @@ use goat::transactions::signing::populate_p2wsh_witness;
 use indexmap::IndexMap;
 use libp2p::{PeerId, Swarm};
 use musig2::{PartialSignature, PubNonce};
+use p3_bn254_fr::Bn254Fr;
+use p3_field::{FieldAlgebra, PrimeField};
 use rand::Rng;
 use reqwest::Url;
 use secp256k1::Secp256k1;
@@ -101,14 +102,37 @@ use store::{
 use stun_client::{Attribute, Class, Client};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zkm_recursion_core::stark::KoalaBearPoseidon2Outer;
 use zkm_sdk::ZKMProofWithPublicValues;
-use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_vk};
+use zkm_stark::PartStarkVerifyingKey;
+use zkm_verifier::{
+    Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_vk, decode_zkm_vkey_hash,
+    hash_public_inputs, load_ark_public_inputs_from_bytes,
+};
 
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
 
 pub type VerifyingKey = ark_groth16::VerifyingKey<ark_bn254::Bn254>;
 pub type Groth16Proof = ark_groth16::Proof<ark_bn254::Bn254>;
 pub type PublicInputs = Vec<ark_bn254::Fr>;
+
+#[derive(Clone)]
+pub struct ValidatedOperatorWrapperProof {
+    pub proof: Groth16Proof,
+    pub public_inputs: PublicInputs,
+    pub verifying_key: VerifyingKey,
+    pub public_values: Vec<u8>,
+    pub wrapper_vk_hash: String,
+    pub zkm_version: String,
+}
+
+#[derive(Clone)]
+pub struct OperatorWrapperStatement {
+    pub public_values: Vec<u8>,
+    pub public_inputs: PublicInputs,
+    pub wrapper_vk_hash: String,
+    pub zkm_version: String,
+}
 
 pub mod todo_funcs {
     #![allow(dead_code, unreachable_code, unused_variables)]
@@ -1825,64 +1849,79 @@ pub async fn get_watchtower_commitment(
     }
 }
 
-#[tracing::instrument(name = "get_watchtower_challenge_info", skip(_btc_client))]
+#[tracing::instrument(name = "get_watchtower_challenge_info", skip(btc_client))]
 pub async fn get_watchtower_challenge_info(
-    _btc_client: &BTCClient,
-    _watchtower_challenge_init_txid: &SerializableTxid,
-    _num_watchtowers: usize,
-) -> Result<(Vec<String>, Vec<bool>)> {
-    todo!("watchtower challenge proof input is pending the GC refactor")
-}
-/// Returns:
-/// - `Ok(Some(OperatorProof), _)` if operator proof is available
-/// - `Ok(None, wait_secs)` if operator proof is not yet available, with suggested wait time
-pub async fn get_operator_proof(
-    _local_db: &LocalDB,
-    http_client: &HttpAsyncClient,
-    bitvm_graph: &BitvmGcGraph,
-    _btc_client: &BTCClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    operator_committed_blockhash: String,
-) -> Result<(Option<ProofData>, usize)> {
-    let Some(base_url) = get_proof_build_rpc_host() else {
-        tracing::warn!("Operator proof builder URL is not configured for {instance_id}:{graph_id}");
-        return Ok((None, env::get_operator_proof_wait_secs()));
-    };
-    let url = Url::parse(&base_url)?.join(NODES_OPERATOR_BASE)?;
-    let response = http_client
-        .post_response_json::<OperatorProofResponse, OperatorProofRequest>(
-            url.as_str(),
-            &OperatorProofRequest {
-                instance_id: instance_id.to_string(),
-                graph_id: graph_id.to_string(),
-                operator_committed_blockhash,
-                execution_layer_block_number: 0,
-                watchtower_challenge_txids: vec![],
-                included_watchtowers: vec![],
-                watchtower_challenge_init_txid: bitvm_graph
-                    .watchtower_challenge_init
-                    .tx()
-                    .compute_txid()
-                    .to_string(),
-                watchtower_challenge_pubkeys: bitvm_graph
-                    .parameters
-                    .watchtower_pubkeys
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-            },
-        )
-        .await?;
-    match response.proof_data {
-        Some(proof_data) if !proof_data.proof.is_empty() => Ok((Some(proof_data), 0)),
-        _ => Ok((None, env::get_operator_proof_wait_secs())),
+    btc_client: &BTCClient,
+    watchtower_challenge_init_txid: &SerializableTxid,
+    num_watchtowers: usize,
+) -> Result<(Vec<Option<String>>, Vec<bool>)> {
+    let mut challenge_txids = Vec::with_capacity(num_watchtowers);
+    let mut included_watchtowers = Vec::with_capacity(num_watchtowers);
+    for index in 0..num_watchtowers {
+        let spent_txid =
+            outpoint_spent_txid(btc_client, &watchtower_challenge_init_txid.0, index as u64)
+                .await?;
+        match spent_txid {
+            Some(txid) => {
+                let status = btc_client.get_tx_status(&txid).await?;
+                if !status.confirmed {
+                    bail!("watchtower challenge tx {txid} at index {index} is not confirmed yet");
+                }
+                challenge_txids.push(Some(txid.to_string()));
+                included_watchtowers.push(true);
+            }
+            None => {
+                challenge_txids.push(None);
+                included_watchtowers.push(false);
+            }
+        }
     }
+    Ok((challenge_txids, included_watchtowers))
 }
-
 fn load_part_stark_vk_for_zkm_version(zkm_version: &str) -> Result<Vec<u8>> {
     catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version).to_vec()))
         .map_err(|_| anyhow!("failed to load part_stark_vk for zkm_version {zkm_version}"))
+}
+
+fn combined_wrapper_vk_hash(wrapper_vk_hash: &str, zkm_version: &str) -> Result<[u8; 32]> {
+    if !wrapper_vk_hash.starts_with("0x") {
+        bail!("configured wrapper vk hash must use 0x-prefixed Ziren encoding");
+    }
+    let raw_vk_hash = decode_zkm_vkey_hash(wrapper_vk_hash)
+        .map_err(|e| anyhow!("invalid configured wrapper vk hash: {e:?}"))?;
+    let part_vk: PartStarkVerifyingKey<KoalaBearPoseidon2Outer> =
+        bincode::deserialize(&load_part_stark_vk_for_zkm_version(zkm_version)?)
+            .context("deserialize configured wrapper partial STARK verifying key")?;
+    let base = Bn254Fr::from_canonical_u32(256);
+    let mut field_hash = Bn254Fr::ZERO;
+    for byte in raw_vk_hash {
+        field_hash = field_hash * base + Bn254Fr::from_canonical_u32(byte as u32);
+    }
+    let combined = zkm_recursion_core::hash_vkey_with_part_vk(&part_vk, field_hash);
+    let bytes = combined.as_canonical_biguint().to_bytes_be();
+    if bytes.len() > 32 {
+        bail!("combined wrapper verifying key hash exceeds BN254 field encoding");
+    }
+    let mut encoded = [0u8; 32];
+    encoded[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(encoded)
+}
+
+pub fn derive_operator_wrapper_statement(graph_id: Uuid) -> Result<OperatorWrapperStatement> {
+    let public_values = wrapper_public_values(
+        get_operator_vk_hash()?,
+        *graph_id.as_bytes(),
+        get_genesis_sequencer_commit_id(),
+    )
+    .to_vec();
+    let wrapper_vk_hash = get_operator_wrapper_vk_hash()?;
+    let zkm_version = get_operator_wrapper_zkm_version()?;
+    let public_inputs = load_ark_public_inputs_from_bytes(
+        &combined_wrapper_vk_hash(&wrapper_vk_hash, &zkm_version)?,
+        &hash_public_inputs(&public_values),
+    )
+    .to_vec();
+    Ok(OperatorWrapperStatement { public_values, public_inputs, wrapper_vk_hash, zkm_version })
 }
 
 /// Returns:
@@ -1895,8 +1934,7 @@ pub async fn get_operator_wrapper_proof(
     btc_client: &BTCClient,
     instance_id: Uuid,
     graph_id: Uuid,
-    operator_committed_blockhash: String,
-) -> Result<(Option<(Groth16Proof, PublicInputs, VerifyingKey)>, usize)> {
+) -> Result<(Option<ValidatedOperatorWrapperProof>, usize)> {
     let mut storage_processor = local_db.acquire().await?;
     let Some(graph) = storage_processor.find_graph(&graph_id).await? else {
         warn!("graph:{graph_id} not found");
@@ -1925,6 +1963,22 @@ pub async fn get_operator_wrapper_proof(
             warn!("Failed to get watchtower challenge info: {e}");
             return Ok((None, get_operator_proof_wait_secs()));
         }
+    };
+    let operator_committed_blockhash = {
+        let mut largest: Option<(u32, BlockHash)> = None;
+        for txid in watchtower_challenge_txids.iter().flatten() {
+            let status = btc_client.get_tx_status(&Txid::from_str(txid)?).await?;
+            let (height, hash) = match (status.block_height, status.block_hash) {
+                (Some(height), Some(hash)) => (height, hash),
+                _ => bail!("watchtower challenge tx {txid} is not confirmed yet"),
+            };
+            if largest.is_none_or(|(largest_height, _)| height > largest_height) {
+                largest = Some((height, hash));
+            }
+        }
+        largest
+            .map(|(_, hash)| hash.to_string())
+            .ok_or_else(|| anyhow!("no confirmed watchtower challenge tx is available"))?
     };
 
     let base_url = Url::parse(
@@ -1957,11 +2011,8 @@ pub async fn get_operator_wrapper_proof(
         return Ok((None, get_operator_proof_wait_secs()));
     }
 
-    let operator_vk_hash = get_operator_vk_hash()?;
-    let genesis_txid = get_genesis_sequencer_commit_id();
-    let wrapper_values =
-        wrapper_public_values(operator_vk_hash, *graph_id.as_bytes(), genesis_txid);
-    let expected_public_values = wrapper_values.to_vec();
+    let statement = derive_operator_wrapper_statement(graph_id)?;
+    let expected_public_values = statement.public_values.clone();
     let genesis_txid_text = std::env::var(ENV_GENESIS_SEQUENCER_COMMIT_TXID)
         .map_err(|_| anyhow!("{ENV_GENESIS_SEQUENCER_COMMIT_TXID} needs to be set"))?;
 
@@ -1990,48 +2041,35 @@ pub async fn get_operator_wrapper_proof(
     if !proof_data.public_inputs.is_empty() && proof_data.public_inputs != expected_public_values {
         bail!("operator wrapper proof public input sidecar does not match proof");
     }
+    let expected_wrapper_vk_hash = statement.wrapper_vk_hash.clone();
+    if proof_data.vk != expected_wrapper_vk_hash {
+        bail!("operator wrapper proof vk hash does not match configured wrapper identity");
+    }
+    let expected_zkm_version = statement.zkm_version.clone();
+    if proof.zkm_version != expected_zkm_version || proof_data.zkm_version != expected_zkm_version {
+        bail!("operator wrapper proof Ziren version does not match configured wrapper identity");
+    }
 
     let part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
     let ark_proof =
         convert_ark_imm_wrap_vk(&proof, &proof_data.vk, &IMM_GROTH16_VK_BYTES, &part_stark_vk)
             .map_err(|e| anyhow!("failed to convert operator wrapper proof to ark format: {e}"))?;
+    if ark_proof.public_inputs.as_slice() != statement.public_inputs.as_slice() {
+        bail!("operator wrapper proof public inputs do not match graph setup statement");
+    }
 
     Ok((
-        Some((
-            ark_proof.proof.clone(),
-            ark_proof.public_inputs.into(),
-            ark_proof.groth16_vk.into(),
-        )),
+        Some(ValidatedOperatorWrapperProof {
+            proof: ark_proof.proof.clone(),
+            public_inputs: ark_proof.public_inputs.into(),
+            verifying_key: ark_proof.groth16_vk.into(),
+            public_values: expected_public_values,
+            wrapper_vk_hash: expected_wrapper_vk_hash,
+            zkm_version: expected_zkm_version,
+        }),
         0,
     ))
 }
-const ASSERT_COMMIT_CACHE_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct CachedAssertCommitInput {
-    txin: Vec<u8>,
-    amount_sat: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CachedAssertCommitInputs {
-    version: u32,
-    inputs: Vec<CachedAssertCommitInput>,
-}
-
-fn embed_txin_into_dummy_tx(txin: &TxIn) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version(2),
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![txin.clone()],
-        output: vec![],
-    }
-}
-
-fn extract_txin_from_dummy_tx(tx: &Transaction) -> TxIn {
-    tx.input[0].clone()
-}
-
 pub async fn verifier_force_skip_kickoff(client: &BTCClient, graph: &BitvmGcGraph) -> Result<Txid> {
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
     let verifier_master_keypair = verifier_master_key.master_keypair();
@@ -2632,7 +2670,7 @@ pub async fn build_graph_params(
     let operator_pubkey = operator_master_keypair.public_key().into();
     let operator_receive_address =
         node_p2wsh_address(instance_parameters.network, &operator_pubkey);
-    let operator_wots_pubkeys = operator_master_key.wots_keypair_for_graph(graph_id).1;
+    let (_, operator_wots_pubkeys) = operator_master_key.wots_keypair_for_graph(graph_id);
     let watchtower_pubkeys = goat_client.committee_mana_get_watchtowers().await?;
     let _guest_constant_value = get_guest_constant_value(instance_id, graph_id)?;
     Ok(BitvmGcGraphParameters {
@@ -4504,4 +4542,6 @@ pub struct OperatorVerifierCandidate {
 pub struct OperatorBabeSetupState {
     pub frozen_verifier_pubkeys: Option<Vec<PublicKey>>,
     pub candidates: Vec<OperatorVerifierCandidate>,
+    #[serde(default)]
+    pub asserted_wrapper_proof: Option<Vec<u8>>,
 }

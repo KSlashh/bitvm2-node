@@ -95,6 +95,10 @@ zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }
+zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-stark = { git = "https://github.com/ProjectZKM/Ziren" }
+p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3" }
+p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 
 #zkm-build = { path = "../Ziren/crates/build" }
 #zkm-core-executor = { path = "../Ziren/crates/core/executor" }
@@ -103,8 +107,9 @@ zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] 
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
 bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
-verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm2-gc", rev = "150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5", package = "verifiable-circuit-babe" }
-garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm2-gc", rev = "150ed7f6d79bd95ae25ee734efc56cc65bfbb1e5", package = "garbled-snark-verifier" }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
+soldering-host = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
 store = { path = "crates/store" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }

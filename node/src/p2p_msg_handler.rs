@@ -5,10 +5,12 @@ use crate::env::get_local_node_info;
 use crate::middleware::swarm::{BitvmSwarmWrapper, P2pMessageHandler, TickMessageType};
 use crate::utils::detect_heart_beat;
 use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
+use std::sync::Arc;
 use store::localdb::LocalDB;
 
 pub struct BitvmNodeProcessor {
@@ -16,6 +18,7 @@ pub struct BitvmNodeProcessor {
     pub btc_client: BTCClient,
     pub goat_client: GOATClient,
     pub http_client: HttpAsyncClient,
+    pub soldering_builder: Arc<BabeBundleBuilder>,
 }
 impl P2pMessageHandler for BitvmNodeProcessor {
     async fn recv_and_dispatch(
@@ -32,6 +35,7 @@ impl P2pMessageHandler for BitvmNodeProcessor {
             &self.btc_client,
             &self.goat_client,
             &self.http_client,
+            &self.soldering_builder,
             actor,
             from_peer_id,
             id,
@@ -71,6 +75,7 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                     &self.btc_client,
                     &self.goat_client,
                     &self.http_client,
+                    &self.soldering_builder,
                     actor,
                     peer_id,
                     GOATMessage::default_message_id(),

@@ -13,7 +13,7 @@ use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
     BabeAssertWitness, BabeChallengeAssertWitness, BabeWronglyChallengedWitness, CACSetupPackage,
-    FinalizedInstanceData, SolderingData,
+    FinalizedInstanceData, SolderingData, BabeBundleBuilder,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
@@ -25,6 +25,7 @@ use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use store::MessageState;
 use store::localdb::LocalDB;
 use tracing::warn;
@@ -333,6 +334,7 @@ pub async fn handle_self_p2p_msg(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     http_client: &HttpAsyncClient,
+    soldering_builder: &Arc<BabeBundleBuilder>,
     actor: Actor,
     from_peer_id: PeerId,
     id: MessageId,
@@ -359,6 +361,7 @@ pub async fn handle_self_p2p_msg(
             btc_client,
             goat_client,
             http_client,
+            soldering_builder,
             actor.clone(),
             from_peer_id,
             id.clone(),
@@ -407,6 +410,7 @@ pub async fn recv_and_dispatch(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     http_client: &HttpAsyncClient,
+    soldering_builder: &Arc<BabeBundleBuilder>,
     actor: Actor,
     from_peer_id: PeerId,
     id: MessageId,
@@ -424,6 +428,7 @@ pub async fn recv_and_dispatch(
         btc_client,
         goat_client,
         http_client,
+        soldering_builder,
         actor,
         from_peer_id,
         id,

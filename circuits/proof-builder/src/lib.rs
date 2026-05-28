@@ -121,7 +121,7 @@ pub struct OnDemandTask {
     pub state_chain_input_proof: String,
 
     pub watchtower_challenge_init_txid: Option<String>,
-    pub watchtower_challenge_txids: Vec<String>,
+    pub watchtower_challenge_txids: Vec<Option<String>>,
     pub included_watchtowers: Vec<bool>,
     pub watchtower_public_keys: Vec<String>,
     pub graph_id: Option<String>,
@@ -212,7 +212,7 @@ pub struct OperatorProofRequest {
     pub graph_id: String,
     pub operator_committed_blockhash: String,
     pub execution_layer_block_number: i64,
-    pub watchtower_challenge_txids: Vec<String>,
+    pub watchtower_challenge_txids: Vec<Option<String>>,
     pub included_watchtowers: Vec<bool>,
     pub watchtower_challenge_init_txid: String,
     pub watchtower_challenge_pubkeys: Vec<String>,

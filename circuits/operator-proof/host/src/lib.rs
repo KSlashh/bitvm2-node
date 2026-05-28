@@ -107,8 +107,14 @@ pub async fn fetch_target_block_and_watchtower_tx(
     Vec<PublicKey>,
     Vec<ScriptBuf>,
 )> {
-    let watchtower_challenge_txids: Vec<&str> = watchtower_challenge_txids.split(",").collect();
-    let watchtower_public_keys: Vec<&str> = watchtower_public_keys.split(",").collect();
+    let watchtower_challenge_txids: Vec<&str> =
+        watchtower_challenge_txids.split(",").filter(|s| !s.is_empty()).collect();
+    let watchtower_public_keys: Vec<&str> =
+        watchtower_public_keys.split(",").filter(|s| !s.is_empty()).collect();
+    anyhow::ensure!(
+        watchtower_challenge_txids.len() == watchtower_public_keys.len(),
+        "watchtower challenge txids and public keys must have equal lengths"
+    );
     let btc_client = BTCClient::new(bitcoin_network, Some(&esplora_url));
 
     let latest_sequencer_commit_txid = Txid::from_str(&latest_sequencer_commit_txid)?;

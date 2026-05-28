@@ -4,12 +4,14 @@ use ark_groth16::Groth16;
 use bitvm_gc::assert_scripts::label_hash;
 use bitvm_gc::babe_adapter::{
     BABE_M_CC, BabeChallengeAssertWitness, BabeProverState, BabeVerifierState, CACInstanceCommit,
-    CACSetupPackage, FinalizedInstanceData, LAMPORT_SIG_COUNT, SolderingData, build_assert_witness,
-    build_challenge_assert_witness, build_real_setup_package, build_setup_package,
-    build_wrongly_challenged_witness, build_wrongly_challenged_witness_from_preimages,
-    derive_finalized_indices, extract_gc_circuit_data, open_and_solder, open_real_setup_and_solder,
-    verify_real_setup, verify_setup,
+    CACSetupPackage, FinalizedInstanceData, SolderingData, BabeBundleBuilder, WOTS_SIG_COUNT,
+    build_assert_witness, build_challenge_assert_witness, build_real_setup_package,
+    build_setup_package, build_wrongly_challenged_witness,
+    build_wrongly_challenged_witness_from_preimages, derive_finalized_indices,
+    extract_gc_circuit_data, open_and_solder, open_real_setup_and_solder, verify_real_setup,
+    verify_setup,
 };
+use bitvm_gc::operator::generate_wots_key;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use std::collections::HashSet;
@@ -25,7 +27,7 @@ fn verifier_pubkey() -> bitcoin::PublicKey {
 
 #[test]
 #[ignore = "requires GC_GATES_PATH and GC_INDICES_PATH runtime assets"]
-fn real_setup_restores_private_state_and_refuses_unverified_soldering_proof() {
+fn real_setup_restores_private_state_and_verifies_soldering_proof() {
     let mut rng = ChaCha12Rng::seed_from_u64(42);
     let a = Fr::from(3_u64);
     let b = Fr::from(7_u64);
@@ -41,21 +43,32 @@ fn real_setup_restores_private_state_and_refuses_unverified_soldering_proof() {
     let restored =
         serde_json::from_slice(&serde_json::to_vec(&private_state).expect("serialize state"))
             .expect("deserialize state");
+    let soldering_builder = BabeBundleBuilder::new();
     let finalized_indices = (0..BABE_M_CC).collect::<Vec<_>>();
-    let (opened, finalized, soldering) =
-        open_real_setup_and_solder(&restored, &package, &finalized_indices, &vk, &public_inputs)
-            .expect("open real setup");
+    let (opened, finalized, soldering) = open_real_setup_and_solder(
+        &soldering_builder,
+        &restored,
+        &package,
+        &finalized_indices,
+        &vk,
+        &public_inputs,
+    )
+    .expect("open real setup");
 
     assert!(opened.is_empty());
     assert_eq!(finalized.len(), BABE_M_CC);
-    let error = verify_real_setup(&package, &opened, &finalized, &soldering, &vk, &public_inputs)
-        .expect_err("soldering proof must not be treated as verified");
-    assert!(error.to_string().contains("soldering proof"));
-    let graph_error = match extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey()) {
-        Ok(_) => panic!("wire domains must differ"),
-        Err(error) => error,
-    };
-    assert!(graph_error.to_string().contains("incompatible with GOAT verifier connector"));
+    verify_real_setup(
+        &soldering_builder,
+        &package,
+        &opened,
+        &finalized,
+        &soldering,
+        &vk,
+        &public_inputs,
+    )
+    .expect("verify soldering proof");
+    extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey())
+        .expect("extract native 508-wire graph data");
 }
 
 #[test]
@@ -172,9 +185,12 @@ fn verify_setup_accepts_valid_opening_and_rejects_invalid_shapes() {
 
 #[test]
 fn witness_builders_validate_inputs_and_indices() {
-    let assert_witness = build_assert_witness(b"proof").expect("assert witness");
-    assert_eq!(assert_witness.lamport_sig.len(), LAMPORT_SIG_COUNT);
-    assert!(build_assert_witness(&[]).is_err());
+    let (assert_secret_key, _) = generate_wots_key("graph-scoped-key");
+    let proof = ark_groth16::Proof::<ark_bn254::Bn254>::default();
+    let assert_witness = build_assert_witness(&proof, &assert_secret_key).expect("assert witness");
+    assert_eq!(assert_witness.wots_sig.len(), WOTS_SIG_COUNT);
+    assert!(!assert_witness.pi1.is_empty());
+    assert!(build_assert_witness(&proof, &Vec::new()).is_err());
 
     let verifier_state = BabeVerifierState {
         package: build_setup_package(BABE_M_CC).expect("setup package"),
@@ -184,6 +200,7 @@ fn witness_builders_validate_inputs_and_indices() {
     let challenge_witness = build_challenge_assert_witness(&verifier_state, &assert_witness, 12)
         .expect("challenge witness");
     assert_eq!(challenge_witness.verifier_index, 12);
+    assert_eq!(challenge_witness.input_labels.len(), 512);
 
     let final_msgs = (0..BABE_M_CC)
         .map(|index| format!("finalized-preimage-{index}").into_bytes())
@@ -204,20 +221,20 @@ fn witness_builders_validate_inputs_and_indices() {
         build_wrongly_challenged_witness(
             &prover_state,
             &challenge_witness,
-            vec![b"missing-preimage".to_vec()],
+            vec![b"missing-preimage".to_vec(); BABE_M_CC],
         )
         .is_err()
     );
 }
 
 #[test]
-fn wrongly_challenged_witness_requires_all_preimages_in_finalized_order() {
+fn wrongly_challenged_witness_requires_all_finalized_preimages() {
     let final_msgs = (0..BABE_M_CC)
         .map(|index| format!("finalized-preimage-{index}").into_bytes())
         .collect::<Vec<_>>();
     let h_msgs = final_msgs.iter().map(label_hash).collect::<Vec<_>>();
     let challenge_witness =
-        BabeChallengeAssertWitness { verifier_index: 0, input_labels: vec![], lamport_sig: vec![] };
+        BabeChallengeAssertWitness { verifier_index: 0, input_labels: vec![], wots_sig: vec![] };
 
     let from_preimages = build_wrongly_challenged_witness_from_preimages(
         &h_msgs,
@@ -242,13 +259,11 @@ fn wrongly_challenged_witness_requires_all_preimages_in_finalized_order() {
     .expect("delegated wrongly challenged witness");
     assert_eq!(delegated, from_preimages);
 
-    let mut wrong_order = from_preimages.final_msgs.clone();
-    wrong_order.swap(0, 1);
     assert!(
         build_wrongly_challenged_witness_from_preimages(
             &prover_state.h_msgs,
             &challenge_witness,
-            wrong_order,
+            vec![from_preimages.final_msgs[0].clone(); BABE_M_CC],
         )
         .is_err()
     );
