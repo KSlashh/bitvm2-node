@@ -36,8 +36,8 @@ name = "update-db"
 path = "src/bin/db_inject.rs"
 
 [[bin]]
-name = "part-stark-vk-attest"
-path = "src/bin/part_stark_vk_attest.rs"
+name = "fetch-watchtower-xonly-pubkeys"
+path = "src/bin/fetch_watchtower_xonly_pubkeys.rs"
 
 [dependencies]
 libp2p = { workspace = true, features = [
@@ -111,8 +111,11 @@ dirs = "5.0.1"
 
 zkm-sdk = { workspace = true }
 zkm-verifier = { workspace = true, features = ["ark"] }
+zkm-recursion-core = { workspace = true }
+zkm-stark = { workspace = true }
+p3-bn254-fr = { workspace = true }
+p3-field = { workspace = true }
 borsh = {version = "1.5.3", features = ["derive"] }
-semver = "1.0"
 
 proof-builder = { workspace = true }
 util = { workspace = true }

@@ -16,9 +16,11 @@ use goat::constants::{CONNECTOR_Z_TIMELOCK, NUM_BLOCKS_PER_HOUR};
 use libp2p::PeerId;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::str::FromStr;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
+use util::hex_parse;
 use zeroize::Zeroizing;
 
 pub const ENV_BTC_CHAIN_URL: &str = "BTC_CHAIN_URL";
@@ -76,8 +78,13 @@ pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
 
 pub const ENV_WATCHTOWER_PROOF_WAIT_SECS: &str = "WATCHTOWER_PROOF_WAIT_SECS";
 pub const ENV_OPERATOR_PROOF_WAIT_SECS: &str = "OPERATOR_PROOF_WAIT_SECS";
+pub const ENV_OPERATOR_VK_HASH: &str = "OPERATOR_VK_HASH";
+pub const ENV_OPERATOR_WRAPPER_VK_HASH: &str = "OPERATOR_WRAPPER_VK_HASH";
+pub const ENV_OPERATOR_WRAPPER_ZKM_VERSION: &str = "OPERATOR_WRAPPER_ZKM_VERSION";
 pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
+pub const ENV_GC_GATES_PATH: &str = "GC_GATES_PATH";
+pub const ENV_GC_INDICES_PATH: &str = "GC_INDICES_PATH";
 
 pub const ENV_ALWAYS_CHALLENGE: &str = "ALWAYS_CHALLENGE";
 pub const ENV_GENESIS_SEQUENCER_COMMIT_TXID: &str = "GENESIS_SEQUENCER_COMMIT_TXID";
@@ -552,6 +559,41 @@ pub fn get_operator_proof_wait_secs() -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_OPERATOR_PROOF_WAIT_SECS)
+}
+
+pub fn get_operator_vk_hash() -> anyhow::Result<[u8; 32]> {
+    let value = std::env::var(ENV_OPERATOR_VK_HASH)
+        .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_VK_HASH} needs to be set"))?;
+    hex_parse::<32>(&value).map_err(|err| anyhow::anyhow!("invalid {ENV_OPERATOR_VK_HASH}: {err}"))
+}
+
+pub fn get_operator_wrapper_vk_hash() -> anyhow::Result<String> {
+    std::env::var(ENV_OPERATOR_WRAPPER_VK_HASH)
+        .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_WRAPPER_VK_HASH} needs to be set"))
+}
+
+pub fn get_operator_wrapper_zkm_version() -> anyhow::Result<String> {
+    std::env::var(ENV_OPERATOR_WRAPPER_ZKM_VERSION)
+        .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_WRAPPER_ZKM_VERSION} needs to be set"))
+}
+
+/// Returns the configured GC asset paths after checking that they are readable files.
+/// TODO: maybe multi files
+pub fn get_babe_gc_asset_paths() -> anyhow::Result<(PathBuf, PathBuf)> {
+    let gates_path = PathBuf::from(
+        std::env::var(ENV_GC_GATES_PATH)
+            .map_err(|_| anyhow::anyhow!("{ENV_GC_GATES_PATH} is missing"))?,
+    );
+    let indices_path = PathBuf::from(
+        std::env::var(ENV_GC_INDICES_PATH)
+            .map_err(|_| anyhow::anyhow!("{ENV_GC_INDICES_PATH} is missing"))?,
+    );
+    for (name, path) in [(ENV_GC_GATES_PATH, &gates_path), (ENV_GC_INDICES_PATH, &indices_path)] {
+        if !path.is_file() {
+            anyhow::bail!("{name} does not point to a readable file: {}", path.display());
+        }
+    }
+    Ok((gates_path, indices_path))
 }
 
 pub fn get_instance_maintenance_batch_size() -> u32 {

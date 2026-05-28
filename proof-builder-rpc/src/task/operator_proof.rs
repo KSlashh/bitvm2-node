@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use util::hex_parse;
+use zkm_sdk::HashableKey;
 
 #[tracing::instrument(level = "info", skip(local_db, cancellation_token))]
 pub(crate) fn spawn_operator_proof_task(
@@ -30,6 +31,7 @@ pub(crate) fn spawn_operator_proof_task(
         }
 
         let builder = OperatorProofBuilder::new();
+        info!("operator vk hash {:?}", builder.vk().bytes32());
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
@@ -50,8 +52,24 @@ pub(crate) fn spawn_operator_proof_task(
                                 args.graph_id
                             );
                             args.watchtower_challenge_init_txid = next_task.watchtower_challenge_init_txid.unwrap().clone();
-                            args.watchtower_challenge_txids = next_task.watchtower_challenge_txids.join(",");
-                            args.watchtower_public_keys = next_task.watchtower_public_keys.join(",");
+                            let included_challenges: Vec<_> = next_task
+                                .watchtower_challenge_txids
+                                .iter()
+                                .zip(&next_task.watchtower_public_keys)
+                                .filter_map(|(txid, public_key)| {
+                                    txid.as_ref().map(|txid| (txid.as_str(), public_key.as_str()))
+                                })
+                                .collect();
+                            args.watchtower_challenge_txids = included_challenges
+                                .iter()
+                                .map(|(txid, _)| *txid)
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            args.watchtower_public_keys = included_challenges
+                                .iter()
+                                .map(|(_, public_key)| *public_key)
+                                .collect::<Vec<_>>()
+                                .join(",");
                             // LE array to string, e.g. [1, 1, 1, 0] => 7
                             args.included_watchtowers = le_bits_to_u256(&next_task.included_watchtowers).to_string();
                             task_index = next_task.task_index;

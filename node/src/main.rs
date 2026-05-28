@@ -1,6 +1,7 @@
 #![feature(trivial_bounds)]
 use base64::Engine;
 use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use bitvm_noded::env::{
     self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, check_node_info, get_btc_url_from_env,
     get_goat_network, get_network, get_node_pubkey, goat_config_from_env,
@@ -160,6 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         btc_client: BTCClient::new(get_network(), get_btc_url_from_env().as_deref()),
         goat_client: GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()),
         http_client: HttpAsyncClient::new(None),
+        soldering_builder: Arc::new(BabeBundleBuilder::new()),
     };
 
     let actor_clone1 = actor.clone();

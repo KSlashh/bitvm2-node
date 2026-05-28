@@ -83,6 +83,7 @@ pub struct BitvmGcGraphParameters {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct BitvmGcCircuitData {
+    pub verifier_pubkey: PublicKey,
     pub final_msg_hashlocks: Vec<LabelHash>,
     #[serde(with = "BigArray")]
     pub wire_hashes: [WireHash; INPUT_WIRE_NUM],

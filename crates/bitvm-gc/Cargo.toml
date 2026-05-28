@@ -18,6 +18,13 @@ anyhow = { workspace = true }
 hex = { workspace = true }
 bitcoin-script = { workspace = true }
 tracing = { workspace = true }
+ark-bn254 = { workspace = true }
+ark-groth16 = { workspace = true }
+ark-serialize = { workspace = true }
+ark-ff = { workspace = true }
+verifiable-circuit-babe = { workspace = true }
+garbled-snark-verifier = { workspace = true }
+soldering-host = { workspace = true }
 
 serde-big-array = { workspace = true }
 serde_json = { workspace = true }
@@ -25,6 +32,10 @@ bincode.workspace = true
 uuid = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 strum = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+ark-crypto-primitives = { workspace = true }
+rand_chacha = { workspace = true }
 
 [features]
 default = []

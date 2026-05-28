@@ -495,6 +495,8 @@ async fn detect_assert_disprove_ready(
                     instance_id: graph.instance_id,
                     graph_id: graph.graph_id,
                     challenge_assert_txid: verifier_assert_txid,
+                    verifier_index: index,
+                    wrongly_challenged_witness: None,
                 }),
                 Some(index.to_string()),
             )));
