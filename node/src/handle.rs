@@ -416,19 +416,11 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         (
             GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
             Actor::Verifier,
-        )
-        | (
-            GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
-            Actor::Verifier,
         ) => handle_kickoff_sent_verifier(ctx, *instance_id, *graph_id, content).await,
         (GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }), _) => {
             handle_kickoff_sent_default(ctx, *instance_id, *graph_id, content).await
         }
         (
-            GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
-            Actor::Verifier,
-        )
-        | (
             GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
             Actor::Verifier,
         ) => handle_prekickoff_sent_verifier(ctx, *instance_id, *graph_id, content).await,
@@ -647,7 +639,7 @@ fn record_candidate_gc_data(
     if prover_state.finalized.len() != BABE_M_CC || prover_state.h_msgs.len() != BABE_M_CC {
         bail!("BABE prover state must contain exactly {BABE_M_CC} finalized instances and hashes");
     }
-    if prover_state.h_msgs != gc_data.final_msg_hashes {
+    if prover_state.h_msgs != gc_data.final_msg_hashlocks {
         bail!("BABE prover state hashes do not match GC slot hashes");
     }
     if let Some(existing) = &candidate.gc_data {
@@ -755,17 +747,6 @@ fn validate_expected_challenge_assert_txid(
         );
     }
     Ok(())
-}
-
-fn operator_assert_proof_from_witness(assert_witness: &BabeAssertWitness) -> Result<[u8; 64]> {
-    if assert_witness.pi1.is_empty() {
-        bail!("assert witness pi1 is empty");
-    }
-    let mut proof = [0u8; 64];
-    for (index, byte) in assert_witness.pi1.iter().cycle().take(64).enumerate() {
-        proof[index] = *byte;
-    }
-    Ok(proof)
 }
 
 fn should_ignore_invalid_pegin_request(e: &anyhow::Error, instance_id: Uuid) -> bool {
@@ -1497,7 +1478,7 @@ async fn handle_soldering_proof_operator(
         package: setup_package.clone(),
         finalized: finalized.clone(),
         soldering: soldering.clone(),
-        h_msgs: gc_data.final_msg_hashes.clone(),
+        h_msgs: gc_data.final_msg_hashlocks.clone(),
     };
     let Some(bitvm_gc_circuit_datas) = record_candidate_gc_data(
         operator_state,

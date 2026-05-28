@@ -8118,7 +8118,7 @@ dependencies = [
 
 [[package]]
 name = "operator-wrapper-proof"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -13363,7 +13363,7 @@ dependencies = [
 
 [[package]]
 name = "verifier"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "zkm-verifier",
 ]

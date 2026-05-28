@@ -65,13 +65,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use store::localdb::{
     GraphQuery, GraphUpdate, InstanceQuery, InstanceUpdate, LocalDB, StorageProcessor,
 };
-use store::{
-    BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, Instance,
-    InstanceBridgeInStatus, Message, MessageState, MessageType, Node, PeginGraphProcessData,
-    PeginInstanceProcessData, SerializableTxid, UInt64Array3,
-};
-use stun_client::{Attribute, Class, Client};
-use zkm_verifier::Groth16Verifier;
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
@@ -91,8 +84,9 @@ use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use proof_builder::{
-    ProofData, WatchtowerProofRequest, WatchtowerProofResponse,
-    WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse, WrapperProofResponse,
+    OperatorProofRequest, OperatorProofResponse, ProofData, WatchtowerProofRequest,
+    WatchtowerProofResponse, WatchtowerProofTimeoutUpdateRequest,
+    WatchtowerProofTimeoutUpdateResponse, WrapperProofResponse,
 };
 use store::{
     BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, Instance,

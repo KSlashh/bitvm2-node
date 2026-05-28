@@ -395,7 +395,7 @@ pub fn extract_gc_circuit_data(
         })?;
     Ok(BitvmGcCircuitData {
         verifier_pubkey,
-        final_msg_hashes: finalized.iter().map(|data| data.final_msg_hash).collect(),
+        final_msg_hashlocks: finalized.iter().map(|data| data.final_msg_hash).collect(),
         wire_hashes,
     })
 }
