@@ -4439,20 +4439,22 @@ pub async fn get_largest_watchtower_challenge_block(
 }
 
 fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> PathBuf {
-    let root = if local_db.is_mem {
-        std::env::temp_dir().join("bitvm2-node-babe-state")
-    } else {
-        let db_path = local_db
-            .path
-            .strip_prefix("sqlite://")
-            .or_else(|| local_db.path.strip_prefix("sqlite:"))
-            .unwrap_or(&local_db.path);
-        PathBuf::from(db_path)
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".bitvm-babe-state")
-    };
+    let root = std::env::var_os(ENV_BABE_SETUP_STATE_DIR)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let db_path = local_db
+                .path
+                .strip_prefix("sqlite://")
+                .or_else(|| local_db.path.strip_prefix("sqlite:"))
+                .unwrap_or(&local_db.path);
+            PathBuf::from(db_path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".bitvm-babe-state")
+        });
     root.join(instance_id.to_string()).join(format!("{graph_id}.json"))
 }
 
