@@ -43,7 +43,7 @@ pub struct HandlerContext<'a> {
     pub btc_client: &'a BTCClient,
     pub goat_client: &'a GOATClient,
     pub http_client: &'a HttpAsyncClient,
-    pub soldering_builder: &'a Arc<BabeBundleBuilder>,
+    pub soldering_builder: &'a Option<Arc<BabeBundleBuilder>>,
     pub actor: Actor,
     pub from_peer_id: PeerId,
     pub id: MessageId,
@@ -1359,7 +1359,11 @@ async fn handle_cut_circuits_verifier(
     let private_state = verifier_state.private_state.clone();
     let selected_indices = selected_circuit_indexes.clone();
     let package_for_opening = setup_package.clone();
-    let soldering_builder = Arc::clone(ctx.soldering_builder);
+    let soldering_builder = Arc::clone(
+        ctx.soldering_builder
+            .as_ref()
+            .context("BABE soldering builder is not initialized for Verifier")?,
+    );
     let (opened, finalized, soldering) = tokio::task::spawn_blocking(move || {
         open_real_setup_and_solder(
             &soldering_builder,
@@ -1458,7 +1462,11 @@ async fn handle_soldering_proof_operator(
     let opened_for_validation = opened.to_vec();
     let finalized_for_validation = finalized.to_vec();
     let soldering_for_validation = soldering.clone();
-    let soldering_builder = Arc::clone(ctx.soldering_builder);
+    let soldering_builder = Arc::clone(
+        ctx.soldering_builder
+            .as_ref()
+            .context("BABE soldering builder is not initialized for Operator")?,
+    );
 
     tokio::task::spawn_blocking(move || {
         verify_real_setup(

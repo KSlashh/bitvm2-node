@@ -161,7 +161,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         btc_client: BTCClient::new(get_network(), get_btc_url_from_env().as_deref()),
         goat_client: GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()),
         http_client: HttpAsyncClient::new(None),
-        soldering_builder: Arc::new(BabeBundleBuilder::new()),
+        soldering_builder: matches!(actor, Actor::Verifier | Actor::Operator)
+            .then(|| Arc::new(BabeBundleBuilder::new())),
     };
 
     let actor_clone1 = actor.clone();

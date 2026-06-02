@@ -18,7 +18,7 @@ pub struct BitvmNodeProcessor {
     pub btc_client: BTCClient,
     pub goat_client: GOATClient,
     pub http_client: HttpAsyncClient,
-    pub soldering_builder: Arc<BabeBundleBuilder>,
+    pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
 }
 impl P2pMessageHandler for BitvmNodeProcessor {
     async fn recv_and_dispatch(
