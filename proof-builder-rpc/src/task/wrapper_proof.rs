@@ -7,6 +7,7 @@ use store::localdb::LocalDB;
 use store::{ProofState, WrapperProof};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zkm_sdk::HashableKey;
 
 #[tracing::instrument(level = "info", skip(local_db))]
 pub(crate) async fn create_missing_wrapper_tasks(
@@ -72,6 +73,7 @@ pub(crate) fn spawn_wrapper_proof_task(
         }
 
         let builder = OperatorWrapperProofBuilder::new();
+        tracing::info!("operator wrapper vk hash {:?}", builder.vk().bytes32());
         let scan_interval = if args.scan_interval == 0 { interval } else { args.scan_interval };
         loop {
             tokio::select! {
