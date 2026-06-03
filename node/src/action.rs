@@ -8,7 +8,7 @@ use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
@@ -36,6 +36,8 @@ pub struct GOATMessage {
     pub actor: Actor,
     pub content: GOATMessageContent,
 }
+
+const GOAT_MESSAGE_BIN_PREFIX: &[u8] = b"GOATBIN1";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum GOATMessageContent {
@@ -319,12 +321,28 @@ impl GOATMessage {
 
     pub async fn serialize_message(&self) -> Result<Vec<u8>> {
         let cloned = self.clone();
-        Ok(tokio::task::spawn_blocking(move || serde_json::to_vec(&cloned)).await??)
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut encoded =
+                bincode::serialize(&cloned).context("failed to serialize bincode GOATMessage")?;
+            let mut message = Vec::with_capacity(GOAT_MESSAGE_BIN_PREFIX.len() + encoded.len());
+            message.extend_from_slice(GOAT_MESSAGE_BIN_PREFIX);
+            message.append(&mut encoded);
+            Ok::<_, anyhow::Error>(message)
+        })
+        .await??)
     }
 
     pub async fn deserialize_message(message: &[u8]) -> Result<GOATMessage> {
         let cloned = message.to_vec();
-        Ok(tokio::task::spawn_blocking(move || serde_json::from_slice(&cloned)).await??)
+        Ok(tokio::task::spawn_blocking(move || {
+            if let Some(encoded) = cloned.strip_prefix(GOAT_MESSAGE_BIN_PREFIX) {
+                bincode::deserialize(encoded).context("failed to deserialize bincode GOATMessage")
+            } else {
+                serde_json::from_slice(&cloned)
+                    .context("failed to deserialize legacy JSON GOATMessage")
+            }
+        })
+        .await??)
     }
 }
 #[allow(clippy::too_many_arguments)]
