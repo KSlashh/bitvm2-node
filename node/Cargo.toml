@@ -59,6 +59,7 @@ libp2p = { workspace = true, features = [
     "rsa",
     "macros",
     "gossipsub",
+    "request-response",
     "quic",
     "websocket",
 ] }
@@ -119,7 +120,7 @@ zkm-recursion-core = { workspace = true }
 zkm-stark = { workspace = true }
 p3-bn254-fr = { workspace = true }
 p3-field = { workspace = true }
-borsh = {version = "1.5.3", features = ["derive"] }
+borsh = { version = "1.5.3", features = ["derive"] }
 
 proof-builder = { workspace = true }
 util = { workspace = true }
