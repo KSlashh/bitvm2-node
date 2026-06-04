@@ -583,7 +583,7 @@ fn restore_real_verifier(
 ) -> Result<BABEVerifier> {
     let instances = state
         .instance_seeds
-        .iter()
+        .par_iter()
         .map(|seed| {
             let mut instance = BABEInstance::new_from_seed(*seed);
             instance.enc_setup(vk, public_inputs).map_err(anyhow::Error::msg)?;
