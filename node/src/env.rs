@@ -86,6 +86,10 @@ pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
 pub const ENV_GC_GATES_PATH: &str = "GC_GATES_PATH";
 pub const ENV_GC_INDICES_PATH: &str = "GC_INDICES_PATH";
 pub const ENV_BABE_SETUP_STATE_DIR: &str = "BABE_SETUP_STATE_DIR";
+pub const ENV_SOLDERING_PROOF_CHUNK_BYTES: &str = "SOLDERING_PROOF_CHUNK_BYTES";
+pub const DEFAULT_SOLDERING_PROOF_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+pub const MIN_SOLDERING_PROOF_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_SOLDERING_PROOF_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 
 pub const ENV_ALWAYS_CHALLENGE: &str = "ALWAYS_CHALLENGE";
 pub const ENV_GENESIS_SEQUENCER_COMMIT_TXID: &str = "GENESIS_SEQUENCER_COMMIT_TXID";
@@ -572,6 +576,14 @@ pub fn get_operator_proof_wait_secs() -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_OPERATOR_PROOF_WAIT_SECS)
+}
+
+pub fn get_soldering_proof_chunk_bytes() -> usize {
+    std::env::var(ENV_SOLDERING_PROOF_CHUNK_BYTES)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SOLDERING_PROOF_CHUNK_BYTES)
+        .clamp(MIN_SOLDERING_PROOF_CHUNK_BYTES, MAX_SOLDERING_PROOF_CHUNK_BYTES)
 }
 
 pub fn get_operator_vk_hash() -> anyhow::Result<[u8; 32]> {

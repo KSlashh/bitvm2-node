@@ -13,7 +13,7 @@ use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
     BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness, BabeWronglyChallengedWitness,
-    CACSetupPackage, FinalizedInstanceData, SolderingData,
+    CACSetupPackage,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
@@ -48,6 +48,7 @@ pub enum GOATMessageContent {
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
     SolderingProof(SolderingProof),
+    SolderingProofChunk(SolderingProofChunk),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -115,12 +116,21 @@ pub struct CutCircuits {
 pub struct SolderingProof {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub verifier_pubkey: PublicKey,
     pub verifier_index: usize,
-    pub setup_package: CACSetupPackage,
-    pub opened: Vec<(usize, u64)>,
-    pub finalized: Vec<FinalizedInstanceData>,
-    pub soldering: SolderingData,
+    pub payload_hash: [u8; 32],
+    pub total_len: usize,
+    pub payload: Vec<u8>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SolderingProofChunk {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_index: usize,
+    pub payload_hash: [u8; 32],
+    pub total_len: usize,
+    pub chunk_index: usize,
+    pub chunk_count: usize,
+    pub data: Vec<u8>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
@@ -321,7 +331,7 @@ impl GOATMessage {
 
     pub async fn serialize_message(&self) -> Result<Vec<u8>> {
         let cloned = self.clone();
-        Ok(tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut encoded =
                 bincode::serialize(&cloned).context("failed to serialize bincode GOATMessage")?;
             let mut message = Vec::with_capacity(GOAT_MESSAGE_BIN_PREFIX.len() + encoded.len());
@@ -329,12 +339,12 @@ impl GOATMessage {
             message.append(&mut encoded);
             Ok::<_, anyhow::Error>(message)
         })
-        .await??)
+        .await?
     }
 
     pub async fn deserialize_message(message: &[u8]) -> Result<GOATMessage> {
         let cloned = message.to_vec();
-        Ok(tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             if let Some(encoded) = cloned.strip_prefix(GOAT_MESSAGE_BIN_PREFIX) {
                 bincode::deserialize(encoded).context("failed to deserialize bincode GOATMessage")
             } else {
@@ -342,7 +352,7 @@ impl GOATMessage {
                     .context("failed to deserialize legacy JSON GOATMessage")
             }
         })
-        .await??)
+        .await?
     }
 }
 #[allow(clippy::too_many_arguments)]

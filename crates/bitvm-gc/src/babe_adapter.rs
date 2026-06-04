@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -86,6 +87,25 @@ pub struct RealFinalizedPayload {
     pub ct_setup: SerializableSetupCt,
     pub constant_labels: [[u8; 16]; 2],
     pub wots_padding_zero_labels: [[u8; 16]; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactFinalizedInstanceData {
+    pub index: usize,
+    pub real_data: RealFinalizedPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSolderingData {
+    pub finalized_indices: Vec<usize>,
+    pub proof: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSolderingProofPayload {
+    pub opened: OpenedInstanceSeeds,
+    pub finalized: Vec<CompactFinalizedInstanceData>,
+    pub soldering: CompactSolderingData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +230,15 @@ impl FinalizedInstanceData {
     }
 }
 
+impl CompactFinalizedInstanceData {
+    pub fn try_from_finalized(finalized: &FinalizedInstanceData) -> Result<Self> {
+        let real_data = finalized.real_data.clone().ok_or_else(|| {
+            anyhow::anyhow!("finalized index {} lacks real BABE payload", finalized.index)
+        })?;
+        Ok(Self { index: finalized.index, real_data })
+    }
+}
+
 impl SolderingData {
     /// Builds deterministic placeholder soldering data for the selected finalized indices.
     pub fn sample(finalized_indices: Vec<usize>) -> Self {
@@ -307,6 +336,38 @@ pub fn verify_real_setup(
     soldering_builder
         .babe_prover_verify_setup(&real_package, &bundle, vk, public_inputs)
         .map_err(anyhow::Error::msg)
+}
+
+/// Removes setup-derived public fields from the Verifier-to-Operator soldering proof payload.
+pub fn compact_soldering_proof_payload(
+    opened: &[(usize, u64)],
+    finalized: &[FinalizedInstanceData],
+    soldering: &SolderingData,
+) -> Result<CompactSolderingProofPayload> {
+    Ok(CompactSolderingProofPayload {
+        opened: opened.to_vec(),
+        finalized: finalized
+            .iter()
+            .map(CompactFinalizedInstanceData::try_from_finalized)
+            .collect::<Result<Vec<_>>>()?,
+        soldering: CompactSolderingData {
+            finalized_indices: soldering.finalized_indices.clone(),
+            proof: soldering.proof.clone(),
+        },
+    })
+}
+
+/// Reconstructs the full BABE setup data using the locally trusted setup package.
+pub fn expand_compact_soldering_proof_payload(
+    package: &CACSetupPackage,
+    payload: CompactSolderingProofPayload,
+) -> Result<SetupAndSolderingData> {
+    let finalized = payload
+        .finalized
+        .into_iter()
+        .map(|data| expand_compact_finalized_instance(package, data))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((payload.opened, finalized, expand_compact_soldering_data(payload.soldering)?))
 }
 
 /// Derives finalized circuit indices using the real BABE/CAC Fiat-Shamir selection.
@@ -647,6 +708,30 @@ fn from_real_finalized(
     finalized: &RealFinalizedInstanceData,
     package: &CACSetupPackage,
 ) -> Result<FinalizedInstanceData> {
+    let real_data = RealFinalizedPayload {
+        gc_ciphertexts: finalized
+            .gc_ciphertexts
+            .iter()
+            .map(|ciphertext| ciphertext.map(|label| label.0))
+            .collect(),
+        adaptor_table: from_real_adaptor_table(&finalized.adaptor_table),
+        ct_setup: SerializableSetupCt {
+            ct2_r_delta_g2: finalized.ct_setup.ct2_r_delta_g2.clone(),
+            ct3_masked_msg: finalized.ct_setup.ct3_masked_msg.clone(),
+        },
+        constant_labels: [finalized.constant_labels[0].0, finalized.constant_labels[1].0],
+        wots_padding_zero_labels: [[0u8; 16]; 4],
+    };
+    expand_compact_finalized_instance(
+        package,
+        CompactFinalizedInstanceData { index: finalized.index, real_data },
+    )
+}
+
+fn expand_compact_finalized_instance(
+    package: &CACSetupPackage,
+    finalized: CompactFinalizedInstanceData,
+) -> Result<FinalizedInstanceData> {
     let commit = package
         .commits
         .get(finalized.index)
@@ -670,20 +755,7 @@ fn from_real_finalized(
         gc_commitment: commit.com_gc,
         adaptor_commitment: commit.com_adaptor,
         ct_setup_commitment: commit.h_ct_setup,
-        real_data: Some(RealFinalizedPayload {
-            gc_ciphertexts: finalized
-                .gc_ciphertexts
-                .iter()
-                .map(|ciphertext| ciphertext.map(|label| label.0))
-                .collect(),
-            adaptor_table: from_real_adaptor_table(&finalized.adaptor_table),
-            ct_setup: SerializableSetupCt {
-                ct2_r_delta_g2: finalized.ct_setup.ct2_r_delta_g2.clone(),
-                ct3_masked_msg: finalized.ct_setup.ct3_masked_msg.clone(),
-            },
-            constant_labels: [finalized.constant_labels[0].0, finalized.constant_labels[1].0],
-            wots_padding_zero_labels: [[0u8; 16]; 4],
-        }),
+        real_data: Some(finalized.real_data),
     })
 }
 
@@ -756,6 +828,23 @@ fn from_real_soldering(soldering: &RealSolderingData) -> Result<SolderingData> {
             commitments: output.commitments.clone(),
         },
         proof: bincode::serialize(&soldering.soldering_proof.proof)?,
+    })
+}
+
+fn expand_compact_soldering_data(soldering: CompactSolderingData) -> Result<SolderingData> {
+    if soldering.proof.is_empty() {
+        bail!("soldering proof is empty");
+    }
+    let proof = RealSolderingProof { proof: bincode::deserialize(&soldering.proof)? };
+    let output = proof.output().map_err(anyhow::Error::msg)?;
+    Ok(SolderingData {
+        finalized_indices: soldering.finalized_indices,
+        soldered_output: SolderedLabelsData {
+            base_commitment: output.base_commitment.clone(),
+            deltas: output.deltas.clone(),
+            commitments: output.commitments.clone(),
+        },
+        proof: soldering.proof,
     })
 }
 

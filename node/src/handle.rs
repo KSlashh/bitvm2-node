@@ -14,10 +14,10 @@ use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
     BABE_M_CC, BABE_N_CC, BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness,
-    BabeProverState, CACSetupPackage, FinalizedInstanceData, SolderingData, assert_wots_message,
+    BabeProverState, CACSetupPackage, CompactSolderingProofPayload, assert_wots_message,
     build_assert_witness, build_real_challenge_assert_witness, build_real_setup_package,
-    derive_finalized_indices, extract_gc_circuit_data, open_real_setup_and_solder,
-    recover_real_wrongly_challenged_witness, verify_real_setup,
+    derive_finalized_indices, expand_compact_soldering_proof_payload, extract_gc_circuit_data,
+    open_real_setup_and_solder, recover_real_wrongly_challenged_witness, verify_real_setup,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::*;
@@ -212,12 +212,10 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             GOATMessageContent::SolderingProof(SolderingProof {
                 instance_id,
                 graph_id,
-                verifier_pubkey,
                 verifier_index,
-                setup_package,
-                opened,
-                finalized,
-                soldering,
+                payload_hash,
+                total_len,
+                payload,
             }),
             Actor::Operator,
         ) => {
@@ -225,12 +223,36 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 ctx,
                 *instance_id,
                 *graph_id,
-                verifier_pubkey,
                 *verifier_index,
-                setup_package,
-                opened,
-                finalized,
-                soldering,
+                *payload_hash,
+                *total_len,
+                payload,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::SolderingProofChunk(SolderingProofChunk {
+                instance_id,
+                graph_id,
+                verifier_index,
+                payload_hash,
+                total_len,
+                chunk_index,
+                chunk_count,
+                data,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_soldering_proof_chunk_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *verifier_index,
+                *payload_hash,
+                *total_len,
+                *chunk_index,
+                *chunk_count,
+                data,
             )
             .await
         }
@@ -1336,17 +1358,17 @@ async fn handle_cut_circuits_verifier(
             bail!("CutCircuits finalized indices conflict with persisted selection");
         }
         if let Some(soldering) = verifier_state.soldering.clone() {
-            let message_content = GOATMessageContent::SolderingProof(SolderingProof {
+            let setup_state = verifier_state;
+            send_soldering_proof_to_operator(
+                ctx.swarm,
                 instance_id,
                 graph_id,
-                verifier_pubkey: *verifier_pubkey,
                 verifier_index,
-                setup_package: verifier_state.setup_package,
-                opened: verifier_state.opened,
-                finalized: verifier_state.finalized,
-                soldering,
-            });
-            send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+                &setup_state.opened,
+                &setup_state.finalized,
+                &soldering,
+            )
+            .await?;
 
             return Ok(());
         }
@@ -1388,34 +1410,105 @@ async fn handle_cut_circuits_verifier(
         state.verifier = Some(verifier_state);
     })?;
 
-    let message_content = GOATMessageContent::SolderingProof(SolderingProof {
+    send_soldering_proof_to_operator(
+        ctx.swarm,
         instance_id,
         graph_id,
-        verifier_pubkey: *verifier_pubkey,
         verifier_index,
-        setup_package,
-        opened,
-        finalized,
-        soldering,
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+        &opened,
+        &finalized,
+        &soldering,
+    )
+    .await?;
 
     Ok(())
 }
 
-// verify Verifier SolderingProof, build Graph and broadcast CreateGraph.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_soldering_proof_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    verifier_pubkey: &PublicKey,
     verifier_index: usize,
-    setup_package: &CACSetupPackage,
-    opened: &[(usize, u64)],
-    finalized: &[FinalizedInstanceData],
-    soldering: &SolderingData,
+    payload_hash: [u8; 32],
+    total_len: usize,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() != total_len {
+        bail!(
+            "SolderingProof payload length {} does not match total_len {total_len}",
+            payload.len()
+        );
+    }
+    if soldering_payload_hash(payload) != payload_hash {
+        bail!("SolderingProof payload hash mismatch");
+    }
+    let payload: CompactSolderingProofPayload =
+        bincode::deserialize(payload).context("deserialize compact soldering proof payload")?;
+    handle_compact_soldering_proof_operator(ctx, instance_id, graph_id, verifier_index, payload)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_soldering_proof_chunk_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: [u8; 32],
+    total_len: usize,
+    chunk_index: usize,
+    chunk_count: usize,
+    data: &[u8],
+) -> Result<()> {
+    if total_len == 0 {
+        bail!("SolderingProofChunk total_len must be greater than zero");
+    }
+    if chunk_count == 0 {
+        bail!("SolderingProofChunk chunk_count must be greater than zero");
+    }
+    if chunk_count > total_len {
+        bail!("SolderingProofChunk chunk_count cannot exceed total_len");
+    }
+    if chunk_index >= chunk_count {
+        bail!("SolderingProofChunk chunk_index {chunk_index} out of range {chunk_count}");
+    }
+
+    let path = soldering_proof_chunk_state_path(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        verifier_index,
+        &payload_hash,
+    );
+    let mut accumulator = load_soldering_chunk_accumulator(&path, total_len, chunk_count)?;
+    let assembled = accumulator.insert(chunk_index, data.to_vec(), &payload_hash)?;
+    if let Some(payload) = assembled {
+        handle_soldering_proof_operator(
+            ctx,
+            instance_id,
+            graph_id,
+            verifier_index,
+            payload_hash,
+            total_len,
+            &payload,
+        )
+        .await?;
+        remove_soldering_chunk_accumulator(&path)?;
+    } else {
+        save_soldering_chunk_accumulator(&path, &accumulator)?;
+    }
+    Ok(())
+}
+
+// verify Verifier SolderingProof, build Graph and broadcast CreateGraph.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_compact_soldering_proof_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload: CompactSolderingProofPayload,
 ) -> Result<()> {
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
@@ -1444,24 +1537,28 @@ async fn handle_soldering_proof_operator(
         .frozen_verifier_pubkeys
         .as_ref()
         .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
-    if frozen.get(verifier_index) != Some(verifier_pubkey) {
-        bail!("SolderingProof verifier does not own slot {verifier_index}");
-    }
+    let verifier_pubkey = *frozen
+        .get(verifier_index)
+        .ok_or_else(|| anyhow!("SolderingProof verifier index {verifier_index} out of range"))?;
 
     let candidate = operator_state
         .candidates
         .iter()
-        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+        .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.setup_package != *setup_package {
-        bail!("SolderingProof setup package does not match selected candidate");
+    if candidate.verifier_index != Some(verifier_index) {
+        bail!("selected verifier candidate index does not match SolderingProof slot");
     }
+    let setup_package = candidate.setup_package.clone();
+    let (opened, finalized, soldering) =
+        expand_compact_soldering_proof_payload(&setup_package, payload)
+            .context("expand compact soldering proof payload")?;
 
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE validation")?;
     let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
     let package_for_validation = setup_package.clone();
-    let opened_for_validation = opened.to_vec();
-    let finalized_for_validation = finalized.to_vec();
+    let opened_for_validation = opened.clone();
+    let finalized_for_validation = finalized.clone();
     let soldering_for_validation = soldering.clone();
     let soldering_builder = Arc::clone(
         ctx.soldering_builder
@@ -1483,18 +1580,18 @@ async fn handle_soldering_proof_operator(
     .await
     .context("real BABE setup verification task failed")??;
 
-    let gc_data = extract_gc_circuit_data(finalized, soldering, *verifier_pubkey)?;
+    let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey)?;
     let prover_state = BabeProverState {
         package: setup_package.clone(),
-        finalized: finalized.to_vec(),
-        soldering: soldering.clone(),
+        finalized,
+        soldering,
         h_msgs: gc_data.final_msg_hashlocks.clone(),
     };
     let Some(bitvm_gc_circuit_datas) = record_candidate_gc_data(
         operator_state,
-        *verifier_pubkey,
+        verifier_pubkey,
         verifier_index,
-        setup_package,
+        &setup_package,
         gc_data,
         prover_state,
     )?

@@ -1,6 +1,7 @@
 use crate::action::{
     ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, KickoffSent, NodeInfo,
-    PreKickoffSent, Take1Sent, Take2Sent, push_local_unhandled_messages, send_to_peer,
+    PreKickoffSent, SolderingProof, SolderingProofChunk, Take1Sent, Take2Sent,
+    push_local_unhandled_messages, send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
@@ -55,6 +56,7 @@ use rand::Rng;
 use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -78,7 +80,7 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
 use bitcoin_light_client_circuit::hash_operator_constant;
 use bitvm_lib::babe_adapter::{
     BabeProverState, BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData,
-    SolderingData,
+    SolderingData, compact_soldering_proof_payload,
 };
 use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
@@ -4438,8 +4440,8 @@ pub async fn get_largest_watchtower_challenge_block(
     Ok(largest_watchtower_challenge_block_hash)
 }
 
-fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> PathBuf {
-    let root = std::env::var_os(ENV_BABE_SETUP_STATE_DIR)
+pub(crate) fn babe_setup_state_root(local_db: &LocalDB) -> PathBuf {
+    std::env::var_os(ENV_BABE_SETUP_STATE_DIR)
         .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -4454,8 +4456,219 @@ fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) 
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".bitvm-babe-state")
-        });
-    root.join(instance_id.to_string()).join(format!("{graph_id}.json"))
+        })
+}
+
+fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> PathBuf {
+    babe_setup_state_root(local_db).join(instance_id.to_string()).join(format!("{graph_id}.json"))
+}
+
+pub(crate) fn soldering_proof_chunk_state_path(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: &[u8; 32],
+) -> PathBuf {
+    let payload_hash_hex =
+        payload_hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    babe_setup_state_root(local_db)
+        .join(instance_id.to_string())
+        .join("soldering-proof-chunks")
+        .join(format!("{graph_id}-{verifier_index}-{payload_hash_hex}.bin"))
+}
+
+pub(crate) fn soldering_payload_hash(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
+}
+
+pub(crate) fn build_soldering_proof_messages(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload: Vec<u8>,
+    chunk_bytes: usize,
+) -> Result<Vec<GOATMessageContent>> {
+    if chunk_bytes == 0 {
+        bail!("soldering proof chunk size must be greater than zero");
+    }
+
+    let payload_hash = soldering_payload_hash(&payload);
+    let total_len = payload.len();
+    if total_len <= chunk_bytes {
+        return Ok(vec![GOATMessageContent::SolderingProof(SolderingProof {
+            instance_id,
+            graph_id,
+            verifier_index,
+            payload_hash,
+            total_len,
+            payload,
+        })]);
+    }
+
+    let chunk_count = total_len.div_ceil(chunk_bytes);
+    Ok(payload
+        .chunks(chunk_bytes)
+        .enumerate()
+        .map(|(chunk_index, data)| {
+            GOATMessageContent::SolderingProofChunk(SolderingProofChunk {
+                instance_id,
+                graph_id,
+                verifier_index,
+                payload_hash,
+                total_len,
+                chunk_index,
+                chunk_count,
+                data: data.to_vec(),
+            })
+        })
+        .collect())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SolderingProofChunkAccumulator {
+    total_len: usize,
+    chunk_count: usize,
+    chunks: Vec<Option<Vec<u8>>>,
+}
+
+impl SolderingProofChunkAccumulator {
+    pub(crate) fn new(total_len: usize, chunk_count: usize) -> Self {
+        Self { total_len, chunk_count, chunks: vec![None; chunk_count] }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        chunk_index: usize,
+        data: Vec<u8>,
+        expected_hash: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        if self.chunk_count == 0 {
+            bail!("soldering proof chunk_count must be greater than zero");
+        }
+        if chunk_index >= self.chunk_count {
+            bail!("soldering proof chunk_index {chunk_index} out of range {}", self.chunk_count);
+        }
+        if data.is_empty() {
+            bail!("soldering proof chunk data is empty");
+        }
+        if data.len() > self.total_len {
+            bail!("soldering proof chunk data exceeds total_len");
+        }
+
+        if let Some(existing) = &self.chunks[chunk_index] {
+            if existing != &data {
+                bail!("conflicting soldering proof chunk data for index {chunk_index}");
+            }
+            return self.assemble_if_complete(expected_hash);
+        }
+
+        self.chunks[chunk_index] = Some(data);
+        self.assemble_if_complete(expected_hash)
+    }
+
+    fn assemble_if_complete(&self, expected_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        if self.chunks.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
+        let mut payload = Vec::with_capacity(self.total_len);
+        for chunk in &self.chunks {
+            payload.extend_from_slice(chunk.as_ref().expect("all chunks are present"));
+        }
+        if payload.len() != self.total_len {
+            bail!(
+                "assembled soldering proof payload length {} does not match total_len {}",
+                payload.len(),
+                self.total_len
+            );
+        }
+        if soldering_payload_hash(&payload) != *expected_hash {
+            bail!("assembled soldering proof payload hash mismatch");
+        }
+        Ok(Some(payload))
+    }
+}
+
+pub(crate) fn load_soldering_chunk_accumulator(
+    path: &Path,
+    total_len: usize,
+    chunk_count: usize,
+) -> Result<SolderingProofChunkAccumulator> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let accumulator: SolderingProofChunkAccumulator =
+                bincode::deserialize(&bytes).context("deserialize soldering proof chunks")?;
+            if accumulator.total_len != total_len {
+                bail!("soldering proof chunk total_len conflicts with persisted state");
+            }
+            if accumulator.chunk_count != chunk_count {
+                bail!("soldering proof chunk_count conflicts with persisted state");
+            }
+            Ok(accumulator)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SolderingProofChunkAccumulator::new(total_len, chunk_count))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("read soldering proof chunk state {}", path.display()))
+        }
+    }
+}
+
+pub(crate) fn save_soldering_chunk_accumulator(
+    path: &Path,
+    accumulator: &SolderingProofChunkAccumulator,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create soldering proof chunk dir {}", parent.display()))?;
+    }
+    let bytes = bincode::serialize(accumulator).context("serialize soldering proof chunks")?;
+    std::fs::write(path, bytes)
+        .with_context(|| format!("write soldering proof chunk state {}", path.display()))
+}
+
+pub(crate) fn remove_soldering_chunk_accumulator(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("remove soldering proof chunk state {}", path.display())),
+    }
+}
+
+pub(crate) async fn send_soldering_proof_to_operator(
+    swarm: &mut Swarm<AllBehaviours>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    opened: &[(usize, u64)],
+    finalized: &[FinalizedInstanceData],
+    soldering: &SolderingData,
+) -> Result<()> {
+    let compact_payload = compact_soldering_proof_payload(opened, finalized, soldering)?;
+    let payload = bincode::serialize(&compact_payload)
+        .context("serialize compact soldering proof payload")?;
+    let chunk_bytes = get_soldering_proof_chunk_bytes();
+    let total_len = payload.len();
+    let messages = build_soldering_proof_messages(
+        instance_id,
+        graph_id,
+        verifier_index,
+        payload,
+        chunk_bytes,
+    )?;
+    tracing::info!(
+        total_len,
+        chunk_bytes,
+        message_count = messages.len(),
+        "send compact soldering proof"
+    );
+    for message_content in messages {
+        send_to_peer(swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+    }
+    Ok(())
 }
 
 fn load_babe_setup_state_from_path(path: &Path) -> Result<Option<BabeSetupState>> {
