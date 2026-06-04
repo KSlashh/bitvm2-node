@@ -1,7 +1,7 @@
 use crate::action::{
     ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, KickoffSent, NodeInfo,
-    PreKickoffSent, SolderingProof, SolderingProofChunk, Take1Sent, Take2Sent,
-    push_local_unhandled_messages, send_to_peer,
+    PreKickoffSent, SolderingProofReady, Take1Sent, Take2Sent, push_local_unhandled_messages,
+    send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
@@ -37,6 +37,7 @@ use bitvm_lib::watchtower::*;
 use client::Utxo as ClientUtxo;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use esplora_client::Utxo;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use goat::connectors::{
     base::TaprootConnector,
     kickoff_connectors::{ForceSkipConnector, KickoffConnector, PrekickoffConnector},
@@ -48,7 +49,7 @@ use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::prekickoff::PrekickoffTransaction;
 use goat::transactions::signing::populate_p2wsh_witness;
 use indexmap::IndexMap;
-use libp2p::{PeerId, Swarm};
+use libp2p::{PeerId, Swarm, request_response};
 use musig2::{PartialSignature, PubNonce};
 use p3_bn254_fr::Bn254Fr;
 use p3_field::{FieldAlgebra, PrimeField};
@@ -57,6 +58,8 @@ use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -4463,183 +4466,548 @@ fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) 
     babe_setup_state_root(local_db).join(instance_id.to_string()).join(format!("{graph_id}.json"))
 }
 
-pub(crate) fn soldering_proof_chunk_state_path(
+pub(crate) fn soldering_payload_hash(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
+}
+
+pub(crate) fn soldering_payload_hash_hex(payload_hash: &[u8; 32]) -> String {
+    payload_hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) fn soldering_proof_protocol_name() -> String {
+    format!("/{}/soldering-proof/1", env::get_proto_base())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SolderingProofRangeRequest {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_index: usize,
+    pub payload_hash: [u8; 32],
+    pub offset: usize,
+    pub len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SolderingProofRangeResponse {
+    Data { total_len: usize, offset: usize, data: Vec<u8> },
+    NotFound,
+    InvalidRange,
+}
+
+#[derive(Clone, Default)]
+pub struct SolderingProofCodec;
+
+const SOLDERING_PROOF_REQUEST_MAX_BYTES: usize = 64 * 1024;
+const SOLDERING_PROOF_RESPONSE_MAX_BYTES: usize = MAX_SOLDERING_PROOF_PULL_RANGE_BYTES + 64 * 1024;
+
+#[async_trait::async_trait]
+impl request_response::Codec for SolderingProofCodec {
+    type Protocol = String;
+    type Request = SolderingProofRangeRequest;
+    type Response = SolderingProofRangeResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let bytes = read_limited(io, SOLDERING_PROOF_REQUEST_MAX_BYTES).await?;
+        bincode::deserialize(&bytes).map_err(|err| IoError::new(ErrorKind::InvalidData, err))
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let bytes = read_limited(io, SOLDERING_PROOF_RESPONSE_MAX_BYTES).await?;
+        bincode::deserialize(&bytes).map_err(|err| IoError::new(ErrorKind::InvalidData, err))
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_bincode(io, &req).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_bincode(io, &res).await
+    }
+}
+
+async fn read_limited<T>(io: &mut T, max_bytes: usize) -> std::io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = io.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() + n > max_bytes {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "soldering proof request-response message exceeds size limit",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+    }
+    Ok(bytes)
+}
+
+async fn write_bincode<T, M>(io: &mut T, message: &M) -> std::io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+    M: Serialize,
+{
+    let bytes =
+        bincode::serialize(message).map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
+    io.write_all(&bytes).await?;
+    io.close().await
+}
+
+pub(crate) fn soldering_proof_payload_path(
     local_db: &LocalDB,
     instance_id: Uuid,
     graph_id: Uuid,
     verifier_index: usize,
     payload_hash: &[u8; 32],
 ) -> PathBuf {
-    let payload_hash_hex =
-        payload_hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     babe_setup_state_root(local_db)
         .join(instance_id.to_string())
-        .join("soldering-proof-chunks")
-        .join(format!("{graph_id}-{verifier_index}-{payload_hash_hex}.bin"))
+        .join("soldering-proof-payloads")
+        .join(format!(
+            "{graph_id}-{verifier_index}-{}.bin",
+            soldering_payload_hash_hex(payload_hash)
+        ))
 }
 
-pub(crate) fn soldering_payload_hash(payload: &[u8]) -> [u8; 32] {
-    Sha256::digest(payload).into()
-}
-
-pub(crate) fn build_soldering_proof_messages(
+fn soldering_proof_pull_temp_path(
+    local_db: &LocalDB,
     instance_id: Uuid,
     graph_id: Uuid,
     verifier_index: usize,
-    payload: Vec<u8>,
-    chunk_bytes: usize,
-) -> Result<Vec<GOATMessageContent>> {
-    if chunk_bytes == 0 {
-        bail!("soldering proof chunk size must be greater than zero");
-    }
-
-    let payload_hash = soldering_payload_hash(&payload);
-    let total_len = payload.len();
-    if total_len <= chunk_bytes {
-        return Ok(vec![GOATMessageContent::SolderingProof(SolderingProof {
-            instance_id,
-            graph_id,
-            verifier_index,
-            payload_hash,
-            total_len,
-            payload,
-        })]);
-    }
-
-    let chunk_count = total_len.div_ceil(chunk_bytes);
-    Ok(payload
-        .chunks(chunk_bytes)
-        .enumerate()
-        .map(|(chunk_index, data)| {
-            GOATMessageContent::SolderingProofChunk(SolderingProofChunk {
-                instance_id,
-                graph_id,
-                verifier_index,
-                payload_hash,
-                total_len,
-                chunk_index,
-                chunk_count,
-                data: data.to_vec(),
-            })
-        })
-        .collect())
+    payload_hash: &[u8; 32],
+) -> PathBuf {
+    babe_setup_state_root(local_db)
+        .join(instance_id.to_string())
+        .join("soldering-proof-pulls")
+        .join(format!(
+            "{graph_id}-{verifier_index}-{}.part",
+            soldering_payload_hash_hex(payload_hash)
+        ))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct SolderingProofChunkAccumulator {
-    total_len: usize,
-    chunk_count: usize,
-    chunks: Vec<Option<Vec<u8>>>,
-}
-
-impl SolderingProofChunkAccumulator {
-    pub(crate) fn new(total_len: usize, chunk_count: usize) -> Self {
-        Self { total_len, chunk_count, chunks: vec![None; chunk_count] }
+pub(crate) fn save_soldering_proof_payload(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: &[u8; 32],
+    payload: &[u8],
+) -> Result<PathBuf> {
+    if soldering_payload_hash(payload) != *payload_hash {
+        bail!("soldering proof payload hash does not match file key");
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        chunk_index: usize,
-        data: Vec<u8>,
-        expected_hash: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>> {
-        if self.chunk_count == 0 {
-            bail!("soldering proof chunk_count must be greater than zero");
-        }
-        if chunk_index >= self.chunk_count {
-            bail!("soldering proof chunk_index {chunk_index} out of range {}", self.chunk_count);
-        }
-        if data.is_empty() {
-            bail!("soldering proof chunk data is empty");
-        }
-        if data.len() > self.total_len {
-            bail!("soldering proof chunk data exceeds total_len");
-        }
-
-        if let Some(existing) = &self.chunks[chunk_index] {
-            if existing != &data {
-                bail!("conflicting soldering proof chunk data for index {chunk_index}");
-            }
-            return self.assemble_if_complete(expected_hash);
-        }
-
-        self.chunks[chunk_index] = Some(data);
-        self.assemble_if_complete(expected_hash)
-    }
-
-    fn assemble_if_complete(&self, expected_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        if self.chunks.iter().any(Option::is_none) {
-            return Ok(None);
-        }
-
-        let mut payload = Vec::with_capacity(self.total_len);
-        for chunk in &self.chunks {
-            payload.extend_from_slice(chunk.as_ref().expect("all chunks are present"));
-        }
-        if payload.len() != self.total_len {
-            bail!(
-                "assembled soldering proof payload length {} does not match total_len {}",
-                payload.len(),
-                self.total_len
-            );
-        }
-        if soldering_payload_hash(&payload) != *expected_hash {
-            bail!("assembled soldering proof payload hash mismatch");
-        }
-        Ok(Some(payload))
-    }
-}
-
-pub(crate) fn load_soldering_chunk_accumulator(
-    path: &Path,
-    total_len: usize,
-    chunk_count: usize,
-) -> Result<SolderingProofChunkAccumulator> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let accumulator: SolderingProofChunkAccumulator =
-                bincode::deserialize(&bytes).context("deserialize soldering proof chunks")?;
-            if accumulator.total_len != total_len {
-                bail!("soldering proof chunk total_len conflicts with persisted state");
-            }
-            if accumulator.chunk_count != chunk_count {
-                bail!("soldering proof chunk_count conflicts with persisted state");
-            }
-            Ok(accumulator)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(SolderingProofChunkAccumulator::new(total_len, chunk_count))
-        }
-        Err(err) => {
-            Err(err).with_context(|| format!("read soldering proof chunk state {}", path.display()))
-        }
-    }
-}
-
-pub(crate) fn save_soldering_chunk_accumulator(
-    path: &Path,
-    accumulator: &SolderingProofChunkAccumulator,
-) -> Result<()> {
+    let path =
+        soldering_proof_payload_path(local_db, instance_id, graph_id, verifier_index, payload_hash);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("create soldering proof chunk dir {}", parent.display()))?;
+            .with_context(|| format!("create soldering proof payload dir {}", parent.display()))?;
     }
-    let bytes = bincode::serialize(accumulator).context("serialize soldering proof chunks")?;
-    std::fs::write(path, bytes)
-        .with_context(|| format!("write soldering proof chunk state {}", path.display()))
+    let temp_path = path.with_extension("bin.tmp");
+    std::fs::write(&temp_path, payload)
+        .with_context(|| format!("write soldering proof payload {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &path).with_context(|| {
+        format!("move soldering proof payload {} to {}", temp_path.display(), path.display())
+    })?;
+    Ok(path)
 }
 
-pub(crate) fn remove_soldering_chunk_accumulator(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err)
-            .with_context(|| format!("remove soldering proof chunk state {}", path.display())),
+pub(crate) fn read_soldering_proof_payload_range(
+    local_db: &LocalDB,
+    request: &SolderingProofRangeRequest,
+) -> Result<SolderingProofRangeResponse> {
+    let path = soldering_proof_payload_path(
+        local_db,
+        request.instance_id,
+        request.graph_id,
+        request.verifier_index,
+        &request.payload_hash,
+    );
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SolderingProofRangeResponse::NotFound);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("open soldering proof payload {}", path.display()));
+        }
+    };
+
+    let total_len = file
+        .metadata()
+        .with_context(|| format!("stat soldering proof payload {}", path.display()))?
+        .len() as usize;
+    if request.len == 0
+        || request.offset > total_len
+        || request.offset.checked_add(request.len).is_none_or(|end| end > total_len)
+    {
+        return Ok(SolderingProofRangeResponse::InvalidRange);
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(request.offset as u64))
+        .with_context(|| format!("seek soldering proof payload {}", path.display()))?;
+    let mut data = vec![0u8; request.len];
+    file.read_exact(&mut data)
+        .with_context(|| format!("read soldering proof payload {}", path.display()))?;
+    Ok(SolderingProofRangeResponse::Data { total_len, offset: request.offset, data })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SolderingProofPayloadKey {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_index: usize,
+    pub payload_hash: [u8; 32],
+}
+
+impl SolderingProofPayloadKey {
+    fn from_ready(ready: &SolderingProofReady) -> Self {
+        Self {
+            instance_id: ready.instance_id,
+            graph_id: ready.graph_id,
+            verifier_index: ready.verifier_index,
+            payload_hash: ready.payload_hash,
+        }
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct SolderingProofPulledPayload {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_index: usize,
+    pub payload_hash: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SolderingProofPullSession {
+    key: SolderingProofPayloadKey,
+    total_len: usize,
+    range_bytes: usize,
+    temp_path: PathBuf,
+    next_offset: usize,
+}
+
+impl SolderingProofPullSession {
+    pub(crate) fn open(local_db: &LocalDB, ready: &SolderingProofReady) -> Result<Self> {
+        if ready.total_len == 0 {
+            bail!("SolderingProofReady total_len must be greater than zero");
+        }
+        let key = SolderingProofPayloadKey::from_ready(ready);
+        let temp_path = soldering_proof_pull_temp_path(
+            local_db,
+            ready.instance_id,
+            ready.graph_id,
+            ready.verifier_index,
+            &ready.payload_hash,
+        );
+        let next_offset = match std::fs::metadata(&temp_path) {
+            Ok(metadata) => {
+                let len = metadata.len() as usize;
+                if len <= ready.total_len {
+                    len
+                } else {
+                    std::fs::remove_file(&temp_path).with_context(|| {
+                        format!(
+                            "remove oversized soldering proof pull temp {}",
+                            temp_path.display()
+                        )
+                    })?;
+                    0
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("stat soldering proof pull temp {}", temp_path.display())
+                });
+            }
+        };
+
+        Ok(Self {
+            key,
+            total_len: ready.total_len,
+            range_bytes: ready
+                .range_bytes
+                .clamp(MIN_SOLDERING_PROOF_PULL_RANGE_BYTES, MAX_SOLDERING_PROOF_PULL_RANGE_BYTES),
+            temp_path,
+            next_offset,
+        })
+    }
+
+    pub(crate) fn next_request(&self) -> Option<SolderingProofRangeRequest> {
+        if self.next_offset >= self.total_len {
+            return None;
+        }
+        Some(SolderingProofRangeRequest {
+            instance_id: self.key.instance_id,
+            graph_id: self.key.graph_id,
+            verifier_index: self.key.verifier_index,
+            payload_hash: self.key.payload_hash,
+            offset: self.next_offset,
+            len: self.range_bytes.min(self.total_len - self.next_offset),
+        })
+    }
+
+    pub(crate) fn write_range(
+        &mut self,
+        total_len: usize,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        if total_len != self.total_len {
+            bail!("soldering proof range total_len mismatch");
+        }
+        if offset != self.next_offset {
+            bail!(
+                "soldering proof range offset {offset} does not match expected {}",
+                self.next_offset
+            );
+        }
+        if data.is_empty() {
+            bail!("soldering proof range data is empty");
+        }
+        if self.next_offset.checked_add(data.len()).is_none_or(|end| end > self.total_len) {
+            bail!("soldering proof range exceeds total_len");
+        }
+        if let Some(parent) = self.temp_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create soldering proof pull temp dir {}", parent.display())
+            })?;
+        }
+        let current_len = match std::fs::metadata(&self.temp_path) {
+            Ok(metadata) => metadata.len() as usize,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("stat soldering proof pull temp {}", self.temp_path.display())
+                });
+            }
+        };
+        if current_len != self.next_offset {
+            bail!("soldering proof pull temp length conflicts with session offset");
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.temp_path)
+            .with_context(|| {
+                format!("open soldering proof pull temp {}", self.temp_path.display())
+            })?;
+        file.write_all(data).with_context(|| {
+            format!("write soldering proof pull temp {}", self.temp_path.display())
+        })?;
+        self.next_offset += data.len();
+        Ok(())
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.next_offset == self.total_len
+    }
+
+    pub(crate) fn finalize(&self) -> Result<SolderingProofPulledPayload> {
+        if !self.is_complete() {
+            bail!("soldering proof pull session is incomplete");
+        }
+        let payload = std::fs::read(&self.temp_path).with_context(|| {
+            format!("read soldering proof pull temp {}", self.temp_path.display())
+        })?;
+        if payload.len() != self.total_len {
+            bail!("soldering proof pulled payload length mismatch");
+        }
+        if soldering_payload_hash(&payload) != self.key.payload_hash {
+            let _ = std::fs::remove_file(&self.temp_path);
+            bail!("soldering proof pulled payload hash mismatch");
+        }
+        match std::fs::remove_file(&self.temp_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("remove soldering proof pull temp {}", self.temp_path.display())
+                });
+            }
+        }
+        Ok(SolderingProofPulledPayload {
+            instance_id: self.key.instance_id,
+            graph_id: self.key.graph_id,
+            verifier_index: self.key.verifier_index,
+            payload_hash: self.key.payload_hash,
+            payload,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SolderingProofPendingRange {
+    key: SolderingProofPayloadKey,
+    peer_id: PeerId,
+    expected_offset: usize,
+    expected_len: usize,
+}
+
+#[derive(Default)]
+pub struct SolderingProofPullCoordinator {
+    sessions: HashMap<SolderingProofPayloadKey, SolderingProofPullSession>,
+    pending: HashMap<request_response::OutboundRequestId, SolderingProofPendingRange>,
+    pending_by_key: HashMap<SolderingProofPayloadKey, request_response::OutboundRequestId>,
+}
+
+impl SolderingProofPullCoordinator {
+    pub(crate) fn request_ready(
+        &mut self,
+        swarm: &mut Swarm<AllBehaviours>,
+        local_db: &LocalDB,
+        peer_id: PeerId,
+        ready: &SolderingProofReady,
+    ) -> Result<Option<SolderingProofPulledPayload>> {
+        let key = SolderingProofPayloadKey::from_ready(ready);
+        if self.pending_by_key.contains_key(&key) {
+            return Ok(None);
+        }
+        if !self.sessions.contains_key(&key) {
+            let session = SolderingProofPullSession::open(local_db, ready)?;
+            self.sessions.insert(key.clone(), session);
+        }
+
+        let session = self
+            .sessions
+            .get(&key)
+            .ok_or_else(|| anyhow!("missing soldering proof pull session"))?;
+        if session.total_len != ready.total_len {
+            bail!("SolderingProofReady total_len conflicts with existing pull session");
+        }
+        if session.is_complete() {
+            let session = self.sessions.remove(&key).expect("session exists");
+            return Ok(Some(session.finalize()?));
+        }
+        let request = session
+            .next_request()
+            .ok_or_else(|| anyhow!("missing next soldering proof range request"))?;
+        let expected_offset = request.offset;
+        let expected_len = request.len;
+        let request_id = swarm.behaviour_mut().soldering_proof.send_request(&peer_id, request);
+        self.pending.insert(
+            request_id,
+            SolderingProofPendingRange { key: key.clone(), peer_id, expected_offset, expected_len },
+        );
+        self.pending_by_key.insert(key, request_id);
+        Ok(None)
+    }
+
+    pub(crate) fn handle_response(
+        &mut self,
+        swarm: &mut Swarm<AllBehaviours>,
+        peer_id: PeerId,
+        request_id: request_response::OutboundRequestId,
+        response: SolderingProofRangeResponse,
+    ) -> Result<Option<SolderingProofPulledPayload>> {
+        let pending = self
+            .pending
+            .remove(&request_id)
+            .ok_or_else(|| anyhow!("unknown soldering proof range response {request_id}"))?;
+        self.pending_by_key.remove(&pending.key);
+        if pending.peer_id != peer_id {
+            bail!("soldering proof range response peer mismatch");
+        }
+
+        let (total_len, offset, data) = match response {
+            SolderingProofRangeResponse::Data { total_len, offset, data } => {
+                (total_len, offset, data)
+            }
+            SolderingProofRangeResponse::NotFound => {
+                bail!("soldering proof payload not found by remote peer");
+            }
+            SolderingProofRangeResponse::InvalidRange => {
+                bail!("remote peer rejected soldering proof range");
+            }
+        };
+        if offset != pending.expected_offset {
+            bail!("soldering proof range response offset mismatch");
+        }
+        if data.len() != pending.expected_len {
+            bail!("soldering proof range response length mismatch");
+        }
+        let session = self
+            .sessions
+            .get_mut(&pending.key)
+            .ok_or_else(|| anyhow!("missing soldering proof pull session"))?;
+        session.write_range(total_len, offset, &data)?;
+        if session.is_complete() {
+            let session = self.sessions.remove(&pending.key).expect("session exists");
+            return Ok(Some(session.finalize()?));
+        }
+
+        let request = session
+            .next_request()
+            .ok_or_else(|| anyhow!("missing next soldering proof range request"))?;
+        let expected_offset = request.offset;
+        let expected_len = request.len;
+        let request_id = swarm.behaviour_mut().soldering_proof.send_request(&peer_id, request);
+        self.pending.insert(
+            request_id,
+            SolderingProofPendingRange {
+                key: pending.key.clone(),
+                peer_id,
+                expected_offset,
+                expected_len,
+            },
+        );
+        self.pending_by_key.insert(pending.key, request_id);
+        Ok(None)
+    }
+
+    pub(crate) fn handle_failure(&mut self, request_id: request_response::OutboundRequestId) {
+        if let Some(pending) = self.pending.remove(&request_id) {
+            self.pending_by_key.remove(&pending.key);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_soldering_proof_to_operator(
     swarm: &mut Swarm<AllBehaviours>,
+    local_db: &LocalDB,
     instance_id: Uuid,
     graph_id: Uuid,
     verifier_index: usize,
@@ -4650,24 +5018,32 @@ pub(crate) async fn send_soldering_proof_to_operator(
     let compact_payload = compact_soldering_proof_payload(opened, finalized, soldering)?;
     let payload = bincode::serialize(&compact_payload)
         .context("serialize compact soldering proof payload")?;
-    let chunk_bytes = get_soldering_proof_chunk_bytes();
+    let payload_hash = soldering_payload_hash(&payload);
     let total_len = payload.len();
-    let messages = build_soldering_proof_messages(
+    let range_bytes = get_soldering_proof_pull_range_bytes();
+    let path = save_soldering_proof_payload(
+        local_db,
         instance_id,
         graph_id,
         verifier_index,
-        payload,
-        chunk_bytes,
+        &payload_hash,
+        &payload,
     )?;
     tracing::info!(
         total_len,
-        chunk_bytes,
-        message_count = messages.len(),
-        "send compact soldering proof"
+        range_bytes,
+        payload_path = %path.display(),
+        "send compact soldering proof ready"
     );
-    for message_content in messages {
-        send_to_peer(swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
-    }
+    let message_content = GOATMessageContent::SolderingProofReady(SolderingProofReady {
+        instance_id,
+        graph_id,
+        verifier_index,
+        payload_hash,
+        total_len,
+        range_bytes,
+    });
+    send_to_peer(swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
     Ok(())
 }
 

@@ -48,6 +48,7 @@ pub struct HandlerContext<'a> {
     pub from_peer_id: PeerId,
     pub id: MessageId,
     pub is_self_peer: bool,
+    pub soldering_pulls: Option<&'a tokio::sync::Mutex<SolderingProofPullCoordinator>>,
 }
 
 fn committee_instance_keys_envelope_path(instance_id: Uuid) -> std::path::PathBuf {
@@ -209,50 +210,24 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             .await
         }
         (
-            GOATMessageContent::SolderingProof(SolderingProof {
+            GOATMessageContent::SolderingProofReady(SolderingProofReady {
                 instance_id,
                 graph_id,
                 verifier_index,
                 payload_hash,
                 total_len,
-                payload,
+                range_bytes,
             }),
             Actor::Operator,
         ) => {
-            handle_soldering_proof_operator(
+            handle_soldering_proof_ready_operator(
                 ctx,
                 *instance_id,
                 *graph_id,
                 *verifier_index,
                 *payload_hash,
                 *total_len,
-                payload,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::SolderingProofChunk(SolderingProofChunk {
-                instance_id,
-                graph_id,
-                verifier_index,
-                payload_hash,
-                total_len,
-                chunk_index,
-                chunk_count,
-                data,
-            }),
-            Actor::Operator,
-        ) => {
-            handle_soldering_proof_chunk_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                *verifier_index,
-                *payload_hash,
-                *total_len,
-                *chunk_index,
-                *chunk_count,
-                data,
+                *range_bytes,
             )
             .await
         }
@@ -1361,6 +1336,7 @@ async fn handle_cut_circuits_verifier(
             let setup_state = verifier_state;
             send_soldering_proof_to_operator(
                 ctx.swarm,
+                ctx.local_db,
                 instance_id,
                 graph_id,
                 verifier_index,
@@ -1412,6 +1388,7 @@ async fn handle_cut_circuits_verifier(
 
     send_soldering_proof_to_operator(
         ctx.swarm,
+        ctx.local_db,
         instance_id,
         graph_id,
         verifier_index,
@@ -1425,7 +1402,89 @@ async fn handle_cut_circuits_verifier(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_soldering_proof_operator(
+async fn handle_soldering_proof_ready_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: [u8; 32],
+    total_len: usize,
+    range_bytes: usize,
+) -> Result<()> {
+    if total_len == 0 {
+        bail!("SolderingProofReady total_len must be greater than zero");
+    }
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
+    if !pending_graph_belongs_to_operator(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        &local_operator_pubkey,
+    )
+    .await?
+    {
+        tracing::debug!(
+            "Ignore SolderingProofReady for {instance_id}:{graph_id}: no local pending graph session"
+        );
+
+        return Ok(());
+    }
+
+    let state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing BABE setup state for pending graph {graph_id}"))?;
+    let operator_state = state
+        .operator
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for pending graph {graph_id}"))?;
+    let frozen = operator_state
+        .frozen_verifier_pubkeys
+        .as_ref()
+        .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
+    let verifier_pubkey = frozen.get(verifier_index).ok_or_else(|| {
+        anyhow!("SolderingProofReady verifier index {verifier_index} out of range")
+    })?;
+    let candidate = operator_state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
+    if candidate.verifier_index != Some(verifier_index) {
+        bail!("selected verifier candidate index does not match SolderingProofReady slot");
+    }
+
+    let ready = SolderingProofReady {
+        instance_id,
+        graph_id,
+        verifier_index,
+        payload_hash,
+        total_len,
+        range_bytes,
+    };
+    let soldering_pulls = ctx
+        .soldering_pulls
+        .ok_or_else(|| anyhow!("soldering proof pull coordinator is not initialized"))?;
+    let pulled = {
+        let mut soldering_pulls = soldering_pulls.lock().await;
+        soldering_pulls.request_ready(ctx.swarm, ctx.local_db, ctx.from_peer_id, &ready)?
+    };
+    if let Some(pulled) = pulled {
+        handle_soldering_proof_payload_operator(
+            ctx,
+            pulled.instance_id,
+            pulled.graph_id,
+            pulled.verifier_index,
+            pulled.payload_hash,
+            pulled.payload.len(),
+            &pulled.payload,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_soldering_proof_payload_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
@@ -1447,58 +1506,6 @@ async fn handle_soldering_proof_operator(
         bincode::deserialize(payload).context("deserialize compact soldering proof payload")?;
     handle_compact_soldering_proof_operator(ctx, instance_id, graph_id, verifier_index, payload)
         .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_soldering_proof_chunk_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    verifier_index: usize,
-    payload_hash: [u8; 32],
-    total_len: usize,
-    chunk_index: usize,
-    chunk_count: usize,
-    data: &[u8],
-) -> Result<()> {
-    if total_len == 0 {
-        bail!("SolderingProofChunk total_len must be greater than zero");
-    }
-    if chunk_count == 0 {
-        bail!("SolderingProofChunk chunk_count must be greater than zero");
-    }
-    if chunk_count > total_len {
-        bail!("SolderingProofChunk chunk_count cannot exceed total_len");
-    }
-    if chunk_index >= chunk_count {
-        bail!("SolderingProofChunk chunk_index {chunk_index} out of range {chunk_count}");
-    }
-
-    let path = soldering_proof_chunk_state_path(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        verifier_index,
-        &payload_hash,
-    );
-    let mut accumulator = load_soldering_chunk_accumulator(&path, total_len, chunk_count)?;
-    let assembled = accumulator.insert(chunk_index, data.to_vec(), &payload_hash)?;
-    if let Some(payload) = assembled {
-        handle_soldering_proof_operator(
-            ctx,
-            instance_id,
-            graph_id,
-            verifier_index,
-            payload_hash,
-            total_len,
-            &payload,
-        )
-        .await?;
-        remove_soldering_chunk_accumulator(&path)?;
-    } else {
-        save_soldering_chunk_accumulator(&path, &accumulator)?;
-    }
-    Ok(())
 }
 
 // verify Verifier SolderingProof, build Graph and broadcast CreateGraph.

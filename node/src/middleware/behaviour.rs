@@ -1,6 +1,7 @@
 // #![feature(trivial_bounds)]
+use crate::utils::{SolderingProofCodec, soldering_proof_protocol_name};
 use libp2p::identity::Keypair;
-use libp2p::{gossipsub, kad, kad::store::MemoryStore, swarm::StreamProtocol};
+use libp2p::{gossipsub, kad, kad::store::MemoryStore, request_response, swarm::StreamProtocol};
 use libp2p_swarm_derive::NetworkBehaviour;
 use std::time::Duration;
 use tokio::io::{self};
@@ -11,6 +12,7 @@ pub struct AllBehaviours {
     pub kademlia: kad::Behaviour<MemoryStore>,
     //pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
+    pub soldering_proof: request_response::Behaviour<SolderingProofCodec>,
 }
 impl AllBehaviours {
     pub fn new(key: &Keypair) -> Self {
@@ -31,7 +33,14 @@ impl AllBehaviours {
             gossipsub_config,
         )
         .expect("Valid configuration");
-        Self { kademlia, gossipsub }
+        let soldering_proof = request_response::Behaviour::with_codec(
+            SolderingProofCodec,
+            [(soldering_proof_protocol_name(), request_response::ProtocolSupport::Full)],
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(60))
+                .with_max_concurrent_streams(32),
+        );
+        Self { kademlia, gossipsub, soldering_proof }
     }
 }
 

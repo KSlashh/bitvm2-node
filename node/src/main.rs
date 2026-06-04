@@ -163,6 +163,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         http_client: HttpAsyncClient::new(None),
         soldering_builder: matches!(actor, Actor::Verifier | Actor::Operator)
             .then(|| Arc::new(BabeBundleBuilder::new())),
+        soldering_pulls: tokio::sync::Mutex::default(),
     };
 
     let actor_clone1 = actor.clone();

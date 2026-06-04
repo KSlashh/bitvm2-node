@@ -47,8 +47,7 @@ pub enum GOATMessageContent {
     InitGraph(InitGraph),
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
-    SolderingProof(SolderingProof),
-    SolderingProofChunk(SolderingProofChunk),
+    SolderingProofReady(SolderingProofReady),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -113,24 +112,13 @@ pub struct CutCircuits {
     pub selected_circuit_indexes: Vec<usize>,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SolderingProof {
+pub struct SolderingProofReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_index: usize,
     pub payload_hash: [u8; 32],
     pub total_len: usize,
-    pub payload: Vec<u8>,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SolderingProofChunk {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub verifier_index: usize,
-    pub payload_hash: [u8; 32],
-    pub total_len: usize,
-    pub chunk_index: usize,
-    pub chunk_count: usize,
-    pub data: Vec<u8>,
+    pub range_bytes: usize,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
@@ -363,6 +351,7 @@ pub async fn handle_self_p2p_msg(
     goat_client: &GOATClient,
     http_client: &HttpAsyncClient,
     soldering_builder: &Option<Arc<BabeBundleBuilder>>,
+    soldering_pulls: Option<&tokio::sync::Mutex<SolderingProofPullCoordinator>>,
     actor: Actor,
     from_peer_id: PeerId,
     id: MessageId,
@@ -394,6 +383,7 @@ pub async fn handle_self_p2p_msg(
             from_peer_id,
             id.clone(),
             &message.content,
+            soldering_pulls,
         )
         .await
         {
@@ -443,6 +433,7 @@ pub async fn recv_and_dispatch(
     from_peer_id: PeerId,
     id: MessageId,
     message: &[u8],
+    soldering_pulls: Option<&tokio::sync::Mutex<SolderingProofPullCoordinator>>,
 ) -> Result<()> {
     if id != GOATMessage::default_message_id() {
         update_node_timestamp(local_db, &from_peer_id.to_string()).await?;
@@ -461,6 +452,7 @@ pub async fn recv_and_dispatch(
         from_peer_id,
         id,
         is_self_peer,
+        soldering_pulls,
     };
     handle_dispatch(&mut handler_ctx, message.content()).await
 }
