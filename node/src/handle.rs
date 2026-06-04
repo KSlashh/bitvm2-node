@@ -1163,6 +1163,7 @@ async fn handle_init_graph_verifier(
         })
         .await
         .context("real BABE setup task failed")??;
+        tracing::info!("Verifier setup done.");
         VerifierBabeSetupState {
             verifier_pubkey,
             setup_package,

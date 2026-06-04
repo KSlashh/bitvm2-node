@@ -46,7 +46,7 @@ use crate::types::BitvmGcCircuitData;
 pub const WOTS_SIG_COUNT: usize = Wots64::TOTAL_DIGIT_LEN as usize;
 pub const BABE_N_CC: usize = 181;
 // TODO: use verifiable_circuit_babe::babe::M_CC instead
-pub const BABE_M_CC: usize = 4;
+pub const BABE_M_CC: usize = 7;
 
 pub type OpenedInstanceSeeds = Vec<(usize, u64)>;
 pub type FinalizedInstances = Vec<FinalizedInstanceData>;
