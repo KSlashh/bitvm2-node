@@ -86,10 +86,7 @@ pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
 pub const ENV_GC_GATES_PATH: &str = "GC_GATES_PATH";
 pub const ENV_GC_INDICES_PATH: &str = "GC_INDICES_PATH";
 pub const ENV_BABE_SETUP_STATE_DIR: &str = "BABE_SETUP_STATE_DIR";
-pub const ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES: &str = "SOLDERING_PROOF_UPLOAD_CHUNK_BYTES";
-pub const DEFAULT_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-pub const MIN_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
-pub const MAX_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub const ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH: &str = "SOLDERING_PROOF_PAYLOAD_STORE_PATH";
 
 pub const ENV_ALWAYS_CHALLENGE: &str = "ALWAYS_CHALLENGE";
 pub const ENV_GENESIS_SEQUENCER_COMMIT_TXID: &str = "GENESIS_SEQUENCER_COMMIT_TXID";
@@ -578,12 +575,24 @@ pub fn get_operator_proof_wait_secs() -> usize {
         .unwrap_or(DEFAULT_OPERATOR_PROOF_WAIT_SECS)
 }
 
-pub fn get_soldering_proof_upload_chunk_bytes() -> usize {
-    std::env::var(ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES)
-        .clamp(MIN_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES, MAX_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES)
+pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {
+    let value = std::env::var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH)
+        .map_err(|_| anyhow::anyhow!("{ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH} needs to be set"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH} cannot be empty");
+    }
+    Ok(value.to_string())
+}
+
+pub fn validate_soldering_proof_payload_store_config(actor: &Actor) -> anyhow::Result<()> {
+    if matches!(actor, Actor::Verifier | Actor::Operator | Actor::All) {
+        get_soldering_proof_payload_store_path()
+            .map(|_| ())
+            .map_err(|err| anyhow::anyhow!("{err}; required for actor {actor}"))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn get_operator_vk_hash() -> anyhow::Result<[u8; 32]> {
@@ -669,4 +678,34 @@ pub fn get_genesis_sequencer_commit_id() -> [u8; 32] {
     let hexed = std::env::var(ENV_GENESIS_SEQUENCER_COMMIT_TXID).unwrap();
     let txid = bitcoin::Txid::from_str(&hexed).expect("Invalid genesis sequencer commit txid");
     txid.to_byte_array()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn soldering_proof_payload_store_config_required_for_soldering_actors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH) };
+
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_err());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Operator).is_err());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_err());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Committee).is_ok());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Watchtower).is_ok());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Publisher).is_ok());
+
+        unsafe { std::env::set_var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH, "/tmp/store") };
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_ok());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Operator).is_ok());
+
+        unsafe { std::env::set_var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH, " ") };
+        assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_err());
+
+        unsafe { std::env::remove_var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH) };
+    }
 }

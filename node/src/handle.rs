@@ -1,11 +1,14 @@
 use crate::action::*;
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
-    is_relayer,
+    get_soldering_proof_payload_store_path, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
+use crate::soldering_payload_store::{
+    read_soldering_proof_store_payload, soldering_proof_payload_store_path,
+};
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -215,32 +218,10 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 verifier_index,
                 payload_hash,
                 total_len,
-                upload_chunk_bytes,
             }),
             Actor::Operator,
         ) => {
             handle_soldering_proof_ready_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                *verifier_index,
-                *payload_hash,
-                *total_len,
-                *upload_chunk_bytes,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::SolderingProofUploaded(SolderingProofUploaded {
-                instance_id,
-                graph_id,
-                verifier_index,
-                payload_hash,
-                total_len,
-            }),
-            Actor::Operator,
-        ) => {
-            handle_soldering_proof_uploaded_operator(
                 ctx,
                 *instance_id,
                 *graph_id,
@@ -1343,8 +1324,6 @@ async fn handle_cut_circuits_verifier(
             let setup_state = verifier_state;
             send_soldering_proof_to_operator(
                 ctx.swarm,
-                ctx.local_db,
-                ctx.from_peer_id,
                 instance_id,
                 graph_id,
                 verifier_index,
@@ -1396,8 +1375,6 @@ async fn handle_cut_circuits_verifier(
 
     send_soldering_proof_to_operator(
         ctx.swarm,
-        ctx.local_db,
-        ctx.from_peer_id,
         instance_id,
         graph_id,
         verifier_index,
@@ -1418,7 +1395,6 @@ async fn handle_soldering_proof_ready_operator(
     verifier_index: usize,
     payload_hash: [u8; 32],
     total_len: usize,
-    upload_chunk_bytes: usize,
 ) -> Result<()> {
     if total_len == 0 {
         bail!("SolderingProofReady total_len must be greater than zero");
@@ -1462,46 +1438,56 @@ async fn handle_soldering_proof_ready_operator(
         bail!("selected verifier candidate index does not match SolderingProofReady slot");
     }
 
+    let store_base_path = get_soldering_proof_payload_store_path()?;
+    let payload_path = soldering_proof_payload_store_path(
+        &store_base_path,
+        instance_id,
+        graph_id,
+        verifier_index,
+        &payload_hash,
+    )?;
     tracing::info!(
         from_peer_id = %ctx.from_peer_id,
+        instance_id = %instance_id,
+        graph_id = %graph_id,
+        verifier_index,
         total_len,
-        upload_chunk_bytes,
         payload_hash = %soldering_payload_hash_hex(&payload_hash),
-        "received SolderingProofReady; waiting for HTTP upload"
+        payload_path = %payload_path,
+        "received SolderingProofReady; reading payload from store"
     );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_soldering_proof_uploaded_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    verifier_index: usize,
-    payload_hash: [u8; 32],
-    total_len: usize,
-) -> Result<()> {
-    if ctx.id != GOATMessage::default_message_id() || !ctx.is_self_peer {
-        tracing::warn!(
-            from_peer_id = %ctx.from_peer_id,
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            verifier_index,
-            "ignore non-local SolderingProofUploaded message"
-        );
-        return Ok(());
-    }
-    let key = SolderingProofUploadKey { instance_id, graph_id, verifier_index, payload_hash };
+    let payload = match read_soldering_proof_store_payload(&payload_path).await {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(
+                instance_id = %instance_id,
+                graph_id = %graph_id,
+                verifier_index,
+                payload_path = %payload_path,
+                error = %err,
+                "failed to read soldering proof payload from store"
+            );
+            return Err(err).context("read soldering proof payload from store");
+        }
+    };
+    tracing::info!(
+        instance_id = %instance_id,
+        graph_id = %graph_id,
+        verifier_index,
+        bytes = payload.len(),
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        payload_path = %payload_path,
+        "read soldering proof payload from store"
+    );
     tracing::info!(
         instance_id = %instance_id,
         graph_id = %graph_id,
         verifier_index,
         total_len,
         payload_hash = %soldering_payload_hash_hex(&payload_hash),
-        "processing uploaded soldering proof payload"
+        "start processing soldering proof payload"
     );
-    let payload = read_completed_soldering_proof_payload(ctx.local_db, &key, total_len)
-        .context("read completed soldering proof upload")?;
     handle_soldering_proof_payload_operator(
         ctx,
         instance_id,
@@ -1525,12 +1511,30 @@ pub(crate) async fn handle_soldering_proof_payload_operator(
     payload: &[u8],
 ) -> Result<()> {
     if payload.len() != total_len {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            verifier_index,
+            actual_len = payload.len(),
+            total_len,
+            payload_hash = %soldering_payload_hash_hex(&payload_hash),
+            "SolderingProof payload length mismatch"
+        );
         bail!(
             "SolderingProof payload length {} does not match total_len {total_len}",
             payload.len()
         );
     }
-    if soldering_payload_hash(payload) != payload_hash {
+    let actual_hash = soldering_payload_hash(payload);
+    if actual_hash != payload_hash {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            verifier_index,
+            expected_hash = %soldering_payload_hash_hex(&payload_hash),
+            actual_hash = %soldering_payload_hash_hex(&actual_hash),
+            "SolderingProof payload hash mismatch"
+        );
         bail!("SolderingProof payload hash mismatch");
     }
     let payload: CompactSolderingProofPayload =

@@ -48,7 +48,6 @@ pub enum GOATMessageContent {
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
     SolderingProofReady(SolderingProofReady),
-    SolderingProofUploaded(SolderingProofUploaded),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -114,15 +113,6 @@ pub struct CutCircuits {
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SolderingProofReady {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub verifier_index: usize,
-    pub payload_hash: [u8; 32],
-    pub total_len: usize,
-    pub upload_chunk_bytes: usize,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SolderingProofUploaded {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_index: usize,
@@ -593,4 +583,33 @@ pub async fn try_send_sync_graph_request(
     let message = GOATMessage::new(Actor::All, message_content);
     send_to_peer(swarm, message).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soldering_proof_ready_is_descriptor_only() {
+        let ready = SolderingProofReady {
+            instance_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            graph_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            verifier_index: 3,
+            payload_hash: [0xabu8; 32],
+            total_len: 1024,
+        };
+
+        let value = serde_json::to_value(ready).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert!(object.contains_key("instance_id"));
+        assert!(object.contains_key("graph_id"));
+        assert!(object.contains_key("verifier_index"));
+        assert!(object.contains_key("payload_hash"));
+        assert!(object.contains_key("total_len"));
+        assert!(!object.contains_key("payload_path"));
+        assert!(!object.contains_key("payload"));
+        assert!(!object.contains_key("setup_package"));
+        assert!(!object.contains_key("verifier_pubkey"));
+    }
 }
