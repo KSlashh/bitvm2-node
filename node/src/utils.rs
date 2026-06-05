@@ -3322,7 +3322,7 @@ pub fn strip_hex_prefix_owned(s: &str) -> String {
 /// Retrieve the server's public IP via NAT protocol and combine it with
 /// the configured RPC monitoring port`rpc_addr` to generate the external RPC service address.
 pub async fn set_node_external_socket_addr_env(rpc_addr: &str) -> Result<()> {
-    if get_proof_server_url().is_some() {
+    if get_proof_server_url().is_some() || std::env::var(ENV_EXTERNAL_SOCKET_ADDR).is_ok() {
         // not provide proof server
         return Ok(());
     }

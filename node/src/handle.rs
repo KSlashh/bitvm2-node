@@ -1293,7 +1293,7 @@ async fn handle_gen_circuits_operator(
     Ok(())
 }
 
-// generate proofs for the choosen GC and broadcast SolderingProof.
+// generate proofs for the chosen GC and broadcast SolderingProof.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_cut_circuits_verifier(
     ctx: &mut HandlerContext<'_>,
