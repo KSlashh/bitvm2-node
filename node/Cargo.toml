@@ -59,7 +59,6 @@ libp2p = { workspace = true, features = [
     "rsa",
     "macros",
     "gossipsub",
-    "request-response",
     "quic",
     "websocket",
 ] }

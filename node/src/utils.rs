@@ -37,7 +37,6 @@ use bitvm_lib::watchtower::*;
 use client::Utxo as ClientUtxo;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use esplora_client::Utxo;
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use goat::connectors::{
     base::TaprootConnector,
     kickoff_connectors::{ForceSkipConnector, KickoffConnector, PrekickoffConnector},
@@ -49,7 +48,7 @@ use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::prekickoff::PrekickoffTransaction;
 use goat::transactions::signing::populate_p2wsh_witness;
 use indexmap::IndexMap;
-use libp2p::{PeerId, Swarm, request_response};
+use libp2p::{PeerId, Swarm};
 use musig2::{PartialSignature, PubNonce};
 use p3_bn254_fr::Bn254Fr;
 use p3_field::{FieldAlgebra, PrimeField};
@@ -58,8 +57,6 @@ use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -4474,119 +4471,16 @@ pub(crate) fn soldering_payload_hash_hex(payload_hash: &[u8; 32]) -> String {
     payload_hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn soldering_proof_protocol_name() -> String {
-    format!("/{}/soldering-proof/1", env::get_proto_base())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SolderingProofRangeRequest {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub verifier_index: usize,
-    pub payload_hash: [u8; 32],
-    pub offset: usize,
-    pub len: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SolderingProofRangeResponse {
-    Data { total_len: usize, offset: usize, data: Vec<u8> },
-    NotFound,
-    InvalidRange,
-}
-
-#[derive(Clone, Default)]
-pub struct SolderingProofCodec;
-
-const SOLDERING_PROOF_REQUEST_MAX_BYTES: usize = 64 * 1024;
-const SOLDERING_PROOF_RESPONSE_MAX_BYTES: usize = MAX_SOLDERING_PROOF_PULL_RANGE_BYTES + 64 * 1024;
-
-#[async_trait::async_trait]
-impl request_response::Codec for SolderingProofCodec {
-    type Protocol = String;
-    type Request = SolderingProofRangeRequest;
-    type Response = SolderingProofRangeResponse;
-
-    async fn read_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> std::io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let bytes = read_limited(io, SOLDERING_PROOF_REQUEST_MAX_BYTES).await?;
-        bincode::deserialize(&bytes).map_err(|err| IoError::new(ErrorKind::InvalidData, err))
-    }
-
-    async fn read_response<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> std::io::Result<Self::Response>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let bytes = read_limited(io, SOLDERING_PROOF_RESPONSE_MAX_BYTES).await?;
-        bincode::deserialize(&bytes).map_err(|err| IoError::new(ErrorKind::InvalidData, err))
-    }
-
-    async fn write_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-        req: Self::Request,
-    ) -> std::io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        write_bincode(io, &req).await
-    }
-
-    async fn write_response<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-        res: Self::Response,
-    ) -> std::io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        write_bincode(io, &res).await
-    }
-}
-
-async fn read_limited<T>(io: &mut T, max_bytes: usize) -> std::io::Result<Vec<u8>>
-where
-    T: AsyncRead + Unpin + Send,
-{
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = io.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-        if bytes.len() + n > max_bytes {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                "soldering proof request-response message exceeds size limit",
-            ));
-        }
-        bytes.extend_from_slice(&buffer[..n]);
-    }
-    Ok(bytes)
-}
-
-async fn write_bincode<T, M>(io: &mut T, message: &M) -> std::io::Result<()>
-where
-    T: AsyncWrite + Unpin + Send,
-    M: Serialize,
-{
-    let bytes =
-        bincode::serialize(message).map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
-    io.write_all(&bytes).await?;
-    io.close().await
+pub(crate) async fn pending_graph_belongs_to_operator(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_pubkey: &PublicKey,
+) -> Result<bool> {
+    let mut storage = local_db.acquire().await?;
+    Ok(storage.find_pending_graph_init_by_graph_id(&graph_id).await?.is_some_and(|pending| {
+        pending.instance_id == instance_id && pending.operator_pubkey == operator_pubkey.to_string()
+    }))
 }
 
 pub(crate) fn soldering_proof_payload_path(
@@ -4605,7 +4499,7 @@ pub(crate) fn soldering_proof_payload_path(
         ))
 }
 
-fn soldering_proof_pull_temp_path(
+fn soldering_proof_upload_temp_path(
     local_db: &LocalDB,
     instance_id: Uuid,
     graph_id: Uuid,
@@ -4614,7 +4508,7 @@ fn soldering_proof_pull_temp_path(
 ) -> PathBuf {
     babe_setup_state_root(local_db)
         .join(instance_id.to_string())
-        .join("soldering-proof-pulls")
+        .join("soldering-proof-uploads")
         .join(format!(
             "{graph_id}-{verifier_index}-{}.part",
             soldering_payload_hash_hex(payload_hash)
@@ -4648,58 +4542,16 @@ pub(crate) fn save_soldering_proof_payload(
     Ok(path)
 }
 
-pub(crate) fn read_soldering_proof_payload_range(
-    local_db: &LocalDB,
-    request: &SolderingProofRangeRequest,
-) -> Result<SolderingProofRangeResponse> {
-    let path = soldering_proof_payload_path(
-        local_db,
-        request.instance_id,
-        request.graph_id,
-        request.verifier_index,
-        &request.payload_hash,
-    );
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SolderingProofRangeResponse::NotFound);
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("open soldering proof payload {}", path.display()));
-        }
-    };
-
-    let total_len = file
-        .metadata()
-        .with_context(|| format!("stat soldering proof payload {}", path.display()))?
-        .len() as usize;
-    if request.len == 0
-        || request.offset > total_len
-        || request.offset.checked_add(request.len).is_none_or(|end| end > total_len)
-    {
-        return Ok(SolderingProofRangeResponse::InvalidRange);
-    }
-
-    use std::io::{Read, Seek, SeekFrom};
-    file.seek(SeekFrom::Start(request.offset as u64))
-        .with_context(|| format!("seek soldering proof payload {}", path.display()))?;
-    let mut data = vec![0u8; request.len];
-    file.read_exact(&mut data)
-        .with_context(|| format!("read soldering proof payload {}", path.display()))?;
-    Ok(SolderingProofRangeResponse::Data { total_len, offset: request.offset, data })
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SolderingProofPayloadKey {
+pub(crate) struct SolderingProofUploadKey {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_index: usize,
     pub payload_hash: [u8; 32],
 }
 
-impl SolderingProofPayloadKey {
-    fn from_ready(ready: &SolderingProofReady) -> Self {
+impl SolderingProofUploadKey {
+    pub(crate) fn from_ready(ready: &SolderingProofReady) -> Self {
         Self {
             instance_id: ready.instance_id,
             graph_id: ready.graph_id,
@@ -4709,305 +4561,255 @@ impl SolderingProofPayloadKey {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SolderingProofPulledPayload {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SolderingProofUploadMetadata {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_index: usize,
     pub payload_hash: [u8; 32],
-    pub payload: Vec<u8>,
+    pub total_len: usize,
+    pub offset: usize,
+    pub chunk_len: usize,
 }
 
-#[derive(Debug)]
-pub(crate) struct SolderingProofPullSession {
-    key: SolderingProofPayloadKey,
-    total_len: usize,
-    range_bytes: usize,
-    temp_path: PathBuf,
-    next_offset: usize,
-}
-
-impl SolderingProofPullSession {
-    pub(crate) fn open(local_db: &LocalDB, ready: &SolderingProofReady) -> Result<Self> {
-        if ready.total_len == 0 {
-            bail!("SolderingProofReady total_len must be greater than zero");
-        }
-        let key = SolderingProofPayloadKey::from_ready(ready);
-        let temp_path = soldering_proof_pull_temp_path(
-            local_db,
-            ready.instance_id,
-            ready.graph_id,
-            ready.verifier_index,
-            &ready.payload_hash,
-        );
-        let next_offset = match std::fs::metadata(&temp_path) {
-            Ok(metadata) => {
-                let len = metadata.len() as usize;
-                if len <= ready.total_len {
-                    len
-                } else {
-                    std::fs::remove_file(&temp_path).with_context(|| {
-                        format!(
-                            "remove oversized soldering proof pull temp {}",
-                            temp_path.display()
-                        )
-                    })?;
-                    0
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("stat soldering proof pull temp {}", temp_path.display())
-                });
-            }
-        };
-
-        Ok(Self {
-            key,
-            total_len: ready.total_len,
-            range_bytes: ready
-                .range_bytes
-                .clamp(MIN_SOLDERING_PROOF_PULL_RANGE_BYTES, MAX_SOLDERING_PROOF_PULL_RANGE_BYTES),
-            temp_path,
-            next_offset,
-        })
-    }
-
-    pub(crate) fn next_request(&self) -> Option<SolderingProofRangeRequest> {
-        if self.next_offset >= self.total_len {
-            return None;
-        }
-        Some(SolderingProofRangeRequest {
-            instance_id: self.key.instance_id,
-            graph_id: self.key.graph_id,
-            verifier_index: self.key.verifier_index,
-            payload_hash: self.key.payload_hash,
-            offset: self.next_offset,
-            len: self.range_bytes.min(self.total_len - self.next_offset),
-        })
-    }
-
-    pub(crate) fn write_range(
-        &mut self,
-        total_len: usize,
-        offset: usize,
-        data: &[u8],
-    ) -> Result<()> {
-        if total_len != self.total_len {
-            bail!("soldering proof range total_len mismatch");
-        }
-        if offset != self.next_offset {
-            bail!(
-                "soldering proof range offset {offset} does not match expected {}",
-                self.next_offset
-            );
-        }
-        if data.is_empty() {
-            bail!("soldering proof range data is empty");
-        }
-        if self.next_offset.checked_add(data.len()).is_none_or(|end| end > self.total_len) {
-            bail!("soldering proof range exceeds total_len");
-        }
-        if let Some(parent) = self.temp_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create soldering proof pull temp dir {}", parent.display())
-            })?;
-        }
-        let current_len = match std::fs::metadata(&self.temp_path) {
-            Ok(metadata) => metadata.len() as usize,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("stat soldering proof pull temp {}", self.temp_path.display())
-                });
-            }
-        };
-        if current_len != self.next_offset {
-            bail!("soldering proof pull temp length conflicts with session offset");
-        }
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.temp_path)
-            .with_context(|| {
-                format!("open soldering proof pull temp {}", self.temp_path.display())
-            })?;
-        file.write_all(data).with_context(|| {
-            format!("write soldering proof pull temp {}", self.temp_path.display())
-        })?;
-        self.next_offset += data.len();
-        Ok(())
-    }
-
-    pub(crate) fn is_complete(&self) -> bool {
-        self.next_offset == self.total_len
-    }
-
-    pub(crate) fn finalize(&self) -> Result<SolderingProofPulledPayload> {
-        if !self.is_complete() {
-            bail!("soldering proof pull session is incomplete");
-        }
-        let payload = std::fs::read(&self.temp_path).with_context(|| {
-            format!("read soldering proof pull temp {}", self.temp_path.display())
-        })?;
-        if payload.len() != self.total_len {
-            bail!("soldering proof pulled payload length mismatch");
-        }
-        if soldering_payload_hash(&payload) != self.key.payload_hash {
-            let _ = std::fs::remove_file(&self.temp_path);
-            bail!("soldering proof pulled payload hash mismatch");
-        }
-        match std::fs::remove_file(&self.temp_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("remove soldering proof pull temp {}", self.temp_path.display())
-                });
-            }
-        }
-        Ok(SolderingProofPulledPayload {
-            instance_id: self.key.instance_id,
-            graph_id: self.key.graph_id,
-            verifier_index: self.key.verifier_index,
-            payload_hash: self.key.payload_hash,
-            payload,
-        })
-    }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SolderingProofUploadResponse {
+    pub received: usize,
+    pub total_len: usize,
+    pub complete: bool,
 }
 
 #[derive(Clone, Debug)]
-struct SolderingProofPendingRange {
-    key: SolderingProofPayloadKey,
-    peer_id: PeerId,
-    expected_offset: usize,
-    expected_len: usize,
+pub(crate) struct SolderingProofUploadWriteResult {
+    pub received: usize,
+    pub total_len: usize,
+    pub complete: bool,
+    pub payload_path: Option<PathBuf>,
 }
 
-#[derive(Default)]
-pub struct SolderingProofPullCoordinator {
-    sessions: HashMap<SolderingProofPayloadKey, SolderingProofPullSession>,
-    pending: HashMap<request_response::OutboundRequestId, SolderingProofPendingRange>,
-    pending_by_key: HashMap<SolderingProofPayloadKey, request_response::OutboundRequestId>,
+pub const X_SOLDERING_TOTAL_LEN: &str = "x-soldering-total-len";
+pub const X_SOLDERING_OFFSET: &str = "x-soldering-offset";
+pub const X_SOLDERING_CHUNK_SHA256: &str = "x-soldering-chunk-sha256";
+pub const X_SOLDERING_SIGNATURE: &str = "x-soldering-signature";
+const SOLDERING_UPLOAD_SIGNATURE_DOMAIN: &[u8] = b"bitvm-soldering-proof-upload-v1";
+
+pub(crate) fn soldering_proof_upload_message_hash(
+    metadata: &SolderingProofUploadMetadata,
+    chunk_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SOLDERING_UPLOAD_SIGNATURE_DOMAIN);
+    hasher.update(metadata.instance_id.as_bytes());
+    hasher.update(metadata.graph_id.as_bytes());
+    hasher.update((metadata.verifier_index as u64).to_be_bytes());
+    hasher.update(metadata.payload_hash);
+    hasher.update((metadata.total_len as u64).to_be_bytes());
+    hasher.update((metadata.offset as u64).to_be_bytes());
+    hasher.update((metadata.chunk_len as u64).to_be_bytes());
+    hasher.update(chunk_hash);
+    hasher.finalize().into()
 }
 
-impl SolderingProofPullCoordinator {
-    pub(crate) fn request_ready(
-        &mut self,
-        swarm: &mut Swarm<AllBehaviours>,
-        local_db: &LocalDB,
-        peer_id: PeerId,
-        ready: &SolderingProofReady,
-    ) -> Result<Option<SolderingProofPulledPayload>> {
-        let key = SolderingProofPayloadKey::from_ready(ready);
-        if self.pending_by_key.contains_key(&key) {
-            return Ok(None);
-        }
-        if !self.sessions.contains_key(&key) {
-            let session = SolderingProofPullSession::open(local_db, ready)?;
-            self.sessions.insert(key.clone(), session);
-        }
+pub(crate) fn sign_soldering_proof_upload_chunk(
+    keypair: &Keypair,
+    metadata: &SolderingProofUploadMetadata,
+    chunk_hash: &[u8; 32],
+) -> String {
+    let msg =
+        secp256k1::Message::from_digest(soldering_proof_upload_message_hash(metadata, chunk_hash));
+    let signature = secp256k1::SECP256K1.sign_schnorr(&msg, keypair);
+    hex::encode(signature.as_ref())
+}
 
-        let session = self
-            .sessions
-            .get(&key)
-            .ok_or_else(|| anyhow!("missing soldering proof pull session"))?;
-        if session.total_len != ready.total_len {
-            bail!("SolderingProofReady total_len conflicts with existing pull session");
-        }
-        if session.is_complete() {
-            let session = self.sessions.remove(&key).expect("session exists");
-            return Ok(Some(session.finalize()?));
-        }
-        let request = session
-            .next_request()
-            .ok_or_else(|| anyhow!("missing next soldering proof range request"))?;
-        let expected_offset = request.offset;
-        let expected_len = request.len;
-        let request_id = swarm.behaviour_mut().soldering_proof.send_request(&peer_id, request);
-        self.pending.insert(
-            request_id,
-            SolderingProofPendingRange { key: key.clone(), peer_id, expected_offset, expected_len },
-        );
-        self.pending_by_key.insert(key, request_id);
-        Ok(None)
+pub(crate) fn verify_soldering_proof_upload_signature(
+    verifier_pubkey: &PublicKey,
+    signature_hex: &str,
+    metadata: &SolderingProofUploadMetadata,
+    chunk_hash: &[u8; 32],
+) -> Result<()> {
+    let signature_bytes =
+        hex::decode(signature_hex.trim()).context("decode soldering proof upload signature hex")?;
+    let signature = secp256k1::schnorr::Signature::from_slice(&signature_bytes)
+        .context("parse soldering proof upload signature")?;
+    let msg =
+        secp256k1::Message::from_digest(soldering_proof_upload_message_hash(metadata, chunk_hash));
+    let x_only_pubkey = XOnlyPublicKey::from(*verifier_pubkey);
+    secp256k1::SECP256K1
+        .verify_schnorr(&signature, &msg, &x_only_pubkey)
+        .context("verify soldering proof upload signature")
+}
+
+fn read_exact_file_range(path: &Path, offset: usize, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    file.seek(SeekFrom::Start(offset as u64))
+        .with_context(|| format!("seek {}", path.display()))?;
+    let mut data = vec![0u8; len];
+    file.read_exact(&mut data).with_context(|| format!("read {}", path.display()))?;
+    Ok(data)
+}
+
+fn validate_completed_soldering_proof_payload(
+    path: &Path,
+    key: &SolderingProofUploadKey,
+    total_len: usize,
+) -> Result<Vec<u8>> {
+    let payload = std::fs::read(path)
+        .with_context(|| format!("read soldering proof payload {}", path.display()))?;
+    if payload.len() != total_len {
+        bail!("completed soldering proof payload length mismatch");
+    }
+    if soldering_payload_hash(&payload) != key.payload_hash {
+        bail!("completed soldering proof payload hash mismatch");
+    }
+    Ok(payload)
+}
+
+pub(crate) fn read_completed_soldering_proof_payload(
+    local_db: &LocalDB,
+    key: &SolderingProofUploadKey,
+    total_len: usize,
+) -> Result<Vec<u8>> {
+    let path = soldering_proof_payload_path(
+        local_db,
+        key.instance_id,
+        key.graph_id,
+        key.verifier_index,
+        &key.payload_hash,
+    );
+    validate_completed_soldering_proof_payload(&path, key, total_len)
+}
+
+pub(crate) fn write_soldering_proof_upload_chunk(
+    local_db: &LocalDB,
+    key: &SolderingProofUploadKey,
+    total_len: usize,
+    offset: usize,
+    data: &[u8],
+    chunk_hash: &[u8; 32],
+) -> Result<SolderingProofUploadWriteResult> {
+    if total_len == 0 {
+        bail!("soldering proof upload total_len must be greater than zero");
+    }
+    if data.is_empty() {
+        bail!("soldering proof upload chunk is empty");
+    }
+    if soldering_payload_hash(data) != *chunk_hash {
+        bail!("soldering proof upload chunk hash mismatch");
+    }
+    let chunk_end = offset
+        .checked_add(data.len())
+        .ok_or_else(|| anyhow!("soldering proof upload chunk offset overflows"))?;
+    if offset > total_len || chunk_end > total_len {
+        bail!("soldering proof upload chunk exceeds total_len");
     }
 
-    pub(crate) fn handle_response(
-        &mut self,
-        swarm: &mut Swarm<AllBehaviours>,
-        peer_id: PeerId,
-        request_id: request_response::OutboundRequestId,
-        response: SolderingProofRangeResponse,
-    ) -> Result<Option<SolderingProofPulledPayload>> {
-        let pending = self
-            .pending
-            .remove(&request_id)
-            .ok_or_else(|| anyhow!("unknown soldering proof range response {request_id}"))?;
-        self.pending_by_key.remove(&pending.key);
-        if pending.peer_id != peer_id {
-            bail!("soldering proof range response peer mismatch");
-        }
-
-        let (total_len, offset, data) = match response {
-            SolderingProofRangeResponse::Data { total_len, offset, data } => {
-                (total_len, offset, data)
-            }
-            SolderingProofRangeResponse::NotFound => {
-                bail!("soldering proof payload not found by remote peer");
-            }
-            SolderingProofRangeResponse::InvalidRange => {
-                bail!("remote peer rejected soldering proof range");
-            }
-        };
-        if offset != pending.expected_offset {
-            bail!("soldering proof range response offset mismatch");
-        }
-        if data.len() != pending.expected_len {
-            bail!("soldering proof range response length mismatch");
-        }
-        let session = self
-            .sessions
-            .get_mut(&pending.key)
-            .ok_or_else(|| anyhow!("missing soldering proof pull session"))?;
-        session.write_range(total_len, offset, &data)?;
-        if session.is_complete() {
-            let session = self.sessions.remove(&pending.key).expect("session exists");
-            return Ok(Some(session.finalize()?));
-        }
-
-        let request = session
-            .next_request()
-            .ok_or_else(|| anyhow!("missing next soldering proof range request"))?;
-        let expected_offset = request.offset;
-        let expected_len = request.len;
-        let request_id = swarm.behaviour_mut().soldering_proof.send_request(&peer_id, request);
-        self.pending.insert(
-            request_id,
-            SolderingProofPendingRange {
-                key: pending.key.clone(),
-                peer_id,
-                expected_offset,
-                expected_len,
-            },
-        );
-        self.pending_by_key.insert(pending.key, request_id);
-        Ok(None)
+    let final_path = soldering_proof_payload_path(
+        local_db,
+        key.instance_id,
+        key.graph_id,
+        key.verifier_index,
+        &key.payload_hash,
+    );
+    if final_path.exists() {
+        validate_completed_soldering_proof_payload(&final_path, key, total_len)?;
+        return Ok(SolderingProofUploadWriteResult {
+            received: total_len,
+            total_len,
+            complete: true,
+            payload_path: Some(final_path),
+        });
     }
 
-    pub(crate) fn handle_failure(&mut self, request_id: request_response::OutboundRequestId) {
-        if let Some(pending) = self.pending.remove(&request_id) {
-            self.pending_by_key.remove(&pending.key);
-        }
+    let temp_path = soldering_proof_upload_temp_path(
+        local_db,
+        key.instance_id,
+        key.graph_id,
+        key.verifier_index,
+        &key.payload_hash,
+    );
+    if let Some(parent) = temp_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create soldering proof upload dir {}", parent.display()))?;
     }
+    let current_len = match std::fs::metadata(&temp_path) {
+        Ok(metadata) => metadata.len() as usize,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat soldering proof upload {}", temp_path.display()));
+        }
+    };
+    if current_len > total_len {
+        std::fs::remove_file(&temp_path).with_context(|| {
+            format!("remove oversized soldering proof upload {}", temp_path.display())
+        })?;
+        bail!("soldering proof upload temp file exceeded total_len");
+    }
+    if offset < current_len {
+        if chunk_end > current_len {
+            bail!("soldering proof upload chunk overlaps existing data");
+        }
+        let existing = read_exact_file_range(&temp_path, offset, data.len())?;
+        if existing != data {
+            bail!("soldering proof upload chunk conflicts with existing data");
+        }
+        return Ok(SolderingProofUploadWriteResult {
+            received: current_len,
+            total_len,
+            complete: false,
+            payload_path: None,
+        });
+    }
+    if offset != current_len {
+        bail!("soldering proof upload chunk offset {offset} does not match expected {current_len}");
+    }
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&temp_path)
+        .with_context(|| format!("open soldering proof upload {}", temp_path.display()))?;
+    file.write_all(data)
+        .with_context(|| format!("write soldering proof upload {}", temp_path.display()))?;
+    let received = chunk_end;
+    if received != total_len {
+        return Ok(SolderingProofUploadWriteResult {
+            received,
+            total_len,
+            complete: false,
+            payload_path: None,
+        });
+    }
+
+    let payload = std::fs::read(&temp_path)
+        .with_context(|| format!("read soldering proof upload {}", temp_path.display()))?;
+    if payload.len() != total_len || soldering_payload_hash(&payload) != key.payload_hash {
+        let _ = std::fs::remove_file(&temp_path);
+        bail!("soldering proof uploaded payload hash mismatch");
+    }
+    if let Some(parent) = final_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create soldering proof payload dir {}", parent.display()))?;
+    }
+    std::fs::rename(&temp_path, &final_path).with_context(|| {
+        format!("move soldering proof upload {} to {}", temp_path.display(), final_path.display())
+    })?;
+
+    Ok(SolderingProofUploadWriteResult {
+        received,
+        total_len,
+        complete: true,
+        payload_path: Some(final_path),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_soldering_proof_to_operator(
     swarm: &mut Swarm<AllBehaviours>,
     local_db: &LocalDB,
+    operator_peer_id: PeerId,
     instance_id: Uuid,
     graph_id: Uuid,
     verifier_index: usize,
@@ -5020,7 +4822,7 @@ pub(crate) async fn send_soldering_proof_to_operator(
         .context("serialize compact soldering proof payload")?;
     let payload_hash = soldering_payload_hash(&payload);
     let total_len = payload.len();
-    let range_bytes = get_soldering_proof_pull_range_bytes();
+    let chunk_bytes = get_soldering_proof_upload_chunk_bytes();
     let path = save_soldering_proof_payload(
         local_db,
         instance_id,
@@ -5030,8 +4832,10 @@ pub(crate) async fn send_soldering_proof_to_operator(
         &payload,
     )?;
     tracing::info!(
+        operator_peer_id = %operator_peer_id,
         total_len,
-        range_bytes,
+        chunk_bytes,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
         payload_path = %path.display(),
         "send compact soldering proof ready"
     );
@@ -5041,9 +4845,165 @@ pub(crate) async fn send_soldering_proof_to_operator(
         verifier_index,
         payload_hash,
         total_len,
-        range_bytes,
+        upload_chunk_bytes: chunk_bytes,
     });
     send_to_peer(swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+    upload_soldering_proof_payload_to_operator(
+        local_db,
+        operator_peer_id,
+        instance_id,
+        graph_id,
+        verifier_index,
+        payload_hash,
+        &payload,
+        chunk_bytes,
+    )
+    .await?;
+
+    Ok(())
+}
+
+fn soldering_proof_upload_url(
+    base_url: &str,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: &[u8; 32],
+) -> String {
+    format!(
+        "{}/v1/soldering-proof-payloads/{}/{}/{}/{}",
+        base_url.trim_end_matches('/'),
+        instance_id,
+        graph_id,
+        verifier_index,
+        soldering_payload_hash_hex(payload_hash)
+    )
+}
+
+async fn operator_rpc_base_url(local_db: &LocalDB, operator_peer_id: PeerId) -> Result<String> {
+    let mut storage = local_db.acquire().await?;
+    let node = storage
+        .node_by_id(&operator_peer_id.to_string())
+        .await?
+        .ok_or_else(|| anyhow!("operator node info not found for peer {operator_peer_id}"))?;
+    let socket_addr = node.socket_addr.trim();
+    if socket_addr.is_empty() {
+        bail!("operator node info has empty socket_addr for peer {operator_peer_id}");
+    }
+    if socket_addr.starts_with("http://") || socket_addr.starts_with("https://") {
+        Ok(socket_addr.trim_end_matches('/').to_string())
+    } else {
+        Ok(format!("http://{}", socket_addr.trim_end_matches('/')))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_soldering_proof_payload_to_operator(
+    local_db: &LocalDB,
+    operator_peer_id: PeerId,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: [u8; 32],
+    payload: &[u8],
+    chunk_bytes: usize,
+) -> Result<()> {
+    let base_url = operator_rpc_base_url(local_db, operator_peer_id).await?;
+    let url =
+        soldering_proof_upload_url(&base_url, instance_id, graph_id, verifier_index, &payload_hash);
+    let total_len = payload.len();
+    let verifier_keypair = VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
+    let client = reqwest::Client::new();
+    tracing::info!(
+        operator_peer_id = %operator_peer_id,
+        target_url = %url,
+        total_len,
+        chunk_bytes,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        "start soldering proof HTTP chunk upload"
+    );
+
+    let mut offset = 0usize;
+    while offset < total_len {
+        let end = offset.saturating_add(chunk_bytes).min(total_len);
+        let chunk = &payload[offset..end];
+        let chunk_hash = soldering_payload_hash(chunk);
+        let metadata = SolderingProofUploadMetadata {
+            instance_id,
+            graph_id,
+            verifier_index,
+            payload_hash,
+            total_len,
+            offset,
+            chunk_len: chunk.len(),
+        };
+        let signature =
+            sign_soldering_proof_upload_chunk(&verifier_keypair, &metadata, &chunk_hash);
+        let response = client
+            .put(&url)
+            .header(X_SOLDERING_TOTAL_LEN, total_len.to_string())
+            .header(X_SOLDERING_OFFSET, offset.to_string())
+            .header(X_SOLDERING_CHUNK_SHA256, soldering_payload_hash_hex(&chunk_hash))
+            .header(X_SOLDERING_SIGNATURE, signature)
+            .body(chunk.to_vec())
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::error!(
+                    operator_peer_id = %operator_peer_id,
+                    target_url = %url,
+                    offset,
+                    len = chunk.len(),
+                    retryable = true,
+                    error = %err,
+                    "soldering proof HTTP chunk upload failed"
+                );
+                return Err(err).context("send soldering proof upload chunk");
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                operator_peer_id = %operator_peer_id,
+                target_url = %url,
+                offset,
+                len = chunk.len(),
+                retryable = true,
+                status = %status,
+                response_body = %body,
+                "soldering proof HTTP chunk upload rejected"
+            );
+            bail!("soldering proof upload chunk rejected with status {status}: {body}");
+        }
+        let upload_response: SolderingProofUploadResponse =
+            response.json().await.context("decode soldering proof upload response")?;
+        let sent = end;
+        if upload_response.total_len != total_len {
+            bail!("soldering proof upload response total_len mismatch");
+        }
+        if upload_response.received < sent {
+            bail!("soldering proof upload response received less than sent");
+        }
+        tracing::info!(
+            operator_peer_id = %operator_peer_id,
+            offset,
+            len = chunk.len(),
+            sent = upload_response.received,
+            total = total_len,
+            complete = upload_response.complete,
+            "soldering proof HTTP chunk uploaded"
+        );
+        offset = upload_response.received.min(total_len);
+    }
+    tracing::info!(
+        operator_peer_id = %operator_peer_id,
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        "soldering proof HTTP chunk upload completed"
+    );
     Ok(())
 }
 
@@ -5129,4 +5089,206 @@ pub struct OperatorBabeSetupState {
     pub candidates: Vec<OperatorVerifierCandidate>,
     #[serde(default)]
     pub asserted_wrapper_proof: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod soldering_upload_tests {
+    use super::*;
+    use crate::env::{
+        DEFAULT_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES, ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES,
+        MAX_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES, MIN_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES,
+        get_soldering_proof_upload_chunk_bytes,
+    };
+    use secp256k1::{Keypair as SecpKeypair, SECP256K1};
+    use store::create_local_db;
+
+    fn test_keypair(byte: u8) -> SecpKeypair {
+        SecpKeypair::from_seckey_slice(SECP256K1, &[byte; 32]).unwrap()
+    }
+
+    fn upload_key(payload: &[u8]) -> SolderingProofUploadKey {
+        SolderingProofUploadKey {
+            instance_id: Uuid::new_v4(),
+            graph_id: Uuid::new_v4(),
+            verifier_index: 2,
+            payload_hash: soldering_payload_hash(payload),
+        }
+    }
+
+    fn metadata(
+        key: &SolderingProofUploadKey,
+        total_len: usize,
+        offset: usize,
+        chunk_len: usize,
+    ) -> SolderingProofUploadMetadata {
+        SolderingProofUploadMetadata {
+            instance_id: key.instance_id,
+            graph_id: key.graph_id,
+            verifier_index: key.verifier_index,
+            payload_hash: key.payload_hash,
+            total_len,
+            offset,
+            chunk_len,
+        }
+    }
+
+    #[test]
+    fn soldering_upload_chunk_bytes_uses_default_and_clamps() {
+        unsafe { std::env::remove_var(ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES) };
+        assert_eq!(
+            get_soldering_proof_upload_chunk_bytes(),
+            DEFAULT_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES
+        );
+
+        unsafe { std::env::set_var(ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES, "1") };
+        assert_eq!(
+            get_soldering_proof_upload_chunk_bytes(),
+            MIN_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES
+        );
+
+        unsafe { std::env::set_var(ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES, "999999999") };
+        assert_eq!(
+            get_soldering_proof_upload_chunk_bytes(),
+            MAX_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES
+        );
+
+        unsafe { std::env::set_var(ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES, "bad") };
+        assert_eq!(
+            get_soldering_proof_upload_chunk_bytes(),
+            DEFAULT_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES
+        );
+        unsafe { std::env::remove_var(ENV_SOLDERING_PROOF_UPLOAD_CHUNK_BYTES) };
+    }
+
+    #[test]
+    fn soldering_upload_signature_verifies_metadata_and_chunk_hash() {
+        let payload = b"hello soldering upload";
+        let key = upload_key(payload);
+        let chunk = &payload[..5];
+        let chunk_hash = soldering_payload_hash(chunk);
+        let signer = test_keypair(7);
+        let verifier_pubkey: PublicKey = signer.public_key().into();
+        let metadata = metadata(&key, payload.len(), 0, chunk.len());
+
+        let signature = sign_soldering_proof_upload_chunk(&signer, &metadata, &chunk_hash);
+        verify_soldering_proof_upload_signature(
+            &verifier_pubkey,
+            &signature,
+            &metadata,
+            &chunk_hash,
+        )
+        .unwrap();
+
+        let mut bad_metadata = metadata.clone();
+        bad_metadata.offset = 1;
+        assert!(
+            verify_soldering_proof_upload_signature(
+                &verifier_pubkey,
+                &signature,
+                &bad_metadata,
+                &chunk_hash,
+            )
+            .is_err()
+        );
+
+        let wrong_pubkey: PublicKey = test_keypair(8).public_key().into();
+        assert!(
+            verify_soldering_proof_upload_signature(
+                &wrong_pubkey,
+                &signature,
+                &metadata,
+                &chunk_hash,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn soldering_upload_writes_chunks_idempotently_and_finalizes() {
+        let local_db = create_local_db(&temp_sqlite_db_path()).await;
+        let payload = b"0123456789abcdef".to_vec();
+        let key = upload_key(&payload);
+
+        let first = &payload[..6];
+        let result = write_soldering_proof_upload_chunk(
+            &local_db,
+            &key,
+            payload.len(),
+            0,
+            first,
+            &soldering_payload_hash(first),
+        )
+        .unwrap();
+        assert_eq!(result.received, first.len());
+        assert!(!result.complete);
+
+        let repeated = write_soldering_proof_upload_chunk(
+            &local_db,
+            &key,
+            payload.len(),
+            0,
+            first,
+            &soldering_payload_hash(first),
+        )
+        .unwrap();
+        assert_eq!(repeated.received, first.len());
+        assert!(!repeated.complete);
+
+        let conflict = write_soldering_proof_upload_chunk(
+            &local_db,
+            &key,
+            payload.len(),
+            0,
+            b"xxxxxx",
+            &soldering_payload_hash(b"xxxxxx"),
+        );
+        assert!(conflict.is_err());
+
+        let gap = write_soldering_proof_upload_chunk(
+            &local_db,
+            &key,
+            payload.len(),
+            8,
+            &payload[8..10],
+            &soldering_payload_hash(&payload[8..10]),
+        );
+        assert!(gap.is_err());
+
+        let second = &payload[first.len()..];
+        let complete = write_soldering_proof_upload_chunk(
+            &local_db,
+            &key,
+            payload.len(),
+            first.len(),
+            second,
+            &soldering_payload_hash(second),
+        )
+        .unwrap();
+        assert_eq!(complete.received, payload.len());
+        assert!(complete.complete);
+        assert!(complete.payload_path.is_some());
+
+        let restored =
+            read_completed_soldering_proof_payload(&local_db, &key, payload.len()).unwrap();
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn soldering_upload_rejects_full_payload_hash_mismatch() {
+        let local_db = create_local_db(&temp_sqlite_db_path()).await;
+        let payload = b"0123456789abcdef".to_vec();
+        let mut key = upload_key(&payload);
+        key.payload_hash = [9u8; 32];
+
+        let result = write_soldering_proof_upload_chunk(
+            &local_db,
+            &key,
+            payload.len(),
+            0,
+            &payload,
+            &soldering_payload_hash(&payload),
+        );
+        assert!(result.is_err());
+        assert!(read_completed_soldering_proof_payload(&local_db, &key, payload.len()).is_err());
+    }
 }

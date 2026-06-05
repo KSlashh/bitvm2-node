@@ -2,18 +2,14 @@ use crate::action::{
     GOATMessage, GOATMessageContent, handle_self_p2p_msg, recv_and_dispatch, send_to_peer,
 };
 use crate::env::get_local_node_info;
-use crate::handle::{HandlerContext, handle_soldering_proof_payload_operator};
 use crate::middleware::swarm::{BitvmSwarmWrapper, P2pMessageHandler, TickMessageType};
-use crate::utils::{
-    SolderingProofPullCoordinator, SolderingProofRangeRequest, SolderingProofRangeResponse,
-    detect_heart_beat, read_soldering_proof_payload_range,
-};
+use crate::utils::detect_heart_beat;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
+use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
-use libp2p::{PeerId, request_response};
 use std::sync::Arc;
 use store::localdb::LocalDB;
 
@@ -23,7 +19,6 @@ pub struct BitvmNodeProcessor {
     pub goat_client: GOATClient,
     pub http_client: HttpAsyncClient,
     pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
-    pub soldering_pulls: tokio::sync::Mutex<SolderingProofPullCoordinator>,
 }
 impl P2pMessageHandler for BitvmNodeProcessor {
     async fn recv_and_dispatch(
@@ -45,7 +40,6 @@ impl P2pMessageHandler for BitvmNodeProcessor {
             from_peer_id,
             id,
             message,
-            Some(&self.soldering_pulls),
         )
         .await
     }
@@ -82,7 +76,6 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                     &self.goat_client,
                     &self.http_client,
                     &self.soldering_builder,
-                    Some(&self.soldering_pulls),
                     actor,
                     peer_id,
                     GOATMessage::default_message_id(),
@@ -108,88 +101,6 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn handle_soldering_proof_range_request(
-        &self,
-        swarm: &mut BitvmSwarmWrapper,
-        peer_id: PeerId,
-        request: SolderingProofRangeRequest,
-        channel: request_response::ResponseChannel<SolderingProofRangeResponse>,
-    ) -> anyhow::Result<()> {
-        tracing::debug!(
-            ?peer_id,
-            instance_id = %request.instance_id,
-            graph_id = %request.graph_id,
-            verifier_index = request.verifier_index,
-            offset = request.offset,
-            len = request.len,
-            "handle soldering proof range request"
-        );
-        let response = read_soldering_proof_payload_range(&self.local_db, &request)?;
-        swarm
-            .behaviour_mut()
-            .soldering_proof
-            .send_response(channel, response)
-            .map_err(|_| anyhow::anyhow!("send soldering proof range response failed"))?;
-        Ok(())
-    }
-
-    async fn handle_soldering_proof_range_response(
-        &self,
-        swarm: &mut BitvmSwarmWrapper,
-        actor: Actor,
-        _local_peer_id: PeerId,
-        peer_id: PeerId,
-        request_id: request_response::OutboundRequestId,
-        response: SolderingProofRangeResponse,
-    ) -> anyhow::Result<()> {
-        if actor != Actor::Operator {
-            tracing::debug!("ignore soldering proof range response for non-operator actor {actor}");
-            return Ok(());
-        }
-        let pulled = {
-            let mut soldering_pulls = self.soldering_pulls.lock().await;
-            soldering_pulls.handle_response(swarm, peer_id, request_id, response)?
-        };
-        let Some(pulled) = pulled else {
-            return Ok(());
-        };
-
-        let mut ctx = HandlerContext {
-            swarm,
-            local_db: &self.local_db,
-            btc_client: &self.btc_client,
-            goat_client: &self.goat_client,
-            http_client: &self.http_client,
-            soldering_builder: &self.soldering_builder,
-            actor,
-            from_peer_id: peer_id,
-            id: GOATMessage::default_message_id(),
-            is_self_peer: get_local_node_info().peer_id == peer_id.to_string(),
-            soldering_pulls: Some(&self.soldering_pulls),
-        };
-        handle_soldering_proof_payload_operator(
-            &mut ctx,
-            pulled.instance_id,
-            pulled.graph_id,
-            pulled.verifier_index,
-            pulled.payload_hash,
-            pulled.payload.len(),
-            &pulled.payload,
-        )
-        .await
-    }
-
-    async fn handle_soldering_proof_range_failure(
-        &self,
-        request_id: request_response::OutboundRequestId,
-        error: String,
-    ) -> anyhow::Result<()> {
-        let mut soldering_pulls = self.soldering_pulls.lock().await;
-        soldering_pulls.handle_failure(request_id);
-        tracing::error!(%request_id, error, "soldering proof range request failed");
         Ok(())
     }
 }

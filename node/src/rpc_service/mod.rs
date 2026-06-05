@@ -17,6 +17,7 @@ use crate::rpc_service::handler::{
     get_instance_escrow_data, get_instances, get_instances_overview, get_node, get_nodes,
     get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph,
     get_unsigned_pegin_txn, instance_settings, pegout, send_challenge,
+    upload_soldering_proof_payload_chunk,
 };
 use axum::body::Body;
 use axum::extract::Request;
@@ -165,6 +166,10 @@ pub async fn serve_with_app_state(
         .route(routes::v1::GRAPHS_NEIGHBOR_IDS, get(get_graph_neighbor_ids))
         .route(routes::v1::GRAPHS_SEND_CHALLENGE, post(send_challenge))
         .route(routes::v1::PEGOUT, post(pegout))
+        .route(
+            routes::v1::SOLDERING_PROOF_PAYLOAD_UPLOAD,
+            put(upload_soldering_proof_payload_chunk),
+        )
         .route(routes::v1::PROOFS_CHAIN_PROOFS_DESC, get(get_chain_proof_desc))
         .route(routes::v1::PROOFS_OPERATOR_PROOF_DESC, get(get_operator_proof_desc))
         .route(routes::METRICS, get(metrics_handler))
@@ -240,6 +245,14 @@ async fn print_req_and_resp_detail(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if req.uri().path().starts_with(routes::v1::SOLDERING_PROOF_PAYLOADS_BASE) {
+        tracing::debug!(
+            "API Request: method:{}, uri:{}, body:<soldering proof upload skipped>",
+            req.method(),
+            req.uri()
+        );
+        return Ok(next.run(req).await);
+    }
     // TODO remove after the service stabilizes.
     let mut print_str = format!(
         "API Request: method:{}, uri:{}, content_type:{:?}, body:",

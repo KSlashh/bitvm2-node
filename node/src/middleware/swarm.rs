@@ -1,6 +1,5 @@
 use crate::middleware::behaviour::AllBehavioursEvent;
 use crate::middleware::{AllBehaviours, split_topic_name};
-use crate::utils::{SolderingProofRangeRequest, SolderingProofRangeResponse};
 use crate::{env, middleware};
 use anyhow::bail;
 use base64::Engine;
@@ -9,7 +8,7 @@ use futures::StreamExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, noise, request_response, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, noise, tcp, yamux};
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 
@@ -90,39 +89,6 @@ pub trait P2pMessageHandler {
         actor: Actor,
         topic: &str,
     ) -> anyhow::Result<()>;
-
-    async fn handle_soldering_proof_range_request(
-        &self,
-        swarm: &mut BitvmSwarmWrapper,
-        peer_id: PeerId,
-        request: SolderingProofRangeRequest,
-        channel: request_response::ResponseChannel<SolderingProofRangeResponse>,
-    ) -> anyhow::Result<()> {
-        let _ = (swarm, peer_id, request, channel);
-        Ok(())
-    }
-
-    async fn handle_soldering_proof_range_response(
-        &self,
-        swarm: &mut BitvmSwarmWrapper,
-        actor: Actor,
-        local_peer_id: PeerId,
-        peer_id: PeerId,
-        request_id: request_response::OutboundRequestId,
-        response: SolderingProofRangeResponse,
-    ) -> anyhow::Result<()> {
-        let _ = (swarm, actor, local_peer_id, peer_id, request_id, response);
-        Ok(())
-    }
-
-    async fn handle_soldering_proof_range_failure(
-        &self,
-        request_id: request_response::OutboundRequestId,
-        error: String,
-    ) -> anyhow::Result<()> {
-        let _ = (request_id, error);
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -284,65 +250,6 @@ impl BitvmNetworkManager {
                         }
                         SwarmEvent::Behaviour(AllBehavioursEvent::Kademlia(kad::Event::InboundRequest {request})) => {
                             debug!("kademlia: {:?}", request);
-                        }
-                        SwarmEvent::Behaviour(AllBehavioursEvent::SolderingProof(request_response::Event::Message {
-                            peer,
-                            message: request_response::Message::Request { request, channel, .. },
-                            ..
-                        })) => {
-                            match msg_handler
-                                .handle_soldering_proof_range_request(&mut self.swarm, peer, request, channel)
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(e) => tracing::error!("Fail to handle soldering proof range request: {e:?}"),
-                            }
-                        }
-                        SwarmEvent::Behaviour(AllBehavioursEvent::SolderingProof(request_response::Event::Message {
-                            peer,
-                            message: request_response::Message::Response { request_id, response },
-                            ..
-                        })) => {
-                            match msg_handler
-                                .handle_soldering_proof_range_response(
-                                    &mut self.swarm,
-                                    actor.clone(),
-                                    self.peer_id,
-                                    peer,
-                                    request_id,
-                                    response,
-                                )
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(e) => tracing::error!("Fail to handle soldering proof range response: {e:?}"),
-                            }
-                        }
-                        SwarmEvent::Behaviour(AllBehavioursEvent::SolderingProof(request_response::Event::OutboundFailure {
-                            request_id,
-                            error,
-                            ..
-                        })) => {
-                            match msg_handler
-                                .handle_soldering_proof_range_failure(request_id, error.to_string())
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(e) => tracing::error!("Fail to handle soldering proof range failure: {e:?}"),
-                            }
-                        }
-                        SwarmEvent::Behaviour(AllBehavioursEvent::SolderingProof(request_response::Event::InboundFailure {
-                            error,
-                            ..
-                        })) => {
-                            tracing::error!("soldering proof inbound range failure: {error:?}");
-                        }
-                        SwarmEvent::Behaviour(AllBehavioursEvent::SolderingProof(request_response::Event::ResponseSent {
-                            request_id,
-                            peer,
-                            ..
-                        })) => {
-                            debug!("sent soldering proof range response {request_id} to {peer}");
                         }
                         SwarmEvent::NewExternalAddrOfPeer {peer_id, address} => {
                             debug!("new external address of peer: {} {}", peer_id, address);

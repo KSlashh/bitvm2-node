@@ -48,7 +48,6 @@ pub struct HandlerContext<'a> {
     pub from_peer_id: PeerId,
     pub id: MessageId,
     pub is_self_peer: bool,
-    pub soldering_pulls: Option<&'a tokio::sync::Mutex<SolderingProofPullCoordinator>>,
 }
 
 fn committee_instance_keys_envelope_path(instance_id: Uuid) -> std::path::PathBuf {
@@ -216,7 +215,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 verifier_index,
                 payload_hash,
                 total_len,
-                range_bytes,
+                upload_chunk_bytes,
             }),
             Actor::Operator,
         ) => {
@@ -227,7 +226,27 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *verifier_index,
                 *payload_hash,
                 *total_len,
-                *range_bytes,
+                *upload_chunk_bytes,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::SolderingProofUploaded(SolderingProofUploaded {
+                instance_id,
+                graph_id,
+                verifier_index,
+                payload_hash,
+                total_len,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_soldering_proof_uploaded_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *verifier_index,
+                *payload_hash,
+                *total_len,
             )
             .await
         }
@@ -704,18 +723,6 @@ fn find_verifier_index_by_pubkey(
         [index] => Ok(Some(*index)),
         _ => bail!("graph contains duplicate slots for verifier {verifier_pubkey}"),
     }
-}
-
-async fn pending_graph_belongs_to_operator(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    operator_pubkey: &PublicKey,
-) -> Result<bool> {
-    let mut storage = local_db.acquire().await?;
-    Ok(storage.find_pending_graph_init_by_graph_id(&graph_id).await?.is_some_and(|pending| {
-        pending.instance_id == instance_id && pending.operator_pubkey == operator_pubkey.to_string()
-    }))
 }
 
 fn validate_challenge_witness_index(
@@ -1337,6 +1344,7 @@ async fn handle_cut_circuits_verifier(
             send_soldering_proof_to_operator(
                 ctx.swarm,
                 ctx.local_db,
+                ctx.from_peer_id,
                 instance_id,
                 graph_id,
                 verifier_index,
@@ -1389,6 +1397,7 @@ async fn handle_cut_circuits_verifier(
     send_soldering_proof_to_operator(
         ctx.swarm,
         ctx.local_db,
+        ctx.from_peer_id,
         instance_id,
         graph_id,
         verifier_index,
@@ -1409,7 +1418,7 @@ async fn handle_soldering_proof_ready_operator(
     verifier_index: usize,
     payload_hash: [u8; 32],
     total_len: usize,
-    range_bytes: usize,
+    upload_chunk_bytes: usize,
 ) -> Result<()> {
     if total_len == 0 {
         bail!("SolderingProofReady total_len must be greater than zero");
@@ -1453,34 +1462,56 @@ async fn handle_soldering_proof_ready_operator(
         bail!("selected verifier candidate index does not match SolderingProofReady slot");
     }
 
-    let ready = SolderingProofReady {
+    tracing::info!(
+        from_peer_id = %ctx.from_peer_id,
+        total_len,
+        upload_chunk_bytes,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        "received SolderingProofReady; waiting for HTTP upload"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_soldering_proof_uploaded_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: [u8; 32],
+    total_len: usize,
+) -> Result<()> {
+    if ctx.id != GOATMessage::default_message_id() || !ctx.is_self_peer {
+        tracing::warn!(
+            from_peer_id = %ctx.from_peer_id,
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            verifier_index,
+            "ignore non-local SolderingProofUploaded message"
+        );
+        return Ok(());
+    }
+    let key = SolderingProofUploadKey { instance_id, graph_id, verifier_index, payload_hash };
+    tracing::info!(
+        instance_id = %instance_id,
+        graph_id = %graph_id,
+        verifier_index,
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        "processing uploaded soldering proof payload"
+    );
+    let payload = read_completed_soldering_proof_payload(ctx.local_db, &key, total_len)
+        .context("read completed soldering proof upload")?;
+    handle_soldering_proof_payload_operator(
+        ctx,
         instance_id,
         graph_id,
         verifier_index,
         payload_hash,
         total_len,
-        range_bytes,
-    };
-    let soldering_pulls = ctx
-        .soldering_pulls
-        .ok_or_else(|| anyhow!("soldering proof pull coordinator is not initialized"))?;
-    let pulled = {
-        let mut soldering_pulls = soldering_pulls.lock().await;
-        soldering_pulls.request_ready(ctx.swarm, ctx.local_db, ctx.from_peer_id, &ready)?
-    };
-    if let Some(pulled) = pulled {
-        handle_soldering_proof_payload_operator(
-            ctx,
-            pulled.instance_id,
-            pulled.graph_id,
-            pulled.verifier_index,
-            pulled.payload_hash,
-            pulled.payload.len(),
-            &pulled.payload,
-        )
-        .await?;
-    }
-    Ok(())
+        &payload,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

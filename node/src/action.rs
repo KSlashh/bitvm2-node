@@ -48,6 +48,7 @@ pub enum GOATMessageContent {
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
     SolderingProofReady(SolderingProofReady),
+    SolderingProofUploaded(SolderingProofUploaded),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -118,7 +119,15 @@ pub struct SolderingProofReady {
     pub verifier_index: usize,
     pub payload_hash: [u8; 32],
     pub total_len: usize,
-    pub range_bytes: usize,
+    pub upload_chunk_bytes: usize,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SolderingProofUploaded {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_index: usize,
+    pub payload_hash: [u8; 32],
+    pub total_len: usize,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
@@ -351,7 +360,6 @@ pub async fn handle_self_p2p_msg(
     goat_client: &GOATClient,
     http_client: &HttpAsyncClient,
     soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    soldering_pulls: Option<&tokio::sync::Mutex<SolderingProofPullCoordinator>>,
     actor: Actor,
     from_peer_id: PeerId,
     id: MessageId,
@@ -383,7 +391,6 @@ pub async fn handle_self_p2p_msg(
             from_peer_id,
             id.clone(),
             &message.content,
-            soldering_pulls,
         )
         .await
         {
@@ -433,7 +440,6 @@ pub async fn recv_and_dispatch(
     from_peer_id: PeerId,
     id: MessageId,
     message: &[u8],
-    soldering_pulls: Option<&tokio::sync::Mutex<SolderingProofPullCoordinator>>,
 ) -> Result<()> {
     if id != GOATMessage::default_message_id() {
         update_node_timestamp(local_db, &from_peer_id.to_string()).await?;
@@ -452,7 +458,6 @@ pub async fn recv_and_dispatch(
         from_peer_id,
         id,
         is_self_peer,
-        soldering_pulls,
     };
     handle_dispatch(&mut handler_ctx, message.content()).await
 }
