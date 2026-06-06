@@ -318,18 +318,15 @@ impl GOATMessage {
 
     pub async fn serialize_message(&self) -> Result<Vec<u8>> {
         let cloned = self.clone();
-        tokio::task::spawn_blocking(move || match bincode::serialize(&cloned) {
-            Ok(mut encoded) => {
+        tokio::task::spawn_blocking(move || {
+            if matches!(&cloned.content, GOATMessageContent::GenCircuits(_)) {
+                let mut encoded = bincode::serialize(&cloned)
+                    .context("failed to serialize bincode GOATMessage")?;
                 let mut message = Vec::with_capacity(GOAT_MESSAGE_BIN_PREFIX.len() + encoded.len());
                 message.extend_from_slice(GOAT_MESSAGE_BIN_PREFIX);
                 message.append(&mut encoded);
                 Ok(message)
-            }
-            Err(err) => {
-                warn!(
-                    error = ?err,
-                    "failed to serialize bincode GOATMessage; falling back to legacy JSON"
-                );
+            } else {
                 serde_json::to_vec(&cloned).context("failed to serialize legacy JSON GOATMessage")
             }
         })
