@@ -1,12 +1,20 @@
 use crate::types::BitvmGcGraph;
 use anyhow::{Result, bail};
-use bitcoin::{Address, Amount, Network, Transaction, TxIn, TxOut, XOnlyPublicKey};
+use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, XOnlyPublicKey};
+use bitvm::chunk::api::type_conversion_utils::RawWitness;
 use goat::{
     assert_scripts::{INPUT_WIRE_NUM, Label},
-    connectors::{assert_connectors::VerifierConnector, connector_c::ConnectorC},
+    connectors::{
+        assert_connectors::VerifierConnector, base::TaprootConnector, connector_c::ConnectorC,
+        connector_e::ConnectorE,
+    },
     constants::PROVER_CONNECTOR_TIMELOCK,
     scripts::{generate_opreturn_script, p2a_output},
-    transactions::{base::DUST_AMOUNT, pre_signed::PreSignedTransaction},
+    transactions::{
+        assert::{pubin_disprove, pubin_disprove_script, validate_pubin},
+        base::DUST_AMOUNT,
+        pre_signed::PreSignedTransaction,
+    },
     utils::num_blocks_per_network,
 };
 
@@ -139,7 +147,7 @@ pub fn build_verifier_assert_tx(
     let connector_c = ConnectorC::new(
         network,
         &n_of_n_taproot_public_key,
-        &graph.parameters.operator_wots_pubkeys,
+        &graph.parameters.operator_assert_wots_pubkey,
     );
     let operator_assertion = connector_c
         .extract_leaf_1_raw_witness(&operator_assert_txin)
@@ -148,7 +156,7 @@ pub fn build_verifier_assert_tx(
     let verifier_connector = VerifierConnector::new(
         network,
         &n_of_n_taproot_public_key,
-        &graph.parameters.operator_wots_pubkeys,
+        &graph.parameters.operator_assert_wots_pubkey,
         graph.parameters.gc_data[verifier_index].wire_hashes.clone(),
     );
     let mut verifier_assert = graph.verifier_asserts[verifier_index].clone();
@@ -180,6 +188,73 @@ pub fn build_disprove_tx(
         );
     }
     Ok(disprove_tx)
+}
+
+pub fn validate_pubin_disprove(
+    graph: &BitvmGcGraph,
+    operator_commit_pubin_txin: &TxIn,
+    operator_assert_txin: &TxIn,
+    ack_preimages: Vec<Vec<u8>>,
+) -> Result<Option<(RawWitness, ScriptBuf)>> {
+    let network = graph.parameters.instance_parameters.network;
+    let n_of_n_taproot_public_key =
+        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
+    let connector_e = ConnectorE::new(
+        network,
+        &n_of_n_taproot_public_key,
+        &graph.parameters.operator_commit_pubin_wots_pubkey,
+    );
+    let connector_c = ConnectorC::new(
+        network,
+        &n_of_n_taproot_public_key,
+        &graph.parameters.operator_assert_wots_pubkey,
+    );
+    let operator_commit_pubin_witness = connector_e
+        .extract_leaf_0_raw_witness(operator_commit_pubin_txin)
+        .map_err(|e| anyhow::anyhow!("failed to extract operator commit pubin witness: {e}"))?;
+    let operator_assert_witness = connector_c
+        .extract_leaf_1_raw_witness(operator_assert_txin)
+        .map_err(|e| anyhow::anyhow!("failed to extract operator assert witness: {e}"))?;
+    let input_lock_script = pubin_disprove_script(
+        &graph.parameters.operator_commit_pubin_wots_pubkey,
+        &graph.parameters.operator_assert_wots_pubkey,
+        &graph.parameters.pubin_disprove_constant,
+        &graph.parameters.watchtower_ack_hashlocks,
+    )
+    .compile();
+
+    Ok(validate_pubin(
+        operator_commit_pubin_witness,
+        operator_assert_witness,
+        ack_preimages,
+        input_lock_script,
+    ))
+}
+
+pub fn build_pubin_disprove_txin(
+    graph: &BitvmGcGraph,
+    input_script_witness: RawWitness,
+    input_lock_script: ScriptBuf,
+) -> Result<TxIn> {
+    let network = graph.parameters.instance_parameters.network;
+    let n_of_n_taproot_public_key =
+        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
+    let connector_e = ConnectorE::new(
+        network,
+        &n_of_n_taproot_public_key,
+        &graph.parameters.operator_commit_pubin_wots_pubkey,
+    );
+    let connector_e_input = graph
+        .watchtower_challenge_init
+        .connector_e_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-e input: {e}"))?;
+    pubin_disprove(
+        &connector_e.generate_taproot_spend_info(),
+        &connector_e_input,
+        input_script_witness,
+        input_lock_script,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to build pubin-disprove txin: {e}"))
 }
 
 pub fn disprove_timelock(network: Network) -> u32 {

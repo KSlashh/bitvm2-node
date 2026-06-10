@@ -1,7 +1,7 @@
 use ark_bn254::Fr;
 use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
 use ark_groth16::Groth16;
-use bitvm_gc::assert_scripts::label_hash;
+use bitvm_gc::assert_scripts::{INPUT_WIRE_NUM, label_hash};
 use bitvm_gc::babe_adapter::{
     BABE_M_CC, BabeBundleBuilder, BabeChallengeAssertWitness, BabeProverState, BabeVerifierState,
     CACInstanceCommit, CACSetupPackage, FinalizedInstanceData, SolderingData, WOTS_SIG_COUNT,
@@ -200,7 +200,7 @@ fn witness_builders_validate_inputs_and_indices() {
     let challenge_witness = build_challenge_assert_witness(&verifier_state, &assert_witness, 12)
         .expect("challenge witness");
     assert_eq!(challenge_witness.verifier_index, 12);
-    assert_eq!(challenge_witness.input_labels.len(), 512);
+    assert_eq!(challenge_witness.input_labels.len(), INPUT_WIRE_NUM);
 
     let final_msgs = (0..BABE_M_CC)
         .map(|index| format!("finalized-preimage-{index}").into_bytes())

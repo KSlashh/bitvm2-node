@@ -2664,9 +2664,20 @@ pub async fn build_graph_params(
     let operator_pubkey = operator_master_keypair.public_key().into();
     let operator_receive_address =
         node_p2wsh_address(instance_parameters.network, &operator_pubkey);
-    let (_, operator_wots_pubkeys) = operator_master_key.wots_keypair_for_graph(graph_id);
+    let (_, operator_assert_wots_pubkey) =
+        operator_master_key.assert_wots_keypair_for_graph(graph_id);
+    let (_, operator_commit_pubin_wots_pubkey) =
+        operator_master_key.commit_pubin_wots_keypair_for_graph(graph_id);
     let watchtower_pubkeys = goat_client.committee_mana_get_watchtowers().await?;
-    let _guest_constant_value = get_guest_constant_value(instance_id, graph_id)?;
+    let watchtower_ack_hashlocks = (0..watchtower_pubkeys.len())
+        .map(|index| {
+            bitcoin::hashes::hash160::Hash::hash(
+                &operator_master_key.preimage_for_graph(graph_id, index),
+            )
+            .to_byte_array()
+        })
+        .collect();
+    let pubin_disprove_constant = get_guest_constant_value(instance_id, graph_id)?;
     Ok(BitvmGcGraphParameters {
         instance_parameters,
         prekickoff_parameters,
@@ -2674,9 +2685,12 @@ pub async fn build_graph_params(
         graph_nonce,
         challenge_amount: todo_funcs::challenge_amount(),
         operator_pubkey,
-        operator_wots_pubkeys,
+        operator_assert_wots_pubkey,
+        operator_commit_pubin_wots_pubkey,
         operator_receive_address,
         watchtower_pubkeys,
+        watchtower_ack_hashlocks,
+        pubin_disprove_constant,
         gc_data: bitvm_gc_circuit_datas,
     })
 }

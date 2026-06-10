@@ -1,17 +1,22 @@
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Transaction, TxIn, key::Keypair};
 use bitcoin::{Network, OutPoint, PublicKey, Witness, XOnlyPublicKey};
-use goat::assert_scripts::{Label, OperatorAssertPublicKey, OperatorAssertSecretKey};
+use goat::assert_scripts::{
+    Label, OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
+    OperatorCommitPubinSecretKey,
+};
 use goat::connectors::assert_connectors::{ProverConnector, VerifierConnector};
 use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_a::ConnectorA;
 use goat::connectors::connector_b::ConnectorB;
 use goat::connectors::connector_c::ConnectorC;
 use goat::connectors::connector_d::ConnectorD;
+use goat::connectors::connector_e::ConnectorE;
+use goat::connectors::connector_f::ConnectorF;
 use goat::connectors::kickoff_connectors::{
     ForceSkipConnector, GuardianConnector, KickoffConnector, PrekickoffConnector,
 };
-use goat::connectors::watchtower_connectors::WatchtowerChallengeConnector;
+use goat::connectors::watchtower_connectors::{AckConnector, WatchtowerChallengeConnector};
 use goat::constants::{CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK};
 use goat::transactions::assert::{
     DisproveTransaction, OperatorAssertTransaction, VerifierAssertTransaction, wrongly_challenged,
@@ -26,21 +31,45 @@ use goat::transactions::prekickoff::{
 };
 use goat::transactions::take1::Take1Transaction;
 use goat::transactions::take2::Take2Transaction;
-use goat::transactions::watchtower_challenge::WatchtowerChallengeInitTransaction;
+use goat::transactions::watchtower_challenge::{
+    OperatorChallengeNackTransaction, OperatorCommitTimeoutTransaction,
+    WatchtowerChallengeInitTransaction, WatchtowerChallengeTimeoutTransaction,
+    operator_challenge_ack, operator_commit_pubin,
+};
 use goat::utils::num_blocks_per_network;
-use goat::wots::{Wots, Wots64};
+use goat::wots::{Wots, Wots96};
 
 use crate::keys::hkdf_derive_bytes;
 use crate::types::{BitvmGcGraph, BitvmGcGraphParameters};
 
-const OPERATOR_WOTS_HKDF_SALT: &[u8] = b"bitvm-gc/operator-wots/v1";
+const OPERATOR_ASSERT_WOTS_HKDF_SALT: &[u8] = b"bitvm-gc/operator-wots/v2";
+const OPERATOR_COMMIT_PUBIN_WOTS_HKDF_SALT: &[u8] = b"bitvm-gc/operator-commit-pubin-wots/v2";
 
 #[allow(deprecated)]
-pub fn generate_wots_key(seed: &str) -> (OperatorAssertSecretKey, OperatorAssertPublicKey) {
-    let sec_str =
-        hex::encode(hkdf_derive_bytes(seed.as_bytes(), OPERATOR_WOTS_HKDF_SALT, b"wots64/0", 64));
-    let secret = Wots64::secret_from_str(&sec_str);
-    let public = Wots64::generate_public_key(&secret);
+pub fn generate_assert_wots_key(seed: &str) -> (OperatorAssertSecretKey, OperatorAssertPublicKey) {
+    let sec_str = hex::encode(hkdf_derive_bytes(
+        seed.as_bytes(),
+        OPERATOR_ASSERT_WOTS_HKDF_SALT,
+        b"wots96/0",
+        96,
+    ));
+    let secret = Wots96::secret_from_str(&sec_str);
+    let public = Wots96::generate_public_key(&secret);
+    (secret, public)
+}
+
+#[allow(deprecated)]
+pub fn generate_commit_pubin_wots_key(
+    seed: &str,
+) -> (OperatorCommitPubinSecretKey, OperatorCommitPubinPublicKey) {
+    let sec_str = hex::encode(hkdf_derive_bytes(
+        seed.as_bytes(),
+        OPERATOR_COMMIT_PUBIN_WOTS_HKDF_SALT,
+        b"wots96/0",
+        96,
+    ));
+    let secret = Wots96::secret_from_str(&sec_str);
+    let public = Wots96::generate_public_key(&secret);
     (secret, public)
 }
 
@@ -55,6 +84,12 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         XOnlyPublicKey::from(params.instance_parameters.committee_agg_pubkey);
     let watchtower_num = params.watchtower_pubkeys.len();
     let verifier_num = params.gc_data.len();
+    if params.watchtower_ack_hashlocks.len() != watchtower_num {
+        bail!(
+            "watchtower ack hashlock count {} does not match watchtower count {watchtower_num}",
+            params.watchtower_ack_hashlocks.len()
+        );
+    }
 
     let (_, pegin, _) = params.instance_parameters.build_pegin_tx()?;
     let pegin_txid = pegin.tx().compute_txid();
@@ -106,7 +141,7 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         ConnectorA::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
     let connector_b = ConnectorB::new(network, &operator_taproot_public_key);
     let connector_c =
-        ConnectorC::new(network, &n_of_n_taproot_public_key, &params.operator_wots_pubkeys);
+        ConnectorC::new(network, &n_of_n_taproot_public_key, &params.operator_assert_wots_pubkey);
     let guardian_connector = GuardianConnector::new(network, &operator_taproot_public_key);
     let kickoff = KickoffTransaction::new_for_validation(
         &kickoff_connector,
@@ -183,17 +218,72 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     );
 
     // watchtower-challenge
+    let connector_e = ConnectorE::new(
+        network,
+        &n_of_n_taproot_public_key,
+        &params.operator_commit_pubin_wots_pubkey,
+    );
+    let connector_f =
+        ConnectorF::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
     let watchtower_challenge_connectors = params
         .watchtower_pubkeys
         .iter()
-        .map(|pubkey| WatchtowerChallengeConnector::new(network, pubkey))
+        .map(|pubkey| {
+            WatchtowerChallengeConnector::new(network, &operator_taproot_public_key, pubkey)
+        })
+        .collect::<Vec<_>>();
+    let ack_connectors = params
+        .watchtower_ack_hashlocks
+        .iter()
+        .map(|hashlock| AckConnector::new(network, &n_of_n_taproot_public_key, *hashlock))
         .collect::<Vec<_>>();
     let watchtower_challenge_init = WatchtowerChallengeInitTransaction::new_for_validation(
         &connector_b,
+        &connector_e,
+        &connector_f,
         &watchtower_challenge_connectors,
+        &ack_connectors,
         connector_b_input,
     )
     .map_err(|e| anyhow::anyhow!("failed to create watchtower-challenge-init txn: {e}"))?;
+    let connector_e_input = watchtower_challenge_init
+        .connector_e_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-e input: {e}"))?;
+    let connector_f_input = watchtower_challenge_init
+        .connector_f_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-f input: {e}"))?;
+    let mut watchtower_challenge_timeouts = Vec::with_capacity(watchtower_num);
+    let mut operator_challenge_nacks = Vec::with_capacity(watchtower_num);
+    for (i, (watchtower_connector, ack_connector)) in
+        watchtower_challenge_connectors.iter().zip(ack_connectors.iter()).enumerate()
+    {
+        let watchtower_input = watchtower_challenge_init
+            .watchtower_connector_input(i)
+            .map_err(|e| anyhow::anyhow!("failed to get watchtower connector input {i}: {e}"))?;
+        let ack_input = watchtower_challenge_init
+            .ack_connector_input(i)
+            .map_err(|e| anyhow::anyhow!("failed to get ack connector input {i}: {e}"))?;
+        watchtower_challenge_timeouts.push(
+            WatchtowerChallengeTimeoutTransaction::new_for_validation(
+                watchtower_connector,
+                ack_connector,
+                watchtower_input,
+                ack_input.clone(),
+            ),
+        );
+        operator_challenge_nacks.push(OperatorChallengeNackTransaction::new_for_validation(
+            ack_connector,
+            &connector_f,
+            ack_input,
+            connector_f_input.clone(),
+        ));
+    }
+    let operator_commit_timeout = OperatorCommitTimeoutTransaction::new_for_validation(
+        &connector_e,
+        &connector_f,
+        connector_e_input.clone(),
+        connector_f_input.clone(),
+    );
 
     // prover-assert
     let connector_d =
@@ -205,7 +295,7 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
             VerifierConnector::new(
                 network,
                 &n_of_n_taproot_public_key,
-                &params.operator_wots_pubkeys,
+                &params.operator_assert_wots_pubkey,
                 data.wire_hashes.clone(),
             )
         })
@@ -218,10 +308,9 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     )
     .map_err(|e| anyhow::anyhow!("failed to create operator assert txn: {e}"))?;
     let operator_assert_txid = operator_assert.tx().compute_txid();
-    let connector_d_input = Input {
-        outpoint: OutPoint { txid: operator_assert_txid, vout: verifier_num as u32 },
-        amount: operator_assert.tx().output[verifier_num].value,
-    };
+    let connector_d_input = operator_assert
+        .connector_d_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-d input: {e}"))?;
 
     // verifier-asserts and disproves
     let mut verifier_asserts = Vec::with_capacity(verifier_num);
@@ -262,9 +351,11 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     let take2 = Take2Transaction::new_for_validation(
         &connector_0,
         &connector_d,
+        &connector_f,
         &guardian_connector,
         connector_0_input,
         connector_d_input,
+        connector_f_input,
         guardian_connector_input,
         &params.operator_receive_address,
     )
@@ -284,6 +375,9 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         take1,
         challenge,
         watchtower_challenge_init,
+        watchtower_challenge_timeouts,
+        operator_challenge_nacks,
+        operator_commit_timeout,
         operator_assert,
         verifier_asserts,
         disproves,
@@ -470,12 +564,18 @@ pub fn operator_sign_take2(
         &operator_context.operator_taproot_public_key,
         &operator_context.n_of_n_taproot_public_key,
     );
+    let connector_f = ConnectorF::new(
+        operator_context.network,
+        &operator_context.operator_taproot_public_key,
+        &operator_context.n_of_n_taproot_public_key,
+    );
     let guardian_connector = GuardianConnector::new(
         operator_context.network,
         &operator_context.operator_taproot_public_key,
     );
     graph.take2.sign_input_1(&operator_context, &connector_d);
-    graph.take2.sign_input_2(&operator_context, &guardian_connector);
+    graph.take2.sign_input_2(&operator_context, &connector_f);
+    graph.take2.sign_input_3(&operator_context, &guardian_connector);
     Ok(graph.take2.tx().clone())
 }
 
@@ -490,12 +590,86 @@ pub fn operator_sign_watchtower_challenge_init(
     Ok(graph.watchtower_challenge_init.tx().clone())
 }
 
+pub fn operator_sign_watchtower_challenge_timeout(
+    operator_keypair: Keypair,
+    graph: &mut BitvmGcGraph,
+    watchtower_index: usize,
+) -> Result<Transaction> {
+    if watchtower_index >= graph.watchtower_challenge_timeouts.len() {
+        bail!("invalid watchtower index {watchtower_index}")
+    };
+    if !graph.committee_pre_signed() {
+        bail!("missing pre-signatures from committee")
+    };
+    let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
+    let watchtower_challenge_connector = WatchtowerChallengeConnector::new(
+        operator_context.network,
+        &operator_context.operator_taproot_public_key,
+        &graph.parameters.watchtower_pubkeys[watchtower_index],
+    );
+    graph.watchtower_challenge_timeouts[watchtower_index]
+        .sign_input_0(&operator_context, &watchtower_challenge_connector);
+    Ok(graph.watchtower_challenge_timeouts[watchtower_index].tx().clone())
+}
+
+pub fn operator_sign_challenge_ack(
+    graph: &BitvmGcGraph,
+    watchtower_index: usize,
+    preimage: &[u8],
+) -> Result<TxIn> {
+    if watchtower_index >= graph.parameters.watchtower_pubkeys.len() {
+        bail!("invalid watchtower index {watchtower_index}")
+    };
+    let network = graph.parameters.instance_parameters.network;
+    let n_of_n_taproot_public_key =
+        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
+    let ack_connector = AckConnector::new(
+        network,
+        &n_of_n_taproot_public_key,
+        graph.parameters.watchtower_ack_hashlocks[watchtower_index],
+    );
+    let input = graph
+        .watchtower_challenge_init
+        .ack_connector_input(watchtower_index)
+        .map_err(|e| anyhow::anyhow!("failed to get ack connector input: {e}"))?;
+    operator_challenge_ack(&ack_connector, preimage, input)
+        .map_err(|e| anyhow::anyhow!("failed to sign operator challenge ack: {e}"))
+}
+
+pub fn operator_sign_commit_pubin(
+    graph: &BitvmGcGraph,
+    wots_secret_key: &OperatorCommitPubinSecretKey,
+    pubin_commitment: &[u8; 96],
+) -> Result<TxIn> {
+    if Wots96::generate_public_key(wots_secret_key)
+        != graph.parameters.operator_commit_pubin_wots_pubkey
+    {
+        bail!("provided pubin WOTS secret key does not match expected public key")
+    };
+
+    let network = graph.parameters.instance_parameters.network;
+    let n_of_n_taproot_public_key =
+        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
+    let connector_e = ConnectorE::new(
+        network,
+        &n_of_n_taproot_public_key,
+        &graph.parameters.operator_commit_pubin_wots_pubkey,
+    );
+    let input = graph
+        .watchtower_challenge_init
+        .connector_e_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-e input: {e}"))?;
+    operator_commit_pubin(&connector_e, pubin_commitment, wots_secret_key, input)
+        .map_err(|e| anyhow::anyhow!("failed to sign operator commit pubin: {e}"))
+}
+
 pub fn operator_sign_assert(
     graph: &mut BitvmGcGraph,
     wots_secret_key: &OperatorAssertSecretKey,
-    proof: &[u8; 64],
+    proof: &[u8; 96],
 ) -> Result<Transaction> {
-    if Wots64::generate_public_key(wots_secret_key) != graph.parameters.operator_wots_pubkeys {
+    if Wots96::generate_public_key(wots_secret_key) != graph.parameters.operator_assert_wots_pubkey
+    {
         bail!("provided WOTS secret key does not match expected public key".to_string())
     };
 
@@ -505,7 +679,7 @@ pub fn operator_sign_assert(
     let connector_c = ConnectorC::new(
         network,
         &n_of_n_taproot_public_key,
-        &graph.parameters.operator_wots_pubkeys,
+        &graph.parameters.operator_assert_wots_pubkey,
     );
 
     graph

@@ -6,7 +6,10 @@ use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_a::ConnectorA;
 use goat::connectors::connector_c::ConnectorC;
 use goat::connectors::connector_d::ConnectorD;
+use goat::connectors::connector_e::ConnectorE;
+use goat::connectors::connector_f::ConnectorF;
 use goat::connectors::connector_z::ConnectorZ;
+use goat::connectors::watchtower_connectors::AckConnector;
 use goat::contexts::base::generate_n_of_n_public_key;
 use goat::transactions::base::BaseTransaction;
 use goat::transactions::pre_signed_musig2::{get_nonce_message, verify_public_nonce};
@@ -28,6 +31,15 @@ pub fn take2_pre_sign_num() -> usize {
 }
 pub fn challenge_pre_sign_num() -> usize {
     1
+}
+pub fn watchtower_challenge_timeout_pre_sign_num(watchtower_num: usize) -> usize {
+    watchtower_num
+}
+pub fn operator_challenge_nack_pre_sign_num(watchtower_num: usize) -> usize {
+    watchtower_num * 2
+}
+pub fn operator_commit_timeout_pre_sign_num() -> usize {
+    2
 }
 pub fn disprove_pre_sign_num(verifier_num: usize) -> usize {
     verifier_num * 2
@@ -73,6 +85,9 @@ pub struct CommitteeMusig2Data<T> {
     pub take1: Vec<T>,
     pub take2: Vec<T>,
     pub challenge: Vec<T>,
+    pub watchtower_challenge_timeout: Vec<T>,
+    pub operator_challenge_nack: Vec<T>,
+    pub operator_commit_timeout: Vec<T>,
     pub disprove: Vec<T>,
 }
 
@@ -84,10 +99,24 @@ pub type CommitteePartialSignatures = CommitteeMusig2Data<PartialSignature>;
 pub type CommitteeSignatures = CommitteeMusig2Data<TaprootSignature>;
 
 impl<T> CommitteeMusig2Data<T> {
-    pub fn validate_length(&self, verifier_num: usize) -> Result<()> {
+    pub fn validate_length(&self, watchtower_num: usize, verifier_num: usize) -> Result<()> {
         ensure!(self.take1.len() == take1_pre_sign_num(), "invalid number of take1");
         ensure!(self.take2.len() == take2_pre_sign_num(), "invalid number of take2");
         ensure!(self.challenge.len() == challenge_pre_sign_num(), "invalid number of challenge");
+        ensure!(
+            self.watchtower_challenge_timeout.len()
+                == watchtower_challenge_timeout_pre_sign_num(watchtower_num),
+            "invalid number of watchtower challenge timeout"
+        );
+        ensure!(
+            self.operator_challenge_nack.len()
+                == operator_challenge_nack_pre_sign_num(watchtower_num),
+            "invalid number of operator challenge nack"
+        );
+        ensure!(
+            self.operator_commit_timeout.len() == operator_commit_timeout_pre_sign_num(),
+            "invalid number of operator commit timeout"
+        );
         ensure!(
             self.disprove.len() == disprove_pre_sign_num(verifier_num),
             "invalid number of disprove"
@@ -96,7 +125,15 @@ impl<T> CommitteeMusig2Data<T> {
     }
 
     pub fn new_empty() -> Self {
-        CommitteeMusig2Data { take1: vec![], take2: vec![], challenge: vec![], disprove: vec![] }
+        CommitteeMusig2Data {
+            take1: vec![],
+            take2: vec![],
+            challenge: vec![],
+            watchtower_challenge_timeout: vec![],
+            operator_challenge_nack: vec![],
+            operator_commit_timeout: vec![],
+            disprove: vec![],
+        }
     }
 }
 
@@ -111,8 +148,9 @@ pub fn committee_pre_sign(
     graph: &mut BitvmGcGraph,
 ) -> Result<CommitteePartialSignatures> {
     let verifier_num = graph.verifier_asserts.len();
-    committee_member_sec_nonce.validate_length(verifier_num)?;
-    committee_agg_nonce.validate_length(verifier_num)?;
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    committee_member_sec_nonce.validate_length(watchtower_num, verifier_num)?;
+    committee_agg_nonce.validate_length(watchtower_num, verifier_num)?;
 
     let committee_context =
         graph.parameters.instance_parameters.get_committee_context(committee_member_keypair)?;
@@ -145,6 +183,50 @@ pub fn committee_pre_sign(
         match graph.challenge.pre_sign(&committee_context, &sec_nonces, &agg_nonces) {
             Ok(v) => res.challenge = v.to_vec(),
             Err(e) => bail!("fail to pre-sign {}: {e}", graph.challenge.name()),
+        };
+    }
+
+    {
+        // watchtower challenge timeout
+        let mut timeout_sigs = vec![];
+        for (i, tx) in graph.watchtower_challenge_timeouts.iter_mut().enumerate() {
+            let sec_nonces = [committee_member_sec_nonce.watchtower_challenge_timeout[i].clone()];
+            let agg_nonces = [committee_agg_nonce.watchtower_challenge_timeout[i].clone()];
+            let sigs = tx
+                .pre_sign(&committee_context, &sec_nonces, &agg_nonces)
+                .map_err(|e| anyhow::anyhow!("fail to pre-sign {}: {e}", tx.name()))?;
+            timeout_sigs.extend(sigs);
+        }
+        res.watchtower_challenge_timeout = timeout_sigs;
+    }
+
+    {
+        // operator challenge nack
+        let mut nack_sigs = vec![];
+        for (i, tx) in graph.operator_challenge_nacks.iter_mut().enumerate() {
+            let sec_nonces = [
+                committee_member_sec_nonce.operator_challenge_nack[i * 2].clone(),
+                committee_member_sec_nonce.operator_challenge_nack[i * 2 + 1].clone(),
+            ];
+            let agg_nonces = [
+                committee_agg_nonce.operator_challenge_nack[i * 2].clone(),
+                committee_agg_nonce.operator_challenge_nack[i * 2 + 1].clone(),
+            ];
+            let sigs = tx
+                .pre_sign(&committee_context, &sec_nonces, &agg_nonces)
+                .map_err(|e| anyhow::anyhow!("fail to pre-sign {}: {e}", tx.name()))?;
+            nack_sigs.extend(sigs);
+        }
+        res.operator_challenge_nack = nack_sigs;
+    }
+
+    {
+        // operator commit timeout
+        let sec_nonces = committee_member_sec_nonce.operator_commit_timeout.try_into().unwrap();
+        let agg_nonces = committee_agg_nonce.operator_commit_timeout.try_into().unwrap();
+        match graph.operator_commit_timeout.pre_sign(&committee_context, &sec_nonces, &agg_nonces) {
+            Ok(v) => res.operator_commit_timeout = v.to_vec(),
+            Err(e) => bail!("fail to pre-sign {}: {e}", graph.operator_commit_timeout.name()),
         };
     }
 
@@ -204,6 +286,11 @@ pub fn nonces_aggregation(pub_nonces_vec: &[CommitteePubNonces]) -> Result<Commi
         take1: aggregate_field(pub_nonces_vec, |c| &c.take1)?,
         take2: aggregate_field(pub_nonces_vec, |c| &c.take2)?,
         challenge: aggregate_field(pub_nonces_vec, |c| &c.challenge)?,
+        watchtower_challenge_timeout: aggregate_field(pub_nonces_vec, |c| {
+            &c.watchtower_challenge_timeout
+        })?,
+        operator_challenge_nack: aggregate_field(pub_nonces_vec, |c| &c.operator_challenge_nack)?,
+        operator_commit_timeout: aggregate_field(pub_nonces_vec, |c| &c.operator_commit_timeout)?,
         disprove: aggregate_field(pub_nonces_vec, |c| &c.disprove)?,
     })
 }
@@ -215,9 +302,10 @@ pub fn signature_aggregation(
 ) -> Result<CommitteeSignatures> {
     let context = graph.parameters.get_base_context();
     let verifier_num = graph.verifier_asserts.len();
-    agg_nonces.validate_length(verifier_num)?;
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    agg_nonces.validate_length(watchtower_num, verifier_num)?;
     for r in partial_sigs {
-        r.validate_length(verifier_num)?;
+        r.validate_length(watchtower_num, verifier_num)?;
     }
 
     let mut res: CommitteeSignatures = CommitteeSignatures::new_empty();
@@ -254,6 +342,55 @@ pub fn signature_aggregation(
         Err(e) => bail!("fail to aggregate pre-sigs {}: {e}", graph.challenge.name()),
     };
 
+    // watchtower challenge timeout
+    let mut timeout_sigs = vec![];
+    for (i, tx) in graph.watchtower_challenge_timeouts.iter().enumerate() {
+        let agg_nonces = [agg_nonces.watchtower_challenge_timeout[i].clone()];
+        let partial_sigs =
+            [partial_sigs.iter().map(|r| r.watchtower_challenge_timeout[i]).collect()];
+        let sigs = tx
+            .aggregate_pre_sigs(&context, &partial_sigs, &agg_nonces)
+            .map_err(|e| anyhow::anyhow!("fail to aggregate pre-sigs {}: {e}", tx.name()))?;
+        timeout_sigs.extend(sigs);
+    }
+    res.watchtower_challenge_timeout = timeout_sigs;
+
+    // operator challenge nack
+    let mut nack_sigs = vec![];
+    for (i, tx) in graph.operator_challenge_nacks.iter().enumerate() {
+        let agg_nonces = [
+            agg_nonces.operator_challenge_nack[i * 2].clone(),
+            agg_nonces.operator_challenge_nack[i * 2 + 1].clone(),
+        ];
+        let mut partial_sigs_by_input = [vec![], vec![]];
+        partial_sigs.iter().for_each(|r| {
+            partial_sigs_by_input[0].push(r.operator_challenge_nack[i * 2]);
+            partial_sigs_by_input[1].push(r.operator_challenge_nack[i * 2 + 1]);
+        });
+        let sigs = tx
+            .aggregate_pre_sigs(&context, &partial_sigs_by_input, &agg_nonces)
+            .map_err(|e| anyhow::anyhow!("fail to aggregate pre-sigs {}: {e}", tx.name()))?;
+        nack_sigs.extend(sigs);
+    }
+    res.operator_challenge_nack = nack_sigs;
+
+    // operator commit timeout
+    let operator_commit_timeout_agg_nonces =
+        agg_nonces.operator_commit_timeout.clone().try_into().unwrap();
+    let mut operator_commit_timeout_partial_sigs = [vec![], vec![]];
+    partial_sigs.iter().for_each(|r| {
+        operator_commit_timeout_partial_sigs[0].push(r.operator_commit_timeout[0]);
+        operator_commit_timeout_partial_sigs[1].push(r.operator_commit_timeout[1]);
+    });
+    match graph.operator_commit_timeout.aggregate_pre_sigs(
+        &context,
+        &operator_commit_timeout_partial_sigs,
+        &operator_commit_timeout_agg_nonces,
+    ) {
+        Ok(v) => res.operator_commit_timeout = v.to_vec(),
+        Err(e) => bail!("fail to aggregate pre-sigs {}: {e}", graph.operator_commit_timeout.name()),
+    };
+
     // disprove
     let mut disprove_sigs = vec![];
     for (i, disprove_tx) in graph.disproves.iter().enumerate() {
@@ -279,10 +416,11 @@ pub fn push_committee_pre_signatures(
     sigs: &CommitteeSignatures,
 ) -> Result<()> {
     let verifier_num = graph.verifier_asserts.len();
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     if graph.committee_pre_signed {
         bail!("already pre-signed by committee".to_string())
     };
-    sigs.validate_length(verifier_num)?;
+    sigs.validate_length(watchtower_num, verifier_num)?;
 
     let network = graph.parameters.instance_parameters.network;
     let n_of_n_taproot_public_key =
@@ -294,10 +432,23 @@ pub fn push_committee_pre_signatures(
     let connector_c = ConnectorC::new(
         network,
         &n_of_n_taproot_public_key,
-        &graph.parameters.operator_wots_pubkeys,
+        &graph.parameters.operator_assert_wots_pubkey,
     );
     let connector_d =
         ConnectorD::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
+    let connector_e = ConnectorE::new(
+        network,
+        &n_of_n_taproot_public_key,
+        &graph.parameters.operator_commit_pubin_wots_pubkey,
+    );
+    let connector_f =
+        ConnectorF::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
+    let ack_connectors = graph
+        .parameters
+        .watchtower_ack_hashlocks
+        .iter()
+        .map(|hashlock| AckConnector::new(network, &n_of_n_taproot_public_key, *hashlock))
+        .collect::<Vec<_>>();
 
     // take1
     graph.take1.push_pre_sigs(&connector_0, &connector_c, sigs.take1.clone().try_into().unwrap());
@@ -307,6 +458,30 @@ pub fn push_committee_pre_signatures(
 
     // challenge
     graph.challenge.push_pre_sigs(&connector_a, sigs.challenge.clone().try_into().unwrap());
+
+    // watchtower challenge timeout
+    for (i, tx) in graph.watchtower_challenge_timeouts.iter_mut().enumerate() {
+        tx.push_pre_sigs(
+            &ack_connectors[i],
+            sigs.watchtower_challenge_timeout[i..(i + 1)].try_into().unwrap(),
+        );
+    }
+
+    // operator challenge nack
+    for (i, tx) in graph.operator_challenge_nacks.iter_mut().enumerate() {
+        tx.push_pre_sigs(
+            &ack_connectors[i],
+            &connector_f,
+            sigs.operator_challenge_nack[i * 2..(i * 2 + 2)].try_into().unwrap(),
+        );
+    }
+
+    // operator commit timeout
+    graph.operator_commit_timeout.push_pre_sigs(
+        &connector_e,
+        &connector_f,
+        sigs.operator_commit_timeout.clone().try_into().unwrap(),
+    );
 
     // disprove
     for (i, disprove_tx) in graph.disproves.iter_mut().enumerate() {
@@ -330,6 +505,7 @@ pub fn generate_nonce_from_seed(
     seed: String,
     graph_index: usize,
     signer_keypair: Keypair,
+    watchtower_num: usize,
     verifier_num: usize,
 ) -> (CommitteePubNonces, CommitteeSecNonces, CommitteeNonceSignatures) {
     let graph_seed = hkdf_derive_bytes(
@@ -376,6 +552,39 @@ pub fn generate_nonce_from_seed(
         }
     }
     {
+        // watchtower challenge timeout
+        for _ in 0..watchtower_challenge_timeout_pre_sign_num(watchtower_num) {
+            let (sec_nonce, pub_nonce, nonce_sig) =
+                generate_nonce(signer_keypair, &graph_seed, index);
+            pub_nonces.watchtower_challenge_timeout.push(pub_nonce);
+            sec_nonces.watchtower_challenge_timeout.push(sec_nonce);
+            nonce_sigs.watchtower_challenge_timeout.push(nonce_sig);
+            index += 1;
+        }
+    }
+    {
+        // operator challenge nack
+        for _ in 0..operator_challenge_nack_pre_sign_num(watchtower_num) {
+            let (sec_nonce, pub_nonce, nonce_sig) =
+                generate_nonce(signer_keypair, &graph_seed, index);
+            pub_nonces.operator_challenge_nack.push(pub_nonce);
+            sec_nonces.operator_challenge_nack.push(sec_nonce);
+            nonce_sigs.operator_challenge_nack.push(nonce_sig);
+            index += 1;
+        }
+    }
+    {
+        // operator commit timeout
+        for _ in 0..operator_commit_timeout_pre_sign_num() {
+            let (sec_nonce, pub_nonce, nonce_sig) =
+                generate_nonce(signer_keypair, &graph_seed, index);
+            pub_nonces.operator_commit_timeout.push(pub_nonce);
+            sec_nonces.operator_commit_timeout.push(sec_nonce);
+            nonce_sigs.operator_commit_timeout.push(nonce_sig);
+            index += 1;
+        }
+    }
+    {
         // disprove
         for _ in 0..disprove_pre_sign_num(verifier_num) {
             let (sec_nonce, pub_nonce, nonce_sig) =
@@ -393,10 +602,11 @@ pub fn verify_nonce_signatures(
     pubkey: &XOnlyPublicKey,
     pub_nonces: &CommitteePubNonces,
     nonce_sigs: &CommitteeNonceSignatures,
+    watchtower_num: usize,
     verifier_num: usize,
 ) -> Result<bool> {
-    pub_nonces.validate_length(verifier_num)?;
-    nonce_sigs.validate_length(verifier_num)?;
+    pub_nonces.validate_length(watchtower_num, verifier_num)?;
+    nonce_sigs.validate_length(watchtower_num, verifier_num)?;
 
     fn verify_vec(pubkey: &XOnlyPublicKey, nonces: &[PubNonce], sigs: &[SchnorrSignature]) -> bool {
         if nonces.len() != sigs.len() {
@@ -408,6 +618,21 @@ pub fn verify_nonce_signatures(
     Ok(verify_vec(pubkey, &pub_nonces.take1, &nonce_sigs.take1)
         && verify_vec(pubkey, &pub_nonces.take2, &nonce_sigs.take2)
         && verify_vec(pubkey, &pub_nonces.challenge, &nonce_sigs.challenge)
+        && verify_vec(
+            pubkey,
+            &pub_nonces.watchtower_challenge_timeout,
+            &nonce_sigs.watchtower_challenge_timeout,
+        )
+        && verify_vec(
+            pubkey,
+            &pub_nonces.operator_challenge_nack,
+            &nonce_sigs.operator_challenge_nack,
+        )
+        && verify_vec(
+            pubkey,
+            &pub_nonces.operator_commit_timeout,
+            &nonce_sigs.operator_commit_timeout,
+        )
         && verify_vec(pubkey, &pub_nonces.disprove, &nonce_sigs.disprove))
 }
 

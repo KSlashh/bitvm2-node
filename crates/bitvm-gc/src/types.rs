@@ -6,7 +6,9 @@ use bitcoin::{
     key::Keypair, taproot::LeafVersion,
 };
 use goat::{
-    assert_scripts::{INPUT_WIRE_NUM, LabelHash, OperatorAssertPublicKey, WireHash},
+    assert_scripts::{
+        INPUT_WIRE_NUM, LabelHash, OperatorAssertPublicKey, OperatorCommitPubinPublicKey, WireHash,
+    },
     connectors::{base::TaprootConnector, connector_0::Connector0, connector_z::ConnectorZ},
     contexts::{base::BaseContext, committee::CommitteeContext, operator::OperatorContext},
     transactions::{
@@ -22,7 +24,10 @@ use goat::{
         },
         take1::Take1Transaction,
         take2::Take2Transaction,
-        watchtower_challenge::WatchtowerChallengeInitTransaction,
+        watchtower_challenge::{
+            OperatorChallengeNackTransaction, OperatorCommitTimeoutTransaction,
+            WatchtowerChallengeInitTransaction, WatchtowerChallengeTimeoutTransaction,
+        },
     },
 };
 use secp256k1::SECP256K1;
@@ -74,10 +79,14 @@ pub struct BitvmGcGraphParameters {
     pub challenge_amount: Amount,
     pub operator_pubkey: PublicKey,
     #[serde(with = "BigArray")]
-    pub operator_wots_pubkeys: OperatorAssertPublicKey,
+    pub operator_assert_wots_pubkey: OperatorAssertPublicKey,
+    #[serde(with = "BigArray")]
+    pub operator_commit_pubin_wots_pubkey: OperatorCommitPubinPublicKey,
     #[serde(with = "node_serializer::address")]
     pub operator_receive_address: Address,
     pub watchtower_pubkeys: Vec<XOnlyPublicKey>,
+    pub watchtower_ack_hashlocks: Vec<LabelHash>,
+    pub pubin_disprove_constant: [u8; 32],
     pub gc_data: Vec<BitvmGcCircuitData>,
 }
 
@@ -276,6 +285,9 @@ pub struct BitvmGcGraph {
     pub take1: Take1Transaction,
     pub challenge: ChallengeTransaction,
     pub watchtower_challenge_init: WatchtowerChallengeInitTransaction,
+    pub watchtower_challenge_timeouts: Vec<WatchtowerChallengeTimeoutTransaction>,
+    pub operator_challenge_nacks: Vec<OperatorChallengeNackTransaction>,
+    pub operator_commit_timeout: OperatorCommitTimeoutTransaction,
     pub operator_assert: OperatorAssertTransaction,
     pub verifier_asserts: Vec<VerifierAssertTransaction>,
     pub disproves: Vec<DisproveTransaction>,
@@ -324,12 +336,34 @@ impl BitvmGcGraph {
             ];
             let take2 = vec![extract_sig_from_witness(&self.take2.tx().input[0].witness)?];
             let challenge = vec![extract_sig_from_witness(&self.challenge.tx().input[0].witness)?];
+            let mut watchtower_challenge_timeout = Vec::new();
+            for tx in &self.watchtower_challenge_timeouts {
+                watchtower_challenge_timeout
+                    .push(extract_sig_from_witness(&tx.tx().input[1].witness)?);
+            }
+            let mut operator_challenge_nack = Vec::new();
+            for tx in &self.operator_challenge_nacks {
+                operator_challenge_nack.push(extract_sig_from_witness(&tx.tx().input[0].witness)?);
+                operator_challenge_nack.push(extract_sig_from_witness(&tx.tx().input[1].witness)?);
+            }
+            let operator_commit_timeout = vec![
+                extract_sig_from_witness(&self.operator_commit_timeout.tx().input[0].witness)?,
+                extract_sig_from_witness(&self.operator_commit_timeout.tx().input[1].witness)?,
+            ];
             let mut disprove = Vec::new();
             for disprove_tx in &self.disproves {
                 disprove.push(extract_sig_from_witness(&disprove_tx.tx().input[0].witness)?);
                 disprove.push(extract_sig_from_witness(&disprove_tx.tx().input[1].witness)?);
             }
-            Some(CommitteeSignatures { take1, take2, challenge, disprove })
+            Some(CommitteeSignatures {
+                take1,
+                take2,
+                challenge,
+                watchtower_challenge_timeout,
+                operator_challenge_nack,
+                operator_commit_timeout,
+                disprove,
+            })
         } else {
             None
         };

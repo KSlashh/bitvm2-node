@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use bitcoin::{Address, Amount, OutPoint, Transaction, key::Keypair};
+use bitcoin::{Address, Amount, Transaction, XOnlyPublicKey, key::Keypair};
 use goat::{
     connectors::watchtower_connectors::WatchtowerChallengeConnector,
     transactions::{
@@ -26,23 +26,17 @@ pub fn build_watchtower_challenge_tx(
         bail!("Invalid watchtower index");
     }
     let network = graph.parameters.instance_parameters.network;
+    let operator_taproot_public_key = XOnlyPublicKey::from(graph.parameters.operator_pubkey);
     let watchtower_taproot_public_key = graph.parameters.watchtower_pubkeys[watchtower_index];
-    let watchtower_challenge_connector =
-        WatchtowerChallengeConnector::new(network, &watchtower_taproot_public_key);
-    let watchtower_challenge_connector_amount = graph
+    let watchtower_challenge_connector = WatchtowerChallengeConnector::new(
+        network,
+        &operator_taproot_public_key,
+        &watchtower_taproot_public_key,
+    );
+    let input_0 = graph
         .watchtower_challenge_init
-        .tx()
-        .output
-        .get(watchtower_index)
-        .ok_or_else(|| anyhow::anyhow!("watchtower index out of bounds"))?
-        .value;
-    let input_0 = Input {
-        outpoint: OutPoint {
-            txid: graph.watchtower_challenge_init.tx().compute_txid(),
-            vout: watchtower_index as u32,
-        },
-        amount: watchtower_challenge_connector_amount,
-    };
+        .watchtower_connector_input(watchtower_index)
+        .map_err(|e| anyhow::anyhow!("failed to get watchtower connector input: {e}"))?;
 
     watchtower_challenge(
         watchtower_keypair,

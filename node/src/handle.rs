@@ -1593,9 +1593,11 @@ async fn handle_create_graph_committee(
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
     let verifier_num = graph.parameters.gc_data.len();
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph_with_keypair(
         instance_id,
         graph_id,
+        watchtower_num,
         verifier_num,
         instance_keypair,
     );
@@ -1624,9 +1626,10 @@ async fn handle_create_graph_committee(
     if pub_nonces_unchecked.len() == committee_pubkeys.len() {
         let mut graph = BitvmGcGraph::from_simplified(graph)?;
         let verifier_num = graph.verifier_asserts.len();
+        let watchtower_num = graph.parameters.watchtower_pubkeys.len();
         let mut pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
         for (pk, pn) in pub_nonces_unchecked.into_iter() {
-            if let Err(e) = pn.validate_length(verifier_num) {
+            if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
                 tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
                 return Ok(());
             }
@@ -1638,6 +1641,7 @@ async fn handle_create_graph_committee(
         let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_with_keypair(
             instance_id,
             graph_id,
+            watchtower_num,
             verifier_num,
             instance_keypair,
         );
@@ -1680,8 +1684,30 @@ async fn handle_nonce_generation_committee(
         return Ok(());
     }
     // 1. check pub_nonces & nonce signatures
+    let message = make_message(ctx, content);
+    let graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(g) => g,
+        None => return Ok(()),
+    };
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    let verifier_num = graph.parameters.gc_data.len();
     let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
-    if !verify_nonce_signatures(&committee_xonly_pubkey, pub_nonces, nonce_sigs, verifier_num)? {
+    if !verify_nonce_signatures(
+        &committee_xonly_pubkey,
+        pub_nonces,
+        nonce_sigs,
+        watchtower_num,
+        verifier_num,
+    )? {
         tracing::warn!(
             "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
             received_committee_pubkey.to_string()
@@ -1706,25 +1732,12 @@ async fn handle_nonce_generation_committee(
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
         let local_committee_pubkey = instance_keypair.public_key().into();
-        let message = make_message(ctx, content);
-        let graph = match get_graph_or_defer(
-            ctx.swarm,
-            ctx.local_db,
-            ctx.goat_client,
-            instance_id,
-            graph_id,
-            &message,
-        )
-        .await?
-        {
-            Some(g) => g,
-            None => return Ok(()),
-        };
         let mut graph = BitvmGcGraph::from_simplified(&graph)?;
         let verifier_num = graph.verifier_asserts.len();
+        let watchtower_num = graph.parameters.watchtower_pubkeys.len();
         let mut pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
         for (pk, pn) in pub_nonces_unchecked.into_iter() {
-            if let Err(e) = pn.validate_length(verifier_num) {
+            if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
                 tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
                 return Ok(());
             }
@@ -1734,6 +1747,7 @@ async fn handle_nonce_generation_committee(
         let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_with_keypair(
             instance_id,
             graph_id,
+            watchtower_num,
             verifier_num,
             instance_keypair,
         );
@@ -1802,15 +1816,6 @@ async fn handle_nonce_generation_operator(
     {
         return Ok(());
     }
-    // 1. check pub_nonces & nonce signatures
-    let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
-    if !verify_nonce_signatures(&committee_xonly_pubkey, pub_nonces, nonce_sigs, verifier_num)? {
-        tracing::warn!(
-            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
-            received_committee_pubkey.to_string()
-        );
-        return Ok(());
-    }
     let graph = match get_graph(ctx.local_db, instance_id, graph_id).await? {
         Some(g) => g,
         None => {
@@ -1822,7 +1827,23 @@ async fn handle_nonce_generation_operator(
         }
     };
     let verifier_num = graph.parameters.gc_data.len();
-    if let Err(e) = pub_nonces.validate_length(verifier_num) {
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    // 1. check pub_nonces & nonce signatures
+    let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
+    if !verify_nonce_signatures(
+        &committee_xonly_pubkey,
+        pub_nonces,
+        nonce_sigs,
+        watchtower_num,
+        verifier_num,
+    )? {
+        tracing::warn!(
+            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
+            received_committee_pubkey.to_string()
+        );
+        return Ok(());
+    }
+    if let Err(e) = pub_nonces.validate_length(watchtower_num, verifier_num) {
         tracing::warn!(
             "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces length: {e}",
             received_committee_pubkey.to_string()
@@ -3114,7 +3135,7 @@ async fn handle_assert_ready_operator(
         return Ok(());
     };
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let assert_secret_key = operator_master_key.wots_keypair_for_graph(graph_id).0;
+    let assert_secret_key = operator_master_key.assert_wots_keypair_for_graph(graph_id).0;
     let assert_witness = build_assert_witness(&operator_wrapper_proof.proof, &assert_secret_key)?;
     let assert_message = assert_wots_message(&assert_witness)?;
     let mut asserted_wrapper_proof = Vec::new();
@@ -3210,7 +3231,7 @@ async fn handle_assert_sent_verifier(
         &saved_verifier_state.finalized_indices,
         &vk,
         &public_inputs,
-        &graph.parameters.operator_wots_pubkeys,
+        &graph.parameters.operator_assert_wots_pubkey,
         assert_witness,
         verifier_index,
     )?;

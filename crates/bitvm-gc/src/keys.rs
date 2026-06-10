@@ -2,7 +2,7 @@ use crate::committee::{
     CommitteeNonceSignatures, CommitteePubNonces, CommitteeSecNonces, generate_nonce,
     generate_nonce_from_seed,
 };
-use crate::operator::generate_wots_key;
+use crate::operator::{generate_assert_wots_key, generate_commit_pubin_wots_key};
 use anyhow::{Context, bail};
 use bitcoin::{
     Network, PublicKey,
@@ -14,7 +14,10 @@ use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
-use goat::assert_scripts::{OperatorAssertPublicKey, OperatorAssertSecretKey};
+use goat::assert_scripts::{
+    OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
+    OperatorCommitPubinSecretKey,
+};
 use hex::{decode as hex_decode, encode as hex_encode};
 use hkdf::Hkdf;
 use musig2::{PubNonce, SecNonce};
@@ -27,9 +30,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write, path::Path};
 use uuid::Uuid;
 
-pub type OperatorWotsSecretKey = OperatorAssertSecretKey;
-pub type OperatorWotsPublicKey = OperatorAssertPublicKey;
-pub type OperatorWotsKeypair = (OperatorWotsSecretKey, OperatorWotsPublicKey);
+pub type OperatorAssertWotsSecretKey = OperatorAssertSecretKey;
+pub type OperatorAssertWotsPublicKey = OperatorAssertPublicKey;
+pub type OperatorAssertWotsKeypair = (OperatorAssertWotsSecretKey, OperatorAssertWotsPublicKey);
+pub type OperatorCommitPubinWotsSecretKey = OperatorCommitPubinSecretKey;
+pub type OperatorCommitPubinWotsPublicKey = OperatorCommitPubinPublicKey;
+pub type OperatorCommitPubinWotsKeypair =
+    (OperatorCommitPubinWotsSecretKey, OperatorCommitPubinWotsPublicKey);
 
 const HKDF_SALT: &[u8] = b"bitvm-gc/keys/v1";
 const BITVM_BIP32_ROOT_DOMAIN: &[u8] = b"bitvm_bip32_root";
@@ -335,6 +342,7 @@ impl CommitteeMasterKey {
         &self,
         instance_id: Uuid,
         graph_id: Uuid,
+        watchtower_num: usize,
         verifier_num: usize,
         signer_keypair: Keypair,
     ) -> (CommitteePubNonces, CommitteeSecNonces, CommitteeNonceSignatures) {
@@ -349,6 +357,7 @@ impl CommitteeMasterKey {
             nonce_seed,
             graph_id.as_u128() as usize,
             signer_keypair,
+            watchtower_num,
             verifier_num,
         )
     }
@@ -381,10 +390,19 @@ impl OperatorMasterKey {
             .expect("valid derivation path should derive child key");
         Keypair::from_secret_key(SECP256K1, &child.private_key)
     }
-    pub fn wots_keypair_for_graph(&self, graph_id: Uuid) -> OperatorWotsKeypair {
+    pub fn assert_wots_keypair_for_graph(&self, graph_id: Uuid) -> OperatorAssertWotsKeypair {
         let domain = [b"operator_bitvm_wots_key".to_vec(), graph_id.as_bytes().to_vec()].concat();
         let key_seed = derive_secret(&self.0, &domain);
-        generate_wots_key(&key_seed)
+        generate_assert_wots_key(&key_seed)
+    }
+    pub fn commit_pubin_wots_keypair_for_graph(
+        &self,
+        graph_id: Uuid,
+    ) -> OperatorCommitPubinWotsKeypair {
+        let domain =
+            [b"operator_bitvm_pubin_wots_key".to_vec(), graph_id.as_bytes().to_vec()].concat();
+        let key_seed = derive_secret(&self.0, &domain);
+        generate_commit_pubin_wots_key(&key_seed)
     }
     pub fn preimage_for_graph(&self, graph_id: Uuid, index: usize) -> Vec<u8> {
         let domain = [
@@ -562,14 +580,14 @@ mod tests {
     }
 
     #[test]
-    fn operator_wots_keypair_for_graph_is_deterministic_and_graph_scoped() {
+    fn operator_assert_wots_keypair_for_graph_is_deterministic_and_graph_scoped() {
         let master = OperatorMasterKey::new(test_master_keypair("seed:test-operator-master"));
         let graph_a = Uuid::new_v4();
         let graph_b = Uuid::new_v4();
 
-        let keypair_a1 = master.wots_keypair_for_graph(graph_a);
-        let keypair_a2 = master.wots_keypair_for_graph(graph_a);
-        let keypair_b = master.wots_keypair_for_graph(graph_b);
+        let keypair_a1 = master.assert_wots_keypair_for_graph(graph_a);
+        let keypair_a2 = master.assert_wots_keypair_for_graph(graph_a);
+        let keypair_b = master.assert_wots_keypair_for_graph(graph_b);
 
         assert_eq!(keypair_a1.1, keypair_a2.1, "same graph should derive same WOTS pubkey");
         assert_ne!(

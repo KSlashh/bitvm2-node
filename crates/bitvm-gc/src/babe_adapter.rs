@@ -6,19 +6,17 @@ use anyhow::{Result, bail};
 use ark_bn254::{Bn254, Fq, Fr};
 use ark_groth16::VerifyingKey as Groth16VerifyingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use bitvm::signatures::{Wots, Wots64};
 use garbled_snark_verifier::bag::S;
 use goat::assert_scripts::{
     INPUT_WIRE_NUM, OperatorAssertPublicKey, OperatorAssertSecretKey, WireHash, label_hash,
 };
+use goat::wots::{Wots, Wots96};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soldering_host::BabeBundle;
 pub use soldering_host::BabeBundleBuilder;
 use verifiable_circuit_babe::babe::{
-    BabeBtcSig, LAMPORT_N, ProverSetupState, VerifierSetupState, WeKnownPi1SetupCt as RealSetupCt,
-    babe_prover_assert, babe_prover_presign, babe_verifier_challenge_assert_cac,
-    babe_verifier_presign,
+    LAMPORT_N, ProverSetupState, WeKnownPi1SetupCt as RealSetupCt, babe_verifier_presign,
 };
 use verifiable_circuit_babe::cac::{
     CACSetupPackage as RealCACSetupPackage, FinalizedInstanceData as RealFinalizedInstanceData,
@@ -34,16 +32,12 @@ use verifiable_circuit_babe::prover::BABEProver;
 use verifiable_circuit_babe::soldering::{
     SolderingData as RealSolderingData, SolderingProof as RealSolderingProof,
 };
-use verifiable_circuit_babe::transactions::{
-    TxAssertWitness, TxChallengeAssertWitness as RealTxChallengeAssertWitness,
-};
-use verifiable_circuit_babe::utils::pi1_to_wots64_msg;
 use verifiable_circuit_babe::verifier::BABEVerifier;
 
 use crate::types::BitvmGcCircuitData;
 
-/// Number of Wots64 digit signatures expected by the remote GOAT connector.
-pub const WOTS_SIG_COUNT: usize = Wots64::TOTAL_DIGIT_LEN as usize;
+/// Number of Wots96 digit signatures expected by the GOAT GC-V2 connector.
+pub const WOTS_SIG_COUNT: usize = Wots96::TOTAL_DIGIT_LEN as usize;
 pub const BABE_N_CC: usize = 181;
 // TODO: use verifiable_circuit_babe::babe::M_CC instead
 pub const BABE_M_CC: usize = 4;
@@ -151,6 +145,8 @@ pub struct BabeProverState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BabeAssertWitness {
     pub pi1: Vec<u8>,
+    #[serde(default)]
+    pub pubin_commitment: [u8; 32],
     pub wots_sig: Vec<[u8; 21]>,
 }
 
@@ -409,17 +405,33 @@ pub fn build_assert_witness(
     proof: &ark_groth16::Proof<Bn254>,
     assert_secret_key: &OperatorAssertSecretKey,
 ) -> Result<BabeAssertWitness> {
+    build_assert_witness_with_pubin_commitment(proof, &[0u8; 32], assert_secret_key)
+}
+
+pub fn build_assert_witness_with_pubin_commitment(
+    proof: &ark_groth16::Proof<Bn254>,
+    pubin_commitment: &[u8; 32],
+    assert_secret_key: &OperatorAssertSecretKey,
+) -> Result<BabeAssertWitness> {
     if assert_secret_key.is_empty() {
         bail!("operator WOTS secret key must not be empty");
     }
-    let real_witness = babe_prover_assert(proof, assert_secret_key);
-    Ok(BabeAssertWitness { pi1: real_witness.pi1, wots_sig: real_witness.wots_sig.to_vec() })
+    let pi1 = proof.a;
+    let mut pi1_bytes = Vec::new();
+    pi1.serialize_compressed(&mut pi1_bytes).expect("serialize pi1");
+    let msg = pi1_to_wots96_msg(&pi1, pubin_commitment);
+    let wots_sig = Wots96::sign(assert_secret_key, &msg);
+    Ok(BabeAssertWitness {
+        pi1: pi1_bytes,
+        pubin_commitment: *pubin_commitment,
+        wots_sig: wots_sig.to_vec(),
+    })
 }
 
-pub fn assert_wots_message(assert_witness: &BabeAssertWitness) -> Result<[u8; 64]> {
+pub fn assert_wots_message(assert_witness: &BabeAssertWitness) -> Result<[u8; 96]> {
     let pi1 = ark_bn254::G1Affine::deserialize_compressed(assert_witness.pi1.as_slice())
         .map_err(|error| anyhow::anyhow!("invalid BABE pi1 in assert witness: {error}"))?;
-    Ok(pi1_to_wots64_msg(&pi1))
+    Ok(pi1_to_wots96_msg(&pi1, &assert_witness.pubin_commitment))
 }
 
 /// Builds a placeholder verifier challenge witness from an assert witness.
@@ -462,28 +474,35 @@ pub fn build_real_challenge_assert_witness(
     if from_real_package(&verifier.commit()) != *package {
         bail!("persisted BABE verifier state does not reproduce setup package");
     }
-    let real_assert_witness = TxAssertWitness {
-        pi1: assert_witness.pi1.clone(),
-        wots_sig: to_real_wots_sig(&assert_witness.wots_sig)?,
-    };
-    let real_verifier_state = VerifierSetupState {
-        verifier,
-        package: to_real_package(package),
-        finalized_indices: finalized_indices.to_vec(),
-        wots_pk_p: *operator_wots_pubkey,
-        presigs_p: babe_prover_presign(),
-    };
-    let real_witness = babe_verifier_challenge_assert_cac(
-        &real_assert_witness,
-        &real_verifier_state,
-        BabeBtcSig::ProverPresigChallengeAssert,
-    )
-    .ok_or_else(|| anyhow::anyhow!("operator BABE assertion WOTS signature is invalid"))?;
-    Ok(BabeChallengeAssertWitness {
-        verifier_index,
-        input_labels: real_witness.input_labels,
-        wots_sig: real_witness.wots_sig.to_vec(),
-    })
+    let pi1 = ark_bn254::G1Affine::deserialize_compressed(assert_witness.pi1.as_slice())
+        .map_err(|error| anyhow::anyhow!("invalid BABE pi1 in assert witness: {error}"))?;
+    let wots_sig = to_real_wots_sig(&assert_witness.wots_sig)?;
+    let signed_message = Wots96::signature_to_message(&wots_sig);
+    let expected_message = pi1_to_wots96_msg(&pi1, &assert_witness.pubin_commitment);
+    if signed_message != expected_message {
+        bail!("operator BABE assertion WOTS signature message does not match pi1/pubin");
+    }
+    let base_idx = finalized_indices[0];
+    let base_inst = verifier
+        .instances
+        .get(base_idx)
+        .ok_or_else(|| anyhow::anyhow!("finalized base index {base_idx} out of range"))?;
+    let mut input_labels = base_inst
+        .compute_pi1_labels_based_on_value(pi1)
+        .into_iter()
+        .skip(2)
+        .map(|label| label.0)
+        .collect::<Vec<_>>();
+    let commit = package
+        .commits
+        .get(base_idx)
+        .ok_or_else(|| anyhow::anyhow!("finalized base index {base_idx} out of range"))?;
+    input_labels.extend(pubin_input_labels(commit, &assert_witness.pubin_commitment));
+    if input_labels.len() != INPUT_WIRE_NUM {
+        bail!("real BABE challenge labels have {}; expected {INPUT_WIRE_NUM}", input_labels.len());
+    }
+    let _ = operator_wots_pubkey;
+    Ok(BabeChallengeAssertWitness { verifier_index, input_labels, wots_sig: wots_sig.to_vec() })
 }
 
 /// Builds a wrongly-challenged witness from every recovered finalized-message preimage.
@@ -516,19 +535,7 @@ pub fn recover_real_wrongly_challenged_witness(
         h_msgs: prover_state.h_msgs.clone(),
         presigs_v: babe_verifier_presign(),
     };
-    let real_challenge = RealTxChallengeAssertWitness {
-        input_labels: challenge_witness.input_labels.clone(),
-        wots_sig: to_real_wots_sig(&challenge_witness.wots_sig)?,
-        sig_v: BabeBtcSig::VerifierLiveSig,
-        sig_p: BabeBtcSig::ProverPresigChallengeAssert,
-    };
-    recover_all_finalized_messages(
-        prover_state,
-        challenge_witness,
-        proof,
-        &real_state,
-        &real_challenge,
-    )
+    recover_all_finalized_messages(prover_state, challenge_witness, proof, &real_state)
 }
 
 /// Builds a wrongly-challenged witness after validating all finalized preimages.
@@ -663,6 +670,7 @@ fn from_real_finalized(
     wire_hashes.extend(commit.wots_padding_epk[..2].iter().map(to_wire_hash));
     wire_hashes.extend(commit.epk[254..].iter().map(to_wire_hash));
     wire_hashes.extend(commit.wots_padding_epk[2..].iter().map(to_wire_hash));
+    wire_hashes.extend(pubin_wire_hashes(commit));
     Ok(FinalizedInstanceData {
         index: finalized.index,
         final_msg_hash: commit.h_msg,
@@ -774,7 +782,6 @@ fn recover_all_finalized_messages(
     challenge_witness: &BabeChallengeAssertWitness,
     proof: &ark_groth16::Proof<Bn254>,
     real_state: &ProverSetupState,
-    real_challenge: &RealTxChallengeAssertWitness,
 ) -> Result<BabeWronglyChallengedWitness> {
     if real_state.finalized.len() != prover_state.h_msgs.len() {
         bail!("BABE prover state finalized data and hash count differ");
@@ -783,7 +790,7 @@ fn recover_all_finalized_messages(
         bail!("BABE prover state has no finalized instances");
     }
 
-    let base_input_labels = pi1_labels_from_challenge(&real_challenge.input_labels)?;
+    let base_input_labels = pi1_labels_from_challenge(&challenge_witness.input_labels)?;
     let soldered_output = &prover_state.soldering.soldered_output;
     if soldered_output.base_commitment.len() != base_input_labels.len() {
         bail!(
@@ -897,7 +904,7 @@ fn recover_finalized_message(
     Ok(final_msg)
 }
 
-fn to_real_wots_sig(wots_sig: &[[u8; 21]]) -> Result<<Wots64 as Wots>::Signature> {
+fn to_real_wots_sig(wots_sig: &[[u8; 21]]) -> Result<<Wots96 as Wots>::Signature> {
     wots_sig.try_into().map_err(|_| {
         anyhow::anyhow!(
             "WOTS signature has {} digit signatures; expected {WOTS_SIG_COUNT}",
@@ -918,6 +925,51 @@ fn deterministic_seed(index: usize) -> u64 {
 
 fn to_wire_hash(pair: &[[u8; 20]; 2]) -> WireHash {
     WireHash { false_label_hash: pair[0], true_label_hash: pair[1] }
+}
+
+fn pi1_to_wots96_msg(pi1: &ark_bn254::G1Affine, pubin_commitment: &[u8; 32]) -> [u8; 96] {
+    let mut msg = [0u8; 96];
+    let mut tmp = Vec::new();
+
+    pi1.x.serialize_uncompressed(&mut tmp).expect("serialize pi1.x");
+    msg[..32].copy_from_slice(&tmp);
+
+    tmp.clear();
+    pi1.y.serialize_uncompressed(&mut tmp).expect("serialize pi1.y");
+    msg[32..64].copy_from_slice(&tmp);
+
+    msg[64..96].copy_from_slice(pubin_commitment);
+    msg
+}
+
+fn pubin_wire_hashes(commit: &CACInstanceCommit) -> Vec<WireHash> {
+    (0..256)
+        .map(|index| WireHash {
+            false_label_hash: label_hash(&pubin_label(commit, index, false).to_vec()),
+            true_label_hash: label_hash(&pubin_label(commit, index, true).to_vec()),
+        })
+        .collect()
+}
+
+fn pubin_input_labels(commit: &CACInstanceCommit, pubin_commitment: &[u8; 32]) -> Vec<[u8; 16]> {
+    (0..256)
+        .map(|index| {
+            let byte = pubin_commitment[index / 8];
+            let bit = ((byte >> (index % 8)) & 1) == 1;
+            pubin_label(commit, index, bit)
+        })
+        .collect()
+}
+
+fn pubin_label(commit: &CACInstanceCommit, index: usize, bit: bool) -> [u8; 16] {
+    let mut bytes = Vec::with_capacity(32 * 4 + std::mem::size_of::<u64>() + 1);
+    bytes.extend_from_slice(&commit.h_ct_setup);
+    bytes.extend_from_slice(&commit.com_adaptor);
+    bytes.extend_from_slice(&commit.com_gc);
+    bytes.extend_from_slice(&commit.h_msg);
+    bytes.extend_from_slice(&(index as u64).to_le_bytes());
+    bytes.push(u8::from(bit));
+    hash16(&bytes)
 }
 
 fn hash20(data: &[u8]) -> [u8; 20] {
