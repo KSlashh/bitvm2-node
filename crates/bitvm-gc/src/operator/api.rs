@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Transaction, TxIn, key::Keypair};
-use bitcoin::{Network, OutPoint, PublicKey, Witness, XOnlyPublicKey};
+use bitcoin::{Network, PublicKey, Witness, XOnlyPublicKey};
 use goat::assert_scripts::{
     Label, OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
     OperatorCommitPubinSecretKey,
@@ -21,7 +21,7 @@ use goat::constants::{CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK};
 use goat::transactions::assert::{
     DisproveTransaction, OperatorAssertTransaction, VerifierAssertTransaction, wrongly_challenged,
 };
-use goat::transactions::base::{DUST_AMOUNT, Input};
+use goat::transactions::base::DUST_AMOUNT;
 use goat::transactions::challenge::ChallengeTransaction;
 use goat::transactions::kickoff::KickoffTransaction;
 use goat::transactions::pre_signed::PreSignedTransaction;
@@ -92,22 +92,18 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     }
 
     let (_, pegin, _) = params.instance_parameters.build_pegin_tx()?;
-    let pegin_txid = pegin.tx().compute_txid();
-    let connector_0_input = Input {
-        outpoint: OutPoint { txid: pegin_txid, vout: 0 },
-        amount: pegin.tx().output[0].value,
-    };
+    let connector_0_input = pegin
+        .connector_0_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-0 input: {e}"))?;
 
     let cur_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
     let next_force_skip_connector = ForceSkipConnector::new(network, &operator_taproot_public_key);
     let next_kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
     let next_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
     let cur_prekickoff = params.prekickoff_parameters.cur_prekickoff_txn.clone();
-    let cur_prekickoff_txid = cur_prekickoff.tx().compute_txid();
-    let cur_prekickoff_connector_input = Input {
-        outpoint: OutPoint { txid: cur_prekickoff_txid, vout: 2 },
-        amount: cur_prekickoff.tx().output[2].value,
-    };
+    let cur_prekickoff_connector_input = cur_prekickoff
+        .prekickoff_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get current pre-kickoff connector input: {e}"))?;
     let next_prekickoff = PrekickoffTransaction::new_for_validation(
         &cur_prekickoff_connector,
         &next_force_skip_connector,
@@ -121,21 +117,17 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         verifier_num,
     )
     .map_err(|e| anyhow::anyhow!("failed to create pre-kickoff txn: {e}"))?;
-    let next_prekickoff_txid = next_prekickoff.tx().compute_txid();
-    let next_force_skip_connector_input = Input {
-        outpoint: OutPoint { txid: next_prekickoff_txid, vout: 0 },
-        amount: next_prekickoff.tx().output[0].value,
-    };
-    let next_prekickoff_connector_input = Input {
-        outpoint: OutPoint { txid: next_prekickoff_txid, vout: 2 },
-        amount: next_prekickoff.tx().output[2].value,
-    };
+    let next_force_skip_connector_input = next_prekickoff
+        .force_skip_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get next force-skip connector input: {e}"))?;
+    let next_prekickoff_connector_input = next_prekickoff
+        .prekickoff_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get next pre-kickoff connector input: {e}"))?;
 
     // kickoff
-    let kickoff_connector_input = Input {
-        outpoint: OutPoint { txid: cur_prekickoff_txid, vout: 1 },
-        amount: cur_prekickoff.tx().output[1].value,
-    };
+    let kickoff_connector_input = cur_prekickoff
+        .kickoff_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get kickoff connector input: {e}"))?;
     let kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
     let connector_a =
         ConnectorA::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
@@ -154,23 +146,18 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         verifier_num,
     )
     .map_err(|e| anyhow::anyhow!("failed to create kickoff txn: {e}"))?;
-    let kickoff_txid = kickoff.tx().compute_txid();
-    let connector_a_input = Input {
-        outpoint: OutPoint { txid: kickoff_txid, vout: 0 },
-        amount: kickoff.tx().output[0].value,
-    };
-    let connector_b_input = Input {
-        outpoint: OutPoint { txid: kickoff_txid, vout: 1 },
-        amount: kickoff.tx().output[1].value,
-    };
-    let connector_c_input = Input {
-        outpoint: OutPoint { txid: kickoff_txid, vout: 2 },
-        amount: kickoff.tx().output[2].value,
-    };
-    let guardian_connector_input = Input {
-        outpoint: OutPoint { txid: kickoff_txid, vout: 3 },
-        amount: kickoff.tx().output[3].value,
-    };
+    let connector_a_input = kickoff
+        .connector_a_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-a input: {e}"))?;
+    let connector_b_input = kickoff
+        .connector_b_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-b input: {e}"))?;
+    let connector_c_input = kickoff
+        .connector_c_input()
+        .map_err(|e| anyhow::anyhow!("failed to get connector-c input: {e}"))?;
+    let guardian_connector_input = kickoff
+        .guardian_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get guardian connector input: {e}"))?;
 
     // prekickoff challenge
     let force_skip_kickoff = ForceSkipKickoffTransaction::new_for_validation(
@@ -307,7 +294,6 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         connector_c_input,
     )
     .map_err(|e| anyhow::anyhow!("failed to create operator assert txn: {e}"))?;
-    let operator_assert_txid = operator_assert.tx().compute_txid();
     let connector_d_input = operator_assert
         .connector_d_input()
         .map_err(|e| anyhow::anyhow!("failed to get connector-d input: {e}"))?;
@@ -316,10 +302,9 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     let mut verifier_asserts = Vec::with_capacity(verifier_num);
     let mut disproves = Vec::with_capacity(verifier_num);
     for (i, verifier_connector) in verifier_connectors.iter().enumerate() {
-        let verifier_input = Input {
-            outpoint: OutPoint { txid: operator_assert_txid, vout: i as u32 },
-            amount: operator_assert.tx().output[i].value,
-        };
+        let verifier_input = operator_assert
+            .verifier_connector_input(i)
+            .map_err(|e| anyhow::anyhow!("failed to get verifier connector input {i}: {e}"))?;
         let prover_connector = ProverConnector::new(
             network,
             n_of_n_taproot_public_key,
@@ -331,10 +316,9 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
             verifier_input,
         )
         .map_err(|e| anyhow::anyhow!("failed to create verifier assert txn {i}: {e}"))?;
-        let prover_input = Input {
-            outpoint: OutPoint { txid: verifier_assert.tx().compute_txid(), vout: 0 },
-            amount: verifier_assert.tx().output[0].value,
-        };
+        let prover_input = verifier_assert
+            .prover_connector_input()
+            .map_err(|e| anyhow::anyhow!("failed to get prover connector input {i}: {e}"))?;
         let disprove = DisproveTransaction::new_for_validation(
             &prover_connector,
             &connector_d,
@@ -481,10 +465,10 @@ pub fn operator_sign_skip_kickoff(
         operator_context.network,
         &operator_context.operator_taproot_public_key,
     );
-    let kickoff_connector_input = Input {
-        outpoint: OutPoint { txid: graph.cur_prekickoff.tx().compute_txid(), vout: 1 },
-        amount: graph.cur_prekickoff.tx().output[1].value,
-    };
+    let kickoff_connector_input = graph
+        .cur_prekickoff
+        .kickoff_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get kickoff connector input: {e}"))?;
     // create a sample tx to estimate fee
     let sample_tx = operator_skip_kickoff(
         &operator_context,
@@ -706,13 +690,9 @@ pub fn operator_sign_wrongly_challenged(
         n_of_n_taproot_public_key,
         graph.parameters.gc_data[verifier_index].final_msg_hashlocks.clone(),
     );
-    let input = Input {
-        outpoint: OutPoint {
-            txid: graph.verifier_asserts[verifier_index].tx().compute_txid(),
-            vout: 0,
-        },
-        amount: graph.verifier_asserts[verifier_index].tx().output[0].value,
-    };
+    let input = graph.verifier_asserts[verifier_index]
+        .prover_connector_input()
+        .map_err(|e| anyhow::anyhow!("failed to get prover connector input: {e}"))?;
 
     wrongly_challenged(&prover_connector, &input, final_msgs)
         .map(|txin| (txin, input.amount))

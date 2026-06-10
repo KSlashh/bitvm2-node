@@ -2,9 +2,7 @@ use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Transaction, XOnlyPublicKey, key::Keypair};
 use goat::{
     connectors::watchtower_connectors::WatchtowerChallengeConnector,
-    transactions::{
-        base::Input, pre_signed::PreSignedTransaction, watchtower_challenge::watchtower_challenge,
-    },
+    transactions::{base::Input, watchtower_challenge::watchtower_challenge},
 };
 
 use crate::types::BitvmGcGraph;

@@ -2935,9 +2935,12 @@ async fn handle_challenge_sent_operator(
         );
         return Ok(());
     }
-    let kickoff_txid = graph.kickoff.tx().compute_txid();
     if let Some(challenge_tx) = ctx.btc_client.get_tx(&challenge_txid).await? {
-        let challenge_outpoint = OutPoint { txid: kickoff_txid, vout: 0 };
+        let challenge_outpoint = graph
+            .kickoff
+            .connector_a_input()
+            .map_err(|e| anyhow!("failed to get connector-a input: {e}"))?
+            .outpoint;
         if challenge_tx.input[0].previous_output != challenge_outpoint {
             tracing::warn!(
                 "Ignore ChallengeSent for {instance_id}:{graph_id}: invalid challenge tx input"

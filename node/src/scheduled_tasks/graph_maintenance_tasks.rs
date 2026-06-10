@@ -13,6 +13,7 @@ use bitvm_lib::operator::{take1_timelock, take2_timelock};
 use bitvm_lib::verifier::disprove_timelock;
 use client::btc_chain::BTCClient;
 use client::goat_chain::DisproveTxType;
+use goat::transactions::base::output_topology;
 use serde::{Deserialize, Serialize};
 use store::localdb::{LocalDB, StorageProcessor};
 use store::{
@@ -433,7 +434,8 @@ async fn detect_assert_disprove_ready(
         return Ok(None);
     }
 
-    let connector_d_vout = graph.verifier_assert_txids.len() as u64;
+    let connector_d_vout =
+        output_topology::operator_assert::connector_d(graph.verifier_assert_txids.len()) as u64;
     if outpoint_spent_txid(btc_client, &operator_assert_txid, connector_d_vout).await?.is_some() {
         trace!(
             "detect_assert_disprove_ready graph_id:{} connector_d already spent",
@@ -587,7 +589,8 @@ async fn process_kickoff_graph(
             return Ok(None);
         }
     };
-    let spent_txid = match outpoint_spent_txid(btc_client, &kickoff_txid, 0).await? {
+    let connector_a_vout = output_topology::kickoff::connector_a() as u64;
+    let spent_txid = match outpoint_spent_txid(btc_client, &kickoff_txid, connector_a_vout).await? {
         Some(txid) => txid,
         None => {
             // kickoff output not spent, check if we need to send Take1Ready
@@ -775,7 +778,8 @@ async fn detect_take2(
         }
     };
 
-    let connector_d_vout = graph.verifier_assert_txids.len() as u64;
+    let connector_d_vout =
+        output_topology::operator_assert::connector_d(graph.verifier_assert_txids.len()) as u64;
     if let Some(spend_txid) =
         outpoint_spent_txid(btc_client, &operator_assert_txid, connector_d_vout).await?
     {

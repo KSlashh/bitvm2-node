@@ -841,34 +841,28 @@ fn normalize_challenge_sub_status(
 
 fn connector_a_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
     graph
-        .challenge
-        .tx()
-        .input
-        .first()
-        .map(|input| input.previous_output)
-        .ok_or_else(|| anyhow!("graph challenge tx has no inputs"))
+        .kickoff
+        .connector_a_input()
+        .map(|input| input.outpoint)
+        .map_err(|e| anyhow!("failed to get connector-a input: {e}"))
 }
 
 #[allow(dead_code)]
 fn connector_d_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
     graph
-        .take2
-        .tx()
-        .input
-        .get(1)
-        .map(|input| input.previous_output)
-        .ok_or_else(|| anyhow!("graph take2 tx has no connector-d input"))
+        .operator_assert
+        .connector_d_input()
+        .map(|input| input.outpoint)
+        .map_err(|e| anyhow!("failed to get connector-d input: {e}"))
 }
 
 #[allow(dead_code)]
 fn guardian_connector_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
     graph
-        .take2
-        .tx()
-        .input
-        .get(2)
-        .map(|input| input.previous_output)
-        .ok_or_else(|| anyhow!("graph take2 tx has no guardian connector input"))
+        .kickoff
+        .guardian_connector_input()
+        .map(|input| input.outpoint)
+        .map_err(|e| anyhow!("failed to get guardian connector input: {e}"))
 }
 
 async fn update_graph_challenge_txid_if_needed(
@@ -2600,7 +2594,10 @@ pub async fn build_prekickoff_params(
     graph_nonce: u64,
     cur_prekickoff_txn: PrekickoffTransaction,
 ) -> Result<PrekickoffParameters> {
-    let prekickoff_remaining_amount = cur_prekickoff_txn.tx().output[2].value;
+    let prekickoff_remaining_amount = cur_prekickoff_txn
+        .prekickoff_connector_input()
+        .map_err(|e| anyhow!("failed to get pre-kickoff connector input: {e}"))?
+        .amount;
     let (replenish_fee_inputs, replenish_fee_prev_outs, fee_amount) = if prekickoff_remaining_amount
         >= todo_funcs::min_prekickoff_input_amount()
     {
@@ -2839,11 +2836,15 @@ pub async fn send_challenge_tx(btc_client: &BTCClient, graph: &BitvmGcGraph) -> 
         value: Amount::ZERO,
         script_pubkey: generate_opreturn_script(verifier_evm_address.to_vec()),
     });
+    let connector_a_input = graph
+        .kickoff
+        .connector_a_input()
+        .map_err(|e| anyhow!("failed to get connector-a input: {e}"))?;
     build_sign_and_broadcast_tx(
         btc_client,
         challenge_keypair,
         challenge_tx.input,
-        graph.kickoff.tx().output[0].value,
+        connector_a_input.amount,
         challenge_tx.output,
     )
     .await

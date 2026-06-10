@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use bitcoin::{
-    Address, Amount, Network, OutPoint, PrivateKey, PublicKey, TxOut, Witness, XOnlyPublicKey,
-    key::Keypair, taproot::LeafVersion,
+    Address, Amount, Network, PrivateKey, PublicKey, TxOut, Witness, XOnlyPublicKey, key::Keypair,
+    taproot::LeafVersion,
 };
 use goat::{
     assert_scripts::{
@@ -123,10 +123,9 @@ impl BitvmGcInstanceParameters {
             self.user_info.user_change_address.clone(),
         )
         .map_err(|e| anyhow::anyhow!("fail to build pegin deposit txn: {e}"))?;
-        let deposit_outpoint = Input {
-            outpoint: OutPoint { txid: pegin_deposit.tx().compute_txid(), vout: 0 },
-            amount: pegin_deposit.tx().output[0].value,
-        };
+        let deposit_outpoint = pegin_deposit
+            .connector_z_input()
+            .map_err(|e| anyhow::anyhow!("fail to get pegin deposit output: {e}"))?;
         let pegin_confirm = PegInConfirmTransaction::new_for_validation(
             &connector_0,
             &connector_z,
@@ -161,10 +160,9 @@ impl BitvmGcInstanceParameters {
             self.user_info.user_change_address.clone(),
         )
         .map_err(|e| anyhow::anyhow!("fail to build pegin deposit txn: {e}"))?;
-        let deposit_outpoint = Input {
-            outpoint: OutPoint { txid: pegin_deposit.tx().compute_txid(), vout: 0 },
-            amount: pegin_deposit.tx().output[0].value,
-        };
+        let deposit_outpoint = pegin_deposit
+            .connector_z_input()
+            .map_err(|e| anyhow::anyhow!("fail to get pegin deposit output: {e}"))?;
         let pegin_refund = PegInRefundTransaction::new_for_validation(
             &connector_z,
             deposit_outpoint.clone(),

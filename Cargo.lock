@@ -2535,7 +2535,7 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
-source = "git+https://github.com/KSlashh/BitVM.git?branch=gc-v2#53f219bdbf34dd29933b6d422c1137b5b0c13b27"
+source = "git+https://github.com/KSlashh/BitVM.git?branch=gc-v2#344dc29b29553ee19835a2e54ba7f4790979a6f9"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5228,7 +5228,7 @@ dependencies = [
 [[package]]
 name = "goat"
 version = "0.1.0"
-source = "git+https://github.com/KSlashh/BitVM.git?branch=gc-v2#53f219bdbf34dd29933b6d422c1137b5b0c13b27"
+source = "git+https://github.com/KSlashh/BitVM.git?branch=gc-v2#344dc29b29553ee19835a2e54ba7f4790979a6f9"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
