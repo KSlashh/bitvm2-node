@@ -3005,7 +3005,7 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
-source = "git+https://github.com/blake-pro/BitVM.git?branch=fix-gc#9ab670396e5fab825d5b05911b7bf95fd8daa475"
+source = "git+https://github.com/KSlashh/BitVM.git?branch=gc-v2#344dc29b29553ee19835a2e54ba7f4790979a6f9"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -3046,7 +3046,7 @@ dependencies = [
  "bincode",
  "bitcoin",
  "bitcoin-script",
- "bitvm 0.1.0 (git+https://github.com/blake-pro/BitVM.git?branch=fix-gc)",
+ "bitvm 0.1.0 (git+https://github.com/KSlashh/BitVM.git?branch=gc-v2)",
  "chacha20poly1305",
  "clap",
  "garbled-snark-verifier",
@@ -3087,7 +3087,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-light-client-circuit",
  "bitcoin-script",
- "bitvm 0.1.0 (git+https://github.com/blake-pro/BitVM.git?branch=fix-gc)",
+ "bitvm 0.1.0 (git+https://github.com/KSlashh/BitVM.git?branch=gc-v2)",
  "bitvm-gc",
  "borsh",
  "cbft-rpc",
@@ -5737,7 +5737,7 @@ dependencies = [
 [[package]]
 name = "goat"
 version = "0.1.0"
-source = "git+https://github.com/blake-pro/BitVM.git?branch=fix-gc#9ab670396e5fab825d5b05911b7bf95fd8daa475"
+source = "git+https://github.com/KSlashh/BitVM.git?branch=gc-v2#344dc29b29553ee19835a2e54ba7f4790979a6f9"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5752,7 +5752,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-script",
  "bitcoin-scriptexec",
- "bitvm 0.1.0 (git+https://github.com/blake-pro/BitVM.git?branch=fix-gc)",
+ "bitvm 0.1.0 (git+https://github.com/KSlashh/BitVM.git?branch=gc-v2)",
  "clap",
  "colored",
  "hex",
