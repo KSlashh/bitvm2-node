@@ -277,6 +277,10 @@ pub enum DisproveTxType {
     Disprove,
     QuickChallenge,
     ChallengeIncompleteKickoff,
+    PubinDisprove,
+    WatchtowerChallengeTimeout,
+    OperatorChallengeNack,
+    OperatorCommitTimeout,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize, Display)]
@@ -367,8 +371,12 @@ pub struct GraphData {
     pub kickoff_txid: [u8; 32],
     pub take1_txid: [u8; 32],
     pub take2_txid: [u8; 32],
+    pub watchtower_challenge_init_txid: [u8; 32],
     pub prover_assert_txid: [u8; 32],
     pub disprove_txids: Vec<[u8; 32]>,
+    pub watchtower_challenge_timeout_txids: Vec<[u8; 32]>,
+    pub operator_challenge_nack_txids: Vec<[u8; 32]>,
+    pub operator_commit_timeout_txid: [u8; 32],
 }
 
 #[derive(Clone, Debug)]

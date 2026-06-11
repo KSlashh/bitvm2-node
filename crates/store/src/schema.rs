@@ -402,6 +402,11 @@ pub struct Graph {
     pub verifier_assert_txids: Vec<SerializableTxid>,
     #[sqlx(json)]
     pub disprove_txids: Vec<SerializableTxid>,
+    #[sqlx(json)]
+    pub watchtower_challenge_timeout_txids: Vec<SerializableTxid>,
+    #[sqlx(json)]
+    pub operator_challenge_nack_txids: Vec<SerializableTxid>,
+    pub operator_commit_timeout_txid: Option<SerializableTxid>,
     pub init_withdraw_tx_hash: Option<String>,
     pub bridge_out_start_at: i64,
     pub status_updated_at: i64,

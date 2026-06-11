@@ -1424,9 +1424,23 @@ pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
     let kickoff_txid = graph.kickoff.finalize().compute_txid().to_byte_array();
     let take1_txid = graph.take1.finalize().compute_txid().to_byte_array();
     let take2_txid = graph.take2.finalize().compute_txid().to_byte_array();
+    let watchtower_challenge_init_txid =
+        graph.watchtower_challenge_init.finalize().compute_txid().to_byte_array();
     let prover_assert_txid = graph.operator_assert.finalize().compute_txid().to_byte_array();
     let disprove_txids: Vec<[u8; 32]> =
         graph.disproves.iter().map(|tx| tx.finalize().compute_txid().to_byte_array()).collect();
+    let watchtower_challenge_timeout_txids: Vec<[u8; 32]> = graph
+        .watchtower_challenge_timeouts
+        .iter()
+        .map(|tx| tx.finalize().compute_txid().to_byte_array())
+        .collect();
+    let operator_challenge_nack_txids: Vec<[u8; 32]> = graph
+        .operator_challenge_nacks
+        .iter()
+        .map(|tx| tx.finalize().compute_txid().to_byte_array())
+        .collect();
+    let operator_commit_timeout_txid =
+        graph.operator_commit_timeout.finalize().compute_txid().to_byte_array();
 
     Ok(GraphData {
         operator_pubkey_prefix,
@@ -1435,8 +1449,12 @@ pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
         kickoff_txid,
         take1_txid,
         take2_txid,
+        watchtower_challenge_init_txid,
         prover_assert_txid,
         disprove_txids,
+        watchtower_challenge_timeout_txids,
+        operator_challenge_nack_txids,
+        operator_commit_timeout_txid,
     })
 }
 
@@ -3627,6 +3645,19 @@ fn convert_graph(bitvm_graph: &BitvmGcGraph, current_time: i64) -> Graph {
             .iter()
             .map(|tx| tx.finalize().compute_txid().into())
             .collect(),
+        watchtower_challenge_timeout_txids: bitvm_graph
+            .watchtower_challenge_timeouts
+            .iter()
+            .map(|tx| tx.finalize().compute_txid().into())
+            .collect(),
+        operator_challenge_nack_txids: bitvm_graph
+            .operator_challenge_nacks
+            .iter()
+            .map(|tx| tx.finalize().compute_txid().into())
+            .collect(),
+        operator_commit_timeout_txid: Some(
+            bitvm_graph.operator_commit_timeout.finalize().compute_txid().into(),
+        ),
         init_withdraw_tx_hash: None,
         bridge_out_start_at: 0,
         status_updated_at: current_time,

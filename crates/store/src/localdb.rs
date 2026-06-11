@@ -504,6 +504,9 @@ pub struct GraphUpdate {
     pub sub_status: Option<String>,
     pub challenge_txid: Option<SerializableTxid>,
     pub disprove_txids: Option<Vec<SerializableTxid>>,
+    pub watchtower_challenge_timeout_txids: Option<Vec<SerializableTxid>>,
+    pub operator_challenge_nack_txids: Option<Vec<SerializableTxid>>,
+    pub operator_commit_timeout_txid: Option<Option<SerializableTxid>>,
     pub bridge_out_start_at: Option<i64>,
     pub init_withdraw_tx_hash: Option<String>,
     pub proceed_withdraw_height: Option<i64>,
@@ -518,6 +521,9 @@ impl GraphUpdate {
             sub_status: None,
             challenge_txid: None,
             disprove_txids: None,
+            watchtower_challenge_timeout_txids: None,
+            operator_challenge_nack_txids: None,
+            operator_commit_timeout_txid: None,
             bridge_out_start_at: None,
             init_withdraw_tx_hash: None,
             proceed_withdraw_height: None,
@@ -547,6 +553,33 @@ impl GraphUpdate {
         self
     }
 
+    /// Set watchtower challenge timeout transaction IDs
+    pub fn with_watchtower_challenge_timeout_txids(
+        mut self,
+        watchtower_challenge_timeout_txids: Vec<SerializableTxid>,
+    ) -> Self {
+        self.watchtower_challenge_timeout_txids = Some(watchtower_challenge_timeout_txids);
+        self
+    }
+
+    /// Set operator challenge NACK transaction IDs
+    pub fn with_operator_challenge_nack_txids(
+        mut self,
+        operator_challenge_nack_txids: Vec<SerializableTxid>,
+    ) -> Self {
+        self.operator_challenge_nack_txids = Some(operator_challenge_nack_txids);
+        self
+    }
+
+    /// Set operator commit timeout transaction ID
+    pub fn with_operator_commit_timeout_txid(
+        mut self,
+        operator_commit_timeout_txid: Option<SerializableTxid>,
+    ) -> Self {
+        self.operator_commit_timeout_txid = Some(operator_commit_timeout_txid);
+        self
+    }
+
     /// Set bridge out start time
     pub fn with_bridge_out_start_at(mut self, bridge_out_start_at: i64) -> Self {
         self.bridge_out_start_at = Some(bridge_out_start_at);
@@ -571,6 +604,9 @@ impl GraphUpdate {
             || self.sub_status.is_some()
             || self.challenge_txid.is_some()
             || self.disprove_txids.is_some()
+            || self.watchtower_challenge_timeout_txids.is_some()
+            || self.operator_challenge_nack_txids.is_some()
+            || self.operator_commit_timeout_txid.is_some()
             || self.bridge_out_start_at.is_some()
             || self.init_withdraw_tx_hash.is_some()
             || self.proceed_withdraw_height.is_some()
@@ -594,6 +630,35 @@ impl GraphUpdate {
             let disprove_txids_json =
                 serde_json::to_string(disprove_txids).unwrap_or_else(|_| "[]".into());
             query_builder.set_field("disprove_txids", QueryParam::Text(disprove_txids_json));
+        }
+        if let Some(ref watchtower_challenge_timeout_txids) =
+            self.watchtower_challenge_timeout_txids
+        {
+            let watchtower_challenge_timeout_txids_json =
+                serde_json::to_string(watchtower_challenge_timeout_txids)
+                    .unwrap_or_else(|_| "[]".into());
+            query_builder.set_field(
+                "watchtower_challenge_timeout_txids",
+                QueryParam::Text(watchtower_challenge_timeout_txids_json),
+            );
+        }
+        if let Some(ref operator_challenge_nack_txids) = self.operator_challenge_nack_txids {
+            let operator_challenge_nack_txids_json =
+                serde_json::to_string(operator_challenge_nack_txids)
+                    .unwrap_or_else(|_| "[]".into());
+            query_builder.set_field(
+                "operator_challenge_nack_txids",
+                QueryParam::Text(operator_challenge_nack_txids_json),
+            );
+        }
+        if let Some(ref operator_commit_timeout_txid) = self.operator_commit_timeout_txid {
+            match operator_commit_timeout_txid {
+                Some(operator_commit_timeout_txid) => query_builder.set_field(
+                    "operator_commit_timeout_txid",
+                    QueryParam::BTCTxid(operator_commit_timeout_txid.clone()),
+                ),
+                None => query_builder.set_field_null("operator_commit_timeout_txid"),
+            }
         }
         if let Some(bridge_out_start_at) = self.bridge_out_start_at {
             query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
@@ -1169,15 +1234,20 @@ impl<'a> StorageProcessor<'a> {
     pub async fn upsert_graph(&mut self, graph: &Graph) -> anyhow::Result<u64> {
         let verifier_assert_txids_json = serde_json::to_string(&graph.verifier_assert_txids)?;
         let disprove_txids_json = serde_json::to_string(&graph.disprove_txids)?;
+        let watchtower_challenge_timeout_txids_json =
+            serde_json::to_string(&graph.watchtower_challenge_timeout_txids)?;
+        let operator_challenge_nack_txids_json =
+            serde_json::to_string(&graph.operator_challenge_nack_txids)?;
         let res = sqlx::query!(
             "INSERT OR
              REPLACE INTO graph (graph_id, instance_id, kickoff_index, from_addr, to_addr, amount, challenge_amount,
                     status, sub_status, operator_pubkey, cur_prekickoff_txid, next_prekickoff, force_skip_kickoff_txid,
                     quick_challenge_txid, challenge_incomplete_kickoff_txid, pegin_txid, kickoff_txid, take1_txid,
                     challenge_txid, take2_txid, watchtower_challenge_init_txid, operator_assert_txid, verifier_assert_txids, disprove_txids,
+                    watchtower_challenge_timeout_txids, operator_challenge_nack_txids, operator_commit_timeout_txid,
                     init_withdraw_tx_hash,
                     bridge_out_start_at, status_updated_at, proceed_withdraw_height,  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             graph.graph_id,
             graph.instance_id,
             graph.kickoff_index,
@@ -1202,14 +1272,18 @@ impl<'a> StorageProcessor<'a> {
             graph.operator_assert_txid,
             verifier_assert_txids_json,
             disprove_txids_json,
+            watchtower_challenge_timeout_txids_json,
+            operator_challenge_nack_txids_json,
+            graph.operator_commit_timeout_txid,
             graph.init_withdraw_tx_hash,
             graph.bridge_out_start_at,
             graph.status_updated_at,
             graph.proceed_withdraw_height,
             graph.created_at,
             graph.updated_at,
-        ).execute(self.conn())
-            .await?;
+        )
+        .execute(self.conn())
+        .await?;
         Ok(res.rows_affected())
     }
 
@@ -1282,6 +1356,9 @@ impl<'a> StorageProcessor<'a> {
                     operator_assert_txid,
                     verifier_assert_txids,
                     disprove_txids,
+                    watchtower_challenge_timeout_txids,
+                    operator_challenge_nack_txids,
+                    operator_commit_timeout_txid,
                     init_withdraw_tx_hash,
                     bridge_out_start_at,
                     status_updated_at,

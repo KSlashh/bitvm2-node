@@ -61,7 +61,11 @@ sol!(
         enum DisproveTxType {
             Disprove,
             QuickChallenge,
-            ChallengeIncompleteKickoff
+            ChallengeIncompleteKickoff,
+            PubinDisprove,
+            WatchtowerChallengeTimeout,
+            OperatorChallengeNack,
+            OperatorCommitTimeout
         }
         enum PeginStatus {
             None,
@@ -118,8 +122,12 @@ sol!(
             bytes32 kickoffTxid;
             bytes32 take1Txid;
             bytes32 take2Txid;
+            bytes32 watchtowerChallengeInitTxid;
             bytes32 proverAssertTxid;
             bytes32[] disproveTxids;
+            bytes32[] watchtowerChallengeTimeoutTxids;
+            bytes32[] operatorChallengeNackTxids;
+            bytes32 operatorCommitTimeoutTxid;
         }
 
         struct BitcoinTx {
@@ -762,6 +770,16 @@ impl From<DisproveTxType> for IGateway::DisproveTxType {
             DisproveTxType::ChallengeIncompleteKickoff => {
                 IGateway::DisproveTxType::ChallengeIncompleteKickoff
             }
+            DisproveTxType::PubinDisprove => IGateway::DisproveTxType::PubinDisprove,
+            DisproveTxType::WatchtowerChallengeTimeout => {
+                IGateway::DisproveTxType::WatchtowerChallengeTimeout
+            }
+            DisproveTxType::OperatorChallengeNack => {
+                IGateway::DisproveTxType::OperatorChallengeNack
+            }
+            DisproveTxType::OperatorCommitTimeout => {
+                IGateway::DisproveTxType::OperatorCommitTimeout
+            }
         }
     }
 }
@@ -815,12 +833,26 @@ impl From<GraphData> for IGateway::GraphData {
             kickoffTxid: FixedBytes::from_slice(&value.kickoff_txid),
             take1Txid: FixedBytes::from_slice(&value.take1_txid),
             take2Txid: FixedBytes::from_slice(&value.take2_txid),
+            watchtowerChallengeInitTxid: FixedBytes::from_slice(
+                &value.watchtower_challenge_init_txid,
+            ),
             proverAssertTxid: FixedBytes::from_slice(&value.prover_assert_txid),
             disproveTxids: value
                 .disprove_txids
                 .into_iter()
                 .map(|txid| FixedBytes::from_slice(&txid))
                 .collect::<Vec<_>>(),
+            watchtowerChallengeTimeoutTxids: value
+                .watchtower_challenge_timeout_txids
+                .into_iter()
+                .map(|txid| FixedBytes::from_slice(&txid))
+                .collect::<Vec<_>>(),
+            operatorChallengeNackTxids: value
+                .operator_challenge_nack_txids
+                .into_iter()
+                .map(|txid| FixedBytes::from_slice(&txid))
+                .collect::<Vec<_>>(),
+            operatorCommitTimeoutTxid: FixedBytes::from_slice(&value.operator_commit_timeout_txid),
         }
     }
 }
@@ -834,8 +866,20 @@ impl From<IGateway::GraphData> for GraphData {
             kickoff_txid: value.kickoffTxid.0,
             take1_txid: value.take1Txid.0,
             take2_txid: value.take2Txid.0,
+            watchtower_challenge_init_txid: value.watchtowerChallengeInitTxid.0,
             prover_assert_txid: value.proverAssertTxid.0,
             disprove_txids: value.disproveTxids.into_iter().map(|txid| txid.into()).collect(),
+            watchtower_challenge_timeout_txids: value
+                .watchtowerChallengeTimeoutTxids
+                .into_iter()
+                .map(|txid| txid.into())
+                .collect(),
+            operator_challenge_nack_txids: value
+                .operatorChallengeNackTxids
+                .into_iter()
+                .map(|txid| txid.into())
+                .collect(),
+            operator_commit_timeout_txid: value.operatorCommitTimeoutTxid.0,
         }
     }
 }

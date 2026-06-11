@@ -370,10 +370,15 @@ impl GOATClient {
                 (raw_challenge_start_tx, challenge_start_proof)
             }
             None => {
-                // if no challengeStartTx happens (for QuickChallenge & ChallengeIncompleteKickoff), set rawChallengeStartTx.inputVector to empty
+                // if no challengeStartTx happens, set rawChallengeStartTx.inputVector to empty
                 if !matches!(
                     disprove_type,
-                    DisproveTxType::QuickChallenge | DisproveTxType::ChallengeIncompleteKickoff
+                    DisproveTxType::QuickChallenge
+                        | DisproveTxType::ChallengeIncompleteKickoff
+                        | DisproveTxType::PubinDisprove
+                        | DisproveTxType::WatchtowerChallengeTimeout
+                        | DisproveTxType::OperatorChallengeNack
+                        | DisproveTxType::OperatorCommitTimeout
                 ) {
                     bail!("challenge_start_tx is required for disprove type {disprove_type:?}");
                 }
