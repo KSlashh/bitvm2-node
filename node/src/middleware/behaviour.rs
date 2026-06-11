@@ -1,4 +1,3 @@
-// #![feature(trivial_bounds)]
 use libp2p::identity::Keypair;
 use libp2p::{gossipsub, kad, kad::store::MemoryStore, swarm::StreamProtocol};
 use libp2p_swarm_derive::NetworkBehaviour;

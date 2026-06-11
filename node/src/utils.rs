@@ -1,11 +1,16 @@
 use crate::action::{
     ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, KickoffSent, NodeInfo,
-    PreKickoffSent, Take1Sent, Take2Sent, push_local_unhandled_messages, send_to_peer,
+    PreKickoffSent, SolderingProofReady, Take1Sent, Take2Sent, push_local_unhandled_messages,
+    send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
+use crate::soldering_payload_store::{
+    is_soldering_proof_s3_path, soldering_proof_payload_store_path,
+    write_soldering_proof_store_payload,
+};
 use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
@@ -55,6 +60,7 @@ use rand::Rng;
 use reqwest::Url;
 use secp256k1::Secp256k1;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -78,7 +84,7 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
 use bitcoin_light_client_circuit::hash_operator_constant;
 use bitvm_lib::babe_adapter::{
     BabeProverState, BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData,
-    SolderingData,
+    SolderingData, compact_soldering_proof_payload,
 };
 use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
@@ -3353,7 +3359,7 @@ pub fn strip_hex_prefix_owned(s: &str) -> String {
 /// Retrieve the server's public IP via NAT protocol and combine it with
 /// the configured RPC monitoring port`rpc_addr` to generate the external RPC service address.
 pub async fn set_node_external_socket_addr_env(rpc_addr: &str) -> Result<()> {
-    if get_proof_server_url().is_some() {
+    if get_proof_server_url().is_some() || std::env::var(ENV_EXTERNAL_SOCKET_ADDR).is_ok() {
         // not provide proof server
         return Ok(());
     }
@@ -4484,8 +4490,8 @@ pub async fn get_largest_watchtower_challenge_block(
     Ok(largest_watchtower_challenge_block_hash)
 }
 
-fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> PathBuf {
-    let root = std::env::var_os(ENV_BABE_SETUP_STATE_DIR)
+pub(crate) fn babe_setup_state_root(local_db: &LocalDB) -> PathBuf {
+    std::env::var_os(ENV_BABE_SETUP_STATE_DIR)
         .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -4500,8 +4506,89 @@ fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) 
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".bitvm-babe-state")
-        });
-    root.join(instance_id.to_string()).join(format!("{graph_id}.json"))
+        })
+}
+
+fn babe_setup_state_path(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> PathBuf {
+    babe_setup_state_root(local_db).join(instance_id.to_string()).join(format!("{graph_id}.json"))
+}
+
+pub(crate) fn soldering_payload_hash(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
+}
+
+pub(crate) fn soldering_payload_hash_hex(payload_hash: &[u8; 32]) -> String {
+    payload_hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) async fn pending_graph_belongs_to_operator(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_pubkey: &PublicKey,
+) -> Result<bool> {
+    let mut storage = local_db.acquire().await?;
+    Ok(storage.find_pending_graph_init_by_graph_id(&graph_id).await?.is_some_and(|pending| {
+        pending.instance_id == instance_id && pending.operator_pubkey == operator_pubkey.to_string()
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_soldering_proof_to_operator(
+    swarm: &mut Swarm<AllBehaviours>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    opened: &[(usize, u64)],
+    finalized: &[FinalizedInstanceData],
+    soldering: &SolderingData,
+) -> Result<()> {
+    let compact_payload = compact_soldering_proof_payload(opened, finalized, soldering)?;
+    let payload = bincode::serialize(&compact_payload)
+        .context("serialize compact soldering proof payload")?;
+    let payload_hash = soldering_payload_hash(&payload);
+    let total_len = payload.len();
+    let store_base_path = get_soldering_proof_payload_store_path()?;
+    let payload_path = soldering_proof_payload_store_path(
+        &store_base_path,
+        instance_id,
+        graph_id,
+        verifier_index,
+        &payload_hash,
+    )?;
+    let store_mode = if is_soldering_proof_s3_path(&store_base_path) { "s3" } else { "local" };
+    if let Err(err) =
+        write_soldering_proof_store_payload(&payload_path, &payload).await.with_context(|| {
+            format!("write soldering proof payload to configured store path {payload_path}")
+        })
+    {
+        tracing::error!(
+            store_mode,
+            total_len,
+            payload_hash = %soldering_payload_hash_hex(&payload_hash),
+            payload_path = %payload_path,
+            error = %err,
+            "failed to write soldering proof payload to store"
+        );
+        return Err(err);
+    }
+    tracing::info!(
+        store_mode,
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        payload_path = %payload_path,
+        "send compact soldering proof ready from payload store"
+    );
+    let message_content = GOATMessageContent::SolderingProofReady(SolderingProofReady {
+        instance_id,
+        graph_id,
+        verifier_index,
+        payload_hash,
+        total_len,
+    });
+    send_to_peer(swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+
+    Ok(())
 }
 
 fn load_babe_setup_state_from_path(path: &Path) -> Result<Option<BabeSetupState>> {

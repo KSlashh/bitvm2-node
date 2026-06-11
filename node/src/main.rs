@@ -5,6 +5,7 @@ use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use bitvm_noded::env::{
     self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, check_node_info, get_btc_url_from_env,
     get_goat_network, get_network, get_node_pubkey, goat_config_from_env,
+    validate_soldering_proof_payload_store_config,
 };
 use clap::{Parser, Subcommand};
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -121,6 +122,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+    validate_soldering_proof_payload_store_config(&actor)?;
 
     let is_publisher = actor == Actor::Publisher || actor == Actor::All;
     let sequencer_set_monitor_start_cosmos_block =

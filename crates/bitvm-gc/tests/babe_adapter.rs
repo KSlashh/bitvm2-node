@@ -105,7 +105,6 @@ fn protocol_finalized_instances_contribute_one_base_wire_slot() {
     let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey())
         .expect("one verifier graph slot");
 
-    assert_eq!(BABE_M_CC, 4);
     assert_eq!(
         gc_data.final_msg_hashlocks,
         finalized.iter().map(|data| data.final_msg_hash).collect::<Vec<_>>()

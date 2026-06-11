@@ -88,6 +88,8 @@ tokio-util.workspace = true
 http-body-util.workspace = true
 axum = { workspace = true, features = ["macros", "json"] }
 reqwest = { workspace = true, features = ["json"] }
+aws-config = { version = "1.1.9", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.21.0"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 http = { workspace = true }
 stun-client = "0.1.4"
@@ -119,7 +121,7 @@ zkm-recursion-core = { workspace = true }
 zkm-stark = { workspace = true }
 p3-bn254-fr = { workspace = true }
 p3-field = { workspace = true }
-borsh = {version = "1.5.3", features = ["derive"] }
+borsh = { version = "1.5.3", features = ["derive"] }
 
 proof-builder = { workspace = true }
 util = { workspace = true }

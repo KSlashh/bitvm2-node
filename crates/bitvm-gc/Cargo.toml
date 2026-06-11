@@ -25,6 +25,7 @@ ark-ff = { workspace = true }
 verifiable-circuit-babe = { workspace = true }
 garbled-snark-verifier = { workspace = true }
 soldering-host = { workspace = true }
+rayon = { workspace = true }
 
 serde-big-array = { workspace = true }
 serde_json = { workspace = true }

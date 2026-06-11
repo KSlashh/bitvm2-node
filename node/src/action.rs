@@ -8,12 +8,12 @@ use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
     BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness, BabeWronglyChallengedWitness,
-    CACSetupPackage, FinalizedInstanceData, SolderingData,
+    CACSetupPackage,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
@@ -37,6 +37,8 @@ pub struct GOATMessage {
     pub content: GOATMessageContent,
 }
 
+const GOAT_MESSAGE_BIN_PREFIX: &[u8] = b"GOATBIN1";
+
 #[derive(Serialize, Deserialize, Clone)]
 pub enum GOATMessageContent {
     PeginRequest(PeginRequest),
@@ -45,7 +47,7 @@ pub enum GOATMessageContent {
     InitGraph(InitGraph),
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
-    SolderingProof(SolderingProof),
+    SolderingProofReady(SolderingProofReady),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -110,15 +112,12 @@ pub struct CutCircuits {
     pub selected_circuit_indexes: Vec<usize>,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SolderingProof {
+pub struct SolderingProofReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub verifier_pubkey: PublicKey,
     pub verifier_index: usize,
-    pub setup_package: CACSetupPackage,
-    pub opened: Vec<(usize, u64)>,
-    pub finalized: Vec<FinalizedInstanceData>,
-    pub soldering: SolderingData,
+    pub payload_hash: [u8; 32],
+    pub total_len: usize,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
@@ -319,12 +318,32 @@ impl GOATMessage {
 
     pub async fn serialize_message(&self) -> Result<Vec<u8>> {
         let cloned = self.clone();
-        Ok(tokio::task::spawn_blocking(move || serde_json::to_vec(&cloned)).await??)
+        tokio::task::spawn_blocking(move || {
+            if matches!(&cloned.content, GOATMessageContent::GenCircuits(_)) {
+                let mut encoded = bincode::serialize(&cloned)
+                    .context("failed to serialize bincode GOATMessage")?;
+                let mut message = Vec::with_capacity(GOAT_MESSAGE_BIN_PREFIX.len() + encoded.len());
+                message.extend_from_slice(GOAT_MESSAGE_BIN_PREFIX);
+                message.append(&mut encoded);
+                Ok(message)
+            } else {
+                serde_json::to_vec(&cloned).context("failed to serialize legacy JSON GOATMessage")
+            }
+        })
+        .await?
     }
 
     pub async fn deserialize_message(message: &[u8]) -> Result<GOATMessage> {
         let cloned = message.to_vec();
-        Ok(tokio::task::spawn_blocking(move || serde_json::from_slice(&cloned)).await??)
+        tokio::task::spawn_blocking(move || {
+            if let Some(encoded) = cloned.strip_prefix(GOAT_MESSAGE_BIN_PREFIX) {
+                bincode::deserialize(encoded).context("failed to deserialize bincode GOATMessage")
+            } else {
+                serde_json::from_slice(&cloned)
+                    .context("failed to deserialize legacy JSON GOATMessage")
+            }
+        })
+        .await?
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -568,4 +587,33 @@ pub async fn try_send_sync_graph_request(
     let message = GOATMessage::new(Actor::All, message_content);
     send_to_peer(swarm, message).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soldering_proof_ready_is_descriptor_only() {
+        let ready = SolderingProofReady {
+            instance_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            graph_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            verifier_index: 3,
+            payload_hash: [0xabu8; 32],
+            total_len: 1024,
+        };
+
+        let value = serde_json::to_value(ready).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert!(object.contains_key("instance_id"));
+        assert!(object.contains_key("graph_id"));
+        assert!(object.contains_key("verifier_index"));
+        assert!(object.contains_key("payload_hash"));
+        assert!(object.contains_key("total_len"));
+        assert!(!object.contains_key("payload_path"));
+        assert!(!object.contains_key("payload"));
+        assert!(!object.contains_key("setup_package"));
+        assert!(!object.contains_key("verifier_pubkey"));
+    }
 }

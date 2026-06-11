@@ -169,11 +169,18 @@ fn save_output(input: OutputData, output_file: &str) {
 /// Query sequencer set hash from local DB.
 /// If `goat_block_number` is provided, find the first record at or before that goat block.
 /// That is, the sequencer set hash at that goat block.
-/// If not provided, return the latest record.
+/// If not provided, query the latest record.
+/// For init-genesis, return the requested goat block number as the resolved height.
+/// Otherwise, return the goat block number from the matched DB record.
 async fn get_sequencer_set_hash_from_db(
     db_path: &str,
     goat_block_number: Option<u64>,
+    init_genesis: bool,
 ) -> Result<([u8; 32], u64, u64), Box<dyn std::error::Error>> {
+    if init_genesis && goat_block_number.is_none() {
+        return Err("init_genesis requires an explicit goat_block_number".into());
+    }
+
     let local_db = store::create_local_db(db_path).await;
     let mut storage = local_db.acquire().await?;
     let record = if let Some(goat_block_number) = goat_block_number {
@@ -189,8 +196,14 @@ async fn get_sequencer_set_hash_from_db(
         record.ok_or("No validators_hash record found in db. Start the monitor task first")?;
 
     let sequencer_set_hash = <[u8; 32]>::from_hex(record.validators_hash.trim_start_matches("0x"))?;
-    let goat_block_number = u64::try_from(record.goat_block_height)?;
+    let record_goat_block_number = u64::try_from(record.goat_block_height)?;
+    let goat_block_number = if init_genesis {
+        goat_block_number.ok_or("init_genesis requires an explicit goat_block_number")?
+    } else {
+        record_goat_block_number
+    };
     let cosmos_block_number = u64::try_from(record.cosmos_block_height)?;
+
     Ok((sequencer_set_hash, goat_block_number, cosmos_block_number))
 }
 
@@ -328,7 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             operator_vk_hash,
         } => {
             let (sequencer_set_hash, goat_block_number, cosmos_block_number) =
-                get_sequencer_set_hash_from_db(&args.db_path, goat_block_number).await?;
+                get_sequencer_set_hash_from_db(&args.db_path, goat_block_number, false).await?;
             println!(
                 "resolved cl block number: {cosmos_block_number}, resolved el block number: {goat_block_number}"
             );
@@ -363,7 +376,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             println!("goat genesis block hash: {:#?}", hex::encode(goat_genesis_block_hash));
             let (sequencer_set_hash, goat_block_number, cosmos_block_number) =
-                get_sequencer_set_hash_from_db(&args.db_path, goat_block_number).await?;
+                get_sequencer_set_hash_from_db(&args.db_path, goat_block_number, init_genesis)
+                    .await?;
 
             let sequencers = fetch_validators(&args.cosmos_rpc_url, cosmos_block_number).await?;
             let fee_tx = cached_output.fee_tx;

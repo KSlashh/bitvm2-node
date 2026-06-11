@@ -162,7 +162,7 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::InitGraph(_) => MessageType::InitGraph,
         GOATMessageContent::GenCircuits(_) => MessageType::GenCircuits,
         GOATMessageContent::CutCircuits(_) => MessageType::CutCircuits,
-        GOATMessageContent::SolderingProof(_) => MessageType::SolderingProof,
+        GOATMessageContent::SolderingProofReady(_) => MessageType::SolderingProof,
         GOATMessageContent::NonceGeneration(_) => MessageType::NonceGeneration,
         GOATMessageContent::CommitteePresign(_) => MessageType::CommitteePresign,
         GOATMessageContent::GraphFinalize(_) => MessageType::GraphFinalize,
