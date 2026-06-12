@@ -47,7 +47,7 @@ use goat::connectors::{
 };
 use goat::contexts::base::generate_n_of_n_public_key;
 use goat::scripts::generate_opreturn_script;
-use goat::transactions::base::Input;
+use goat::transactions::base::{Input, output_topology};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::prekickoff::PrekickoffTransaction;
 use goat::transactions::signing::populate_p2wsh_witness;
@@ -853,7 +853,6 @@ fn connector_a_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
         .map_err(|e| anyhow!("failed to get connector-a input: {e}"))
 }
 
-#[allow(dead_code)]
 fn connector_d_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
     graph
         .operator_assert
@@ -915,6 +914,41 @@ async fn detect_guardian_disprove(
         }));
     }
     Ok(None)
+}
+
+async fn detect_connector_d_disprove(
+    btc_client: &BTCClient,
+    graph: &BitvmGcGraph,
+    challenge_start_txid: Option<Txid>,
+) -> Result<Option<DetectedDisprove>> {
+    let connector_d = connector_d_outpoint(graph)?;
+    let Some(spent_txid) =
+        outpoint_spent_txid(btc_client, &connector_d.txid, connector_d.vout as u64).await?
+    else {
+        return Ok(None);
+    };
+
+    if spent_txid == graph.take2.tx().compute_txid() {
+        return Ok(None);
+    }
+
+    for (index, disprove) in graph.disproves.iter().enumerate() {
+        if spent_txid == disprove.tx().compute_txid() {
+            return Ok(Some(DetectedDisprove {
+                disprove_type: DisproveTxType::Disprove,
+                index,
+                challenge_start_txid,
+                challenge_finish_txid: spent_txid,
+            }));
+        }
+    }
+
+    Ok(Some(DetectedDisprove {
+        disprove_type: DisproveTxType::PubinDisprove,
+        index: 0,
+        challenge_start_txid: None,
+        challenge_finish_txid: spent_txid,
+    }))
 }
 
 async fn scan_graph_chain_state(
@@ -1112,10 +1146,13 @@ async fn scan_graph_chain_state(
             });
         }
         for watchtower_index in 0..watchtower_num {
+            let watchtower_challenge_vout =
+                output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                    as u64;
             if outpoint_spent_txid(
                 btc_client,
                 &watchtower_challenge_init_txid,
-                watchtower_index as u64,
+                watchtower_challenge_vout,
             )
             .await?
             .is_some()
@@ -1190,6 +1227,20 @@ async fn scan_graph_chain_state(
                 watchtower_challenge_init_on_chain,
                 operator_assert_on_chain,
                 disprove: detected_disprove,
+            });
+        }
+        if let Some(disprove) =
+            detect_connector_d_disprove(btc_client, graph, challenge_txid).await?
+        {
+            sub_status.disprove_type = Some(disprove.disprove_type);
+            sub_status.disprove_index = disprove.index as i32;
+            return Ok(GraphChainScan {
+                status: GraphStatus::Disprove,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: Some(disprove),
             });
         }
         if tx_on_chain(btc_client, &take2_txid).await? {
@@ -1870,8 +1921,10 @@ pub async fn get_watchtower_challenge_info(
     let mut challenge_txids = Vec::with_capacity(num_watchtowers);
     let mut included_watchtowers = Vec::with_capacity(num_watchtowers);
     for index in 0..num_watchtowers {
+        let challenge_vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(index) as u64;
         let spent_txid =
-            outpoint_spent_txid(btc_client, &watchtower_challenge_init_txid.0, index as u64)
+            outpoint_spent_txid(btc_client, &watchtower_challenge_init_txid.0, challenge_vout)
                 .await?;
         match spent_txid {
             Some(txid) => {
@@ -4451,11 +4504,13 @@ pub async fn get_largest_watchtower_challenge_block(
     let mut largest_watchtower_challenge_block_hash: BlockHash =
         BlockHash::from_slice(&[0u8; 32]).unwrap();
     for watchtower_index in 0..graph.parameters.watchtower_pubkeys.len() {
-        let watchtower_challenge_vout = watchtower_index as u32;
+        let watchtower_challenge_vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                as u64;
         match outpoint_spent_txid(
             btc_client,
             &watchtower_challenge_init_txid,
-            watchtower_challenge_vout as u64,
+            watchtower_challenge_vout,
         )
         .await
         {

@@ -178,6 +178,14 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
             MessageType::WatchtowerChallengeInitSent
         }
         GOATMessageContent::WatchtowerChallengeSent(_) => MessageType::WatchtowerChallengeSent,
+        GOATMessageContent::WatchtowerChallengeTimeout(_) => {
+            MessageType::WatchtowerChallengeTimeout
+        }
+        GOATMessageContent::NackReady(_) => MessageType::NackReady,
+        GOATMessageContent::OperatorCommitPubinReady(_) => MessageType::OperatorCommitPubinReady,
+        GOATMessageContent::OperatorCommitPubinTimeout(_) => {
+            MessageType::OperatorCommitPubinTimeout
+        }
         GOATMessageContent::AssertReady(_) => MessageType::AssertReady,
         GOATMessageContent::AssertSent(_) => MessageType::AssertSent,
         GOATMessageContent::ChallengeAssertSent(_) => MessageType::ChallengeAssertSent,

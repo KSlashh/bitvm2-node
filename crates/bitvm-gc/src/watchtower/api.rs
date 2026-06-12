@@ -1,9 +1,6 @@
 use anyhow::{Result, bail};
-use bitcoin::{Address, Amount, Transaction, XOnlyPublicKey, key::Keypair};
-use goat::{
-    connectors::watchtower_connectors::WatchtowerChallengeConnector,
-    transactions::{base::Input, watchtower_challenge::watchtower_challenge},
-};
+use bitcoin::{Address, Amount, Transaction, key::Keypair};
+use goat::transactions::{base::Input, watchtower_challenge::watchtower_challenge};
 
 use crate::types::BitvmGcGraph;
 
@@ -23,14 +20,7 @@ pub fn build_watchtower_challenge_tx(
     if watchtower_index >= graph.parameters.watchtower_pubkeys.len() {
         bail!("Invalid watchtower index");
     }
-    let network = graph.parameters.instance_parameters.network;
-    let operator_taproot_public_key = XOnlyPublicKey::from(graph.parameters.operator_pubkey);
-    let watchtower_taproot_public_key = graph.parameters.watchtower_pubkeys[watchtower_index];
-    let watchtower_challenge_connector = WatchtowerChallengeConnector::new(
-        network,
-        &operator_taproot_public_key,
-        &watchtower_taproot_public_key,
-    );
+    let watchtower_challenge_connector = graph.watchtower_challenge_connector(watchtower_index)?;
     let input_0 = graph
         .watchtower_challenge_init
         .watchtower_connector_input(watchtower_index)

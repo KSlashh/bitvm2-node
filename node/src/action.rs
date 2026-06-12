@@ -61,6 +61,10 @@ pub enum GOATMessageContent {
     ChallengeSent(ChallengeSent),
     WatchtowerChallengeInitSent(WatchtowerChallengeInitSent),
     WatchtowerChallengeSent(WatchtowerChallengeSent),
+    WatchtowerChallengeTimeout(WatchtowerChallengeTimeout),
+    NackReady(NackReady),
+    OperatorCommitPubinReady(OperatorCommitPubinReady),
+    OperatorCommitPubinTimeout(OperatorCommitPubinTimeout),
     AssertReady(AssertReady),
     AssertSent(AssertSent),
     ChallengeAssertSent(ChallengeAssertSent),
@@ -211,6 +215,27 @@ pub struct WatchtowerChallengeSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub watchtower_index: usize,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WatchtowerChallengeTimeout {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct NackReady {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub watchtower_index: usize,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OperatorCommitPubinReady {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OperatorCommitPubinTimeout {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AssertReady {

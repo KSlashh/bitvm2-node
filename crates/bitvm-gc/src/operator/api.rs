@@ -1,22 +1,10 @@
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Transaction, TxIn, key::Keypair};
-use bitcoin::{Network, PublicKey, Witness, XOnlyPublicKey};
+use bitcoin::{Network, PublicKey, Witness};
 use goat::assert_scripts::{
     Label, OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
     OperatorCommitPubinSecretKey,
 };
-use goat::connectors::assert_connectors::{ProverConnector, VerifierConnector};
-use goat::connectors::connector_0::Connector0;
-use goat::connectors::connector_a::ConnectorA;
-use goat::connectors::connector_b::ConnectorB;
-use goat::connectors::connector_c::ConnectorC;
-use goat::connectors::connector_d::ConnectorD;
-use goat::connectors::connector_e::ConnectorE;
-use goat::connectors::connector_f::ConnectorF;
-use goat::connectors::kickoff_connectors::{
-    ForceSkipConnector, GuardianConnector, KickoffConnector, PrekickoffConnector,
-};
-use goat::connectors::watchtower_connectors::{AckConnector, WatchtowerChallengeConnector};
 use goat::constants::{CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK};
 use goat::transactions::assert::{
     DisproveTransaction, OperatorAssertTransaction, VerifierAssertTransaction, wrongly_challenged,
@@ -78,10 +66,6 @@ pub fn operator_presig_num() -> usize {
 }
 
 pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGraph> {
-    let network = params.instance_parameters.network;
-    let operator_taproot_public_key = XOnlyPublicKey::from(params.operator_pubkey);
-    let n_of_n_taproot_public_key =
-        XOnlyPublicKey::from(params.instance_parameters.committee_agg_pubkey);
     let watchtower_num = params.watchtower_pubkeys.len();
     let verifier_num = params.gc_data.len();
     if params.watchtower_ack_hashlocks.len() != watchtower_num {
@@ -96,10 +80,10 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         .connector_0_input()
         .map_err(|e| anyhow::anyhow!("failed to get connector-0 input: {e}"))?;
 
-    let cur_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
-    let next_force_skip_connector = ForceSkipConnector::new(network, &operator_taproot_public_key);
-    let next_kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
-    let next_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
+    let cur_prekickoff_connector = params.prekickoff_connector();
+    let next_force_skip_connector = params.force_skip_connector();
+    let next_kickoff_connector = params.kickoff_connector();
+    let next_prekickoff_connector = params.prekickoff_connector();
     let cur_prekickoff = params.prekickoff_parameters.cur_prekickoff_txn.clone();
     let cur_prekickoff_connector_input = cur_prekickoff
         .prekickoff_connector_input()
@@ -128,13 +112,11 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     let kickoff_connector_input = cur_prekickoff
         .kickoff_connector_input()
         .map_err(|e| anyhow::anyhow!("failed to get kickoff connector input: {e}"))?;
-    let kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
-    let connector_a =
-        ConnectorA::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
-    let connector_b = ConnectorB::new(network, &operator_taproot_public_key);
-    let connector_c =
-        ConnectorC::new(network, &n_of_n_taproot_public_key, &params.operator_assert_wots_pubkey);
-    let guardian_connector = GuardianConnector::new(network, &operator_taproot_public_key);
+    let kickoff_connector = params.kickoff_connector();
+    let connector_a = params.connector_a();
+    let connector_b = params.connector_b();
+    let connector_c = params.connector_c();
+    let guardian_connector = params.guardian_connector();
     let kickoff = KickoffTransaction::new_for_validation(
         &kickoff_connector,
         &connector_a,
@@ -180,7 +162,7 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     );
 
     // take-1
-    let connector_0 = Connector0::new(network, &n_of_n_taproot_public_key);
+    let connector_0 = params.connector_0();
     let take1 = Take1Transaction::new_for_validation(
         &connector_0,
         &connector_a,
@@ -205,25 +187,10 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     );
 
     // watchtower-challenge
-    let connector_e = ConnectorE::new(
-        network,
-        &n_of_n_taproot_public_key,
-        &params.operator_commit_pubin_wots_pubkey,
-    );
-    let connector_f =
-        ConnectorF::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
-    let watchtower_challenge_connectors = params
-        .watchtower_pubkeys
-        .iter()
-        .map(|pubkey| {
-            WatchtowerChallengeConnector::new(network, &operator_taproot_public_key, pubkey)
-        })
-        .collect::<Vec<_>>();
-    let ack_connectors = params
-        .watchtower_ack_hashlocks
-        .iter()
-        .map(|hashlock| AckConnector::new(network, &n_of_n_taproot_public_key, *hashlock))
-        .collect::<Vec<_>>();
+    let connector_e = params.connector_e();
+    let connector_f = params.connector_f();
+    let watchtower_challenge_connectors = params.watchtower_challenge_connectors();
+    let ack_connectors = params.ack_connectors();
     let watchtower_challenge_init = WatchtowerChallengeInitTransaction::new_for_validation(
         &connector_b,
         &connector_e,
@@ -273,20 +240,8 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
     );
 
     // prover-assert
-    let connector_d =
-        ConnectorD::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
-    let verifier_connectors = params
-        .gc_data
-        .iter()
-        .map(|data| {
-            VerifierConnector::new(
-                network,
-                &n_of_n_taproot_public_key,
-                &params.operator_assert_wots_pubkey,
-                data.wire_hashes.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let connector_d = params.connector_d();
+    let verifier_connectors = params.verifier_connectors();
     let operator_assert = OperatorAssertTransaction::new_for_validation(
         &connector_c,
         &verifier_connectors,
@@ -305,11 +260,7 @@ pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGra
         let verifier_input = operator_assert
             .verifier_connector_input(i)
             .map_err(|e| anyhow::anyhow!("failed to get verifier connector input {i}: {e}"))?;
-        let prover_connector = ProverConnector::new(
-            network,
-            n_of_n_taproot_public_key,
-            params.gc_data[i].final_msg_hashlocks.clone(),
-        );
+        let prover_connector = params.prover_connector(i)?;
         let verifier_assert = VerifierAssertTransaction::new_for_validation(
             verifier_connector,
             &prover_connector,
@@ -380,12 +331,10 @@ pub fn operator_pre_sign(
 
     let mut wits = vec![];
     let context = graph.parameters.get_operator_context(operator_keypair)?;
-    let network = context.network;
-    let operator_taproot_public_key = context.operator_taproot_public_key;
 
     // presign force_skip_kickoff
-    let kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
-    let next_force_skip_connector = ForceSkipConnector::new(network, &operator_taproot_public_key);
+    let kickoff_connector = graph.parameters.kickoff_connector();
+    let next_force_skip_connector = graph.parameters.force_skip_connector();
     graph.force_skip_kickoff.pre_sign_and_push(
         &context,
         &kickoff_connector,
@@ -395,7 +344,7 @@ pub fn operator_pre_sign(
     wits.push(graph.force_skip_kickoff.tx().input[1].witness.clone());
 
     // presign quick_challenge
-    let guardian_connector = GuardianConnector::new(network, &operator_taproot_public_key);
+    let guardian_connector = graph.guardian_connector();
     graph.quick_challenge.pre_sign_and_push(
         &context,
         &guardian_connector,
@@ -405,7 +354,7 @@ pub fn operator_pre_sign(
     wits.push(graph.quick_challenge.tx().input[1].witness.clone());
 
     // presign challenge_incomplete_kickoff
-    let next_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
+    let next_prekickoff_connector = graph.parameters.prekickoff_connector();
     graph.challenge_incomplete_kickoff.pre_sign_and_push(
         &context,
         &guardian_connector,
@@ -446,10 +395,7 @@ pub fn operator_sign_prekickoff_input_0(
     graph: &mut BitvmGcGraph,
 ) -> Result<Transaction> {
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let prev_prekickoff_connector = PrekickoffConnector::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-    );
+    let prev_prekickoff_connector = graph.parameters.prekickoff_connector();
     graph.cur_prekickoff.sign_input_0(&operator_context, &prev_prekickoff_connector);
     Ok(graph.cur_prekickoff.tx().clone())
 }
@@ -461,10 +407,7 @@ pub fn operator_sign_skip_kickoff(
     fee_rate: f64,
 ) -> Result<Option<Transaction>> {
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let kickoff_connector = KickoffConnector::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-    );
+    let kickoff_connector = graph.parameters.kickoff_connector();
     let kickoff_connector_input = graph
         .cur_prekickoff
         .kickoff_connector_input()
@@ -502,10 +445,7 @@ pub fn operator_sign_kickoff(
     graph: &mut BitvmGcGraph,
 ) -> Result<Transaction> {
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let kickoff_connector = KickoffConnector::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-    );
+    let kickoff_connector = graph.parameters.kickoff_connector();
     graph.kickoff.sign_input_0(&operator_context, &kickoff_connector);
     Ok(graph.kickoff.tx().clone())
 }
@@ -518,17 +458,9 @@ pub fn operator_sign_take1(
         bail!("missing pre-signatures from committee".to_string())
     };
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let connector_a = ConnectorA::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-        &operator_context.n_of_n_taproot_public_key,
-    );
-    let connector_b =
-        ConnectorB::new(operator_context.network, &operator_context.operator_taproot_public_key);
-    let guardian_connector = GuardianConnector::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-    );
+    let connector_a = graph.connector_a();
+    let connector_b = graph.connector_b();
+    let guardian_connector = graph.guardian_connector();
     graph.take1.sign_input_1(&operator_context, &connector_a);
     graph.take1.sign_input_2(&operator_context, &connector_b);
     graph.take1.sign_input_4(&operator_context, &guardian_connector);
@@ -543,20 +475,9 @@ pub fn operator_sign_take2(
         bail!("missing pre-signatures from committee".to_string())
     };
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let connector_d = ConnectorD::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-        &operator_context.n_of_n_taproot_public_key,
-    );
-    let connector_f = ConnectorF::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-        &operator_context.n_of_n_taproot_public_key,
-    );
-    let guardian_connector = GuardianConnector::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-    );
+    let connector_d = graph.connector_d();
+    let connector_f = graph.connector_f();
+    let guardian_connector = graph.guardian_connector();
     graph.take2.sign_input_1(&operator_context, &connector_d);
     graph.take2.sign_input_2(&operator_context, &connector_f);
     graph.take2.sign_input_3(&operator_context, &guardian_connector);
@@ -568,8 +489,7 @@ pub fn operator_sign_watchtower_challenge_init(
     graph: &mut BitvmGcGraph,
 ) -> Result<Transaction> {
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let connector_b =
-        ConnectorB::new(operator_context.network, &operator_context.operator_taproot_public_key);
+    let connector_b = graph.connector_b();
     graph.watchtower_challenge_init.sign_input_0(&operator_context, &connector_b);
     Ok(graph.watchtower_challenge_init.tx().clone())
 }
@@ -586,11 +506,7 @@ pub fn operator_sign_watchtower_challenge_timeout(
         bail!("missing pre-signatures from committee")
     };
     let operator_context = graph.parameters.get_operator_context(operator_keypair)?;
-    let watchtower_challenge_connector = WatchtowerChallengeConnector::new(
-        operator_context.network,
-        &operator_context.operator_taproot_public_key,
-        &graph.parameters.watchtower_pubkeys[watchtower_index],
-    );
+    let watchtower_challenge_connector = graph.watchtower_challenge_connector(watchtower_index)?;
     graph.watchtower_challenge_timeouts[watchtower_index]
         .sign_input_0(&operator_context, &watchtower_challenge_connector);
     Ok(graph.watchtower_challenge_timeouts[watchtower_index].tx().clone())
@@ -604,14 +520,7 @@ pub fn operator_sign_challenge_ack(
     if watchtower_index >= graph.parameters.watchtower_pubkeys.len() {
         bail!("invalid watchtower index {watchtower_index}")
     };
-    let network = graph.parameters.instance_parameters.network;
-    let n_of_n_taproot_public_key =
-        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
-    let ack_connector = AckConnector::new(
-        network,
-        &n_of_n_taproot_public_key,
-        graph.parameters.watchtower_ack_hashlocks[watchtower_index],
-    );
+    let ack_connector = graph.ack_connector(watchtower_index)?;
     let input = graph
         .watchtower_challenge_init
         .ack_connector_input(watchtower_index)
@@ -631,14 +540,7 @@ pub fn operator_sign_commit_pubin(
         bail!("provided pubin WOTS secret key does not match expected public key")
     };
 
-    let network = graph.parameters.instance_parameters.network;
-    let n_of_n_taproot_public_key =
-        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
-    let connector_e = ConnectorE::new(
-        network,
-        &n_of_n_taproot_public_key,
-        &graph.parameters.operator_commit_pubin_wots_pubkey,
-    );
+    let connector_e = graph.connector_e();
     let input = graph
         .watchtower_challenge_init
         .connector_e_input()
@@ -657,14 +559,7 @@ pub fn operator_sign_assert(
         bail!("provided WOTS secret key does not match expected public key".to_string())
     };
 
-    let network = graph.parameters.instance_parameters.network;
-    let n_of_n_taproot_public_key =
-        bitcoin::XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
-    let connector_c = ConnectorC::new(
-        network,
-        &n_of_n_taproot_public_key,
-        &graph.parameters.operator_assert_wots_pubkey,
-    );
+    let connector_c = graph.connector_c();
 
     graph
         .operator_assert
@@ -682,14 +577,7 @@ pub fn operator_sign_wrongly_challenged(
         bail!("invalid verifier index {verifier_index}".to_string())
     };
 
-    let network = graph.parameters.instance_parameters.network;
-    let n_of_n_taproot_public_key =
-        bitcoin::XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
-    let prover_connector = ProverConnector::new(
-        network,
-        n_of_n_taproot_public_key,
-        graph.parameters.gc_data[verifier_index].final_msg_hashlocks.clone(),
-    );
+    let prover_connector = graph.prover_connector(verifier_index)?;
     let input = graph.verifier_asserts[verifier_index]
         .prover_connector_input()
         .map_err(|e| anyhow::anyhow!("failed to get prover connector input: {e}"))?;

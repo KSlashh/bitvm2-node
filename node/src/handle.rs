@@ -31,6 +31,7 @@ use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::connectors::connector_z::ConnectorZ;
+use goat::transactions::base::output_topology;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
@@ -446,6 +447,59 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             Actor::Watchtower,
         ) => {
             handle_watchtower_challenge_init_sent_watchtower(ctx, *instance_id, *graph_id, content)
+                .await
+        }
+        (
+            GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
+                instance_id,
+                graph_id,
+                watchtower_index,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_watchtower_challenge_sent_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *watchtower_index,
+                content,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::WatchtowerChallengeTimeout(WatchtowerChallengeTimeout {
+                instance_id,
+                graph_id,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_watchtower_challenge_timeout_operator(ctx, *instance_id, *graph_id, content)
+                .await
+        }
+        (
+            GOATMessageContent::NackReady(NackReady { instance_id, graph_id, watchtower_index }),
+            Actor::Verifier,
+        ) => {
+            handle_nack_ready_verifier(ctx, *instance_id, *graph_id, *watchtower_index, content)
+                .await
+        }
+        (
+            GOATMessageContent::OperatorCommitPubinReady(OperatorCommitPubinReady {
+                instance_id,
+                graph_id,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_operator_commit_pubin_ready_operator(ctx, *instance_id, *graph_id, content).await
+        }
+        (
+            GOATMessageContent::OperatorCommitPubinTimeout(OperatorCommitPubinTimeout {
+                instance_id,
+                graph_id,
+            }),
+            Actor::Verifier,
+        ) => {
+            handle_operator_commit_pubin_timeout_verifier(ctx, *instance_id, *graph_id, content)
                 .await
         }
         (
@@ -3183,9 +3237,15 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
         );
         return Ok(());
     }
-    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, node_index as u64)
-        .await?
-        .is_some()
+    let watchtower_challenge_vout =
+        output_topology::watchtower_challenge_init::watchtower_connector(node_index) as u64;
+    if outpoint_spent_txid(
+        ctx.btc_client,
+        &watchtower_challenge_init_txid,
+        watchtower_challenge_vout,
+    )
+    .await?
+    .is_some()
     {
         tracing::warn!(
             "Ignore WatchtowerChallengeInitSent for {instance_id}:{graph_id}: watchtower challenge already spent"
@@ -3237,6 +3297,128 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
     });
     send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
     Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id, watchtower_index = watchtower_index))]
+async fn handle_watchtower_challenge_sent_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    watchtower_index: usize,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let message = make_message(ctx, content);
+    let _graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    todo!("operator send ack")
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_watchtower_challenge_timeout_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let message = make_message(ctx, content);
+    let _graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    todo!("operator send watchtower-challenge-timeout")
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id, watchtower_index = watchtower_index))]
+async fn handle_nack_ready_verifier(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    watchtower_index: usize,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let message = make_message(ctx, content);
+    let _graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    todo!("verifier send nack")
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_operator_commit_pubin_ready_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let message = make_message(ctx, content);
+    let _graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    todo!("operator send operator-commit-pubin")
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_operator_commit_pubin_timeout_verifier(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let message = make_message(ctx, content);
+    let _graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    todo!("verifier send operator-commit-pubin-timeout")
 }
 
 // after the watchtower challenge flow is complete, build proof and broadcast Assert transaction.
@@ -3320,6 +3502,7 @@ async fn handle_assert_sent_verifier(
     assert_txid: Txid,
     assert_witness: &Option<BabeAssertWitness>,
 ) -> Result<()> {
+    // TODO: check pubin first, if invalid, directly send PubinDisprove without building ChallengeAssert transaction
     let (graph, _graph_status, _graph_sub_status) =
         match refresh_graph_status(ctx, instance_id, graph_id, None, GraphStatus::Challenge).await?
         {
@@ -3661,7 +3844,7 @@ async fn handle_disprove_sent_committee(
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let take1_txid = graph.take1.tx().compute_txid();
-    let connector_a_vout = 0;
+    let connector_a_vout = output_topology::kickoff::connector_a() as u64;
     let challenge_start_tx = if let Some(spent_txid) =
         outpoint_spent_txid(ctx.btc_client, &kickoff_txid, connector_a_vout).await?
     {
@@ -3765,8 +3948,8 @@ async fn handle_take1_ready_operator(
         return Ok(());
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let connector_a_vout = 0;
-    let guardian_connector_vout = 3;
+    let connector_a_vout = output_topology::kickoff::connector_a() as u64;
+    let guardian_connector_vout = output_topology::kickoff::guardian_connector() as u64;
     if outpoint_spent_txid(ctx.btc_client, &kickoff_txid, connector_a_vout).await?.is_some()
         || outpoint_spent_txid(ctx.btc_client, &kickoff_txid, guardian_connector_vout)
             .await?

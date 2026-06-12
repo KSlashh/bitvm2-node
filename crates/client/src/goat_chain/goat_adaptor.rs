@@ -63,7 +63,6 @@ sol!(
             QuickChallenge,
             ChallengeIncompleteKickoff,
             PubinDisprove,
-            WatchtowerChallengeTimeout,
             OperatorChallengeNack,
             OperatorCommitTimeout
         }
@@ -773,9 +772,6 @@ impl From<DisproveTxType> for IGateway::DisproveTxType {
                 IGateway::DisproveTxType::ChallengeIncompleteKickoff
             }
             DisproveTxType::PubinDisprove => IGateway::DisproveTxType::PubinDisprove,
-            DisproveTxType::WatchtowerChallengeTimeout => {
-                IGateway::DisproveTxType::WatchtowerChallengeTimeout
-            }
             DisproveTxType::OperatorChallengeNack => {
                 IGateway::DisproveTxType::OperatorChallengeNack
             }

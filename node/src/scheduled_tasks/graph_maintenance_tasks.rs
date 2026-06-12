@@ -23,9 +23,6 @@ use strum::{Display, EnumString};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-// const CONNECTOR_D_MARGIN: u64 = 2;
-const CONNECTOR_GUARDIAN_MARGIN: u64 = 2;
-
 const MONITE_BTC_TX_NAME_KICKOFF: &str = "kickoff";
 const MONITE_BTC_TX_NAME_WATCHTOWER_INIT: &str = "watchtower_init";
 const MONITE_BTC_TX_NAME_PROVER_ASSERT: &str = "prover_assert";
@@ -396,7 +393,12 @@ async fn detect_watchtower_challenge(
     };
 
     let mut spent_challenge_connector_num = 0;
-    for vout in 0..vout_len as u64 {
+    let watchtower_num =
+        output_topology::watchtower_challenge_init::watchtower_num(vout_len.max(0) as usize);
+    for watchtower_index in 0..watchtower_num {
+        let vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                as u64;
         if outpoint_spent_txid(btc_client, &watchtower_challenge_init_txid, vout).await?.is_some() {
             spent_challenge_connector_num += 1;
             if spent_challenge_connector_num >= required_watchtower_num {
@@ -695,23 +697,9 @@ async fn detect_kickoff_ref_disprove_tx(
         info!("graph_id:{} next {pre_sents} graphs's pre_kickoff has been sent!", graph.graph_id);
         detected = true;
     }
-    let out_monitor = {
-        let mut storage_processor = local_db.acquire().await?;
-        storage_processor
-            .find_graph_btc_tx_vout_monitor(&graph.graph_id, &kickoff_txid.into())
-            .await?
-    };
-
-    let Some(out_monitor) = out_monitor else {
-        return Ok(false);
-    };
-
-    if let Some(spend_txid) = outpoint_spent_txid(
-        btc_client,
-        &kickoff_txid,
-        out_monitor.vout_len as u64 - CONNECTOR_GUARDIAN_MARGIN,
-    )
-    .await?
+    let guardian_connector_vout = output_topology::kickoff::guardian_connector() as u64;
+    if let Some(spend_txid) =
+        outpoint_spent_txid(btc_client, &kickoff_txid, guardian_connector_vout).await?
         && let Some(tx) = btc_client.get_tx(&spend_txid).await?
     {
         if spend_txid == take1_txid || spend_txid == take2_txid || tx.input.len() < 2 {
@@ -822,13 +810,23 @@ async fn detect_take2(
         }
 
         warn!(
-            "detect_take2 graph_id:{} connector_d spent by unknown txid:{}",
+            "detect_take2 graph_id:{} connector_d spent by pubin-disprove txid:{}",
             graph.graph_id, spend_txid
         );
-        return Ok(None);
+        return Ok(Some((
+            Actor::Committee,
+            GOATMessageContent::DisproveSent(DisproveSent {
+                instance_id: graph.instance_id,
+                graph_id: graph.graph_id,
+                disprove_type: DisproveTxType::PubinDisprove,
+                index: 0,
+                challenge_start_txid: None,
+                challenge_finish_txid: spend_txid,
+            }),
+        )));
     }
 
-    let guardian_connector_vout = 3;
+    let guardian_connector_vout = output_topology::kickoff::guardian_connector() as u64;
     if outpoint_spent_txid(btc_client, &kickoff_txid, guardian_connector_vout).await?.is_some() {
         trace!("detect_take2 graph_id:{} guardian connector already spent", graph.graph_id);
         return Ok(None);

@@ -9,7 +9,22 @@ use goat::{
     assert_scripts::{
         INPUT_WIRE_NUM, LabelHash, OperatorAssertPublicKey, OperatorCommitPubinPublicKey, WireHash,
     },
-    connectors::{base::TaprootConnector, connector_0::Connector0, connector_z::ConnectorZ},
+    connectors::{
+        assert_connectors::{ProverConnector, VerifierConnector},
+        base::TaprootConnector,
+        connector_0::Connector0,
+        connector_a::ConnectorA,
+        connector_b::ConnectorB,
+        connector_c::ConnectorC,
+        connector_d::ConnectorD,
+        connector_e::ConnectorE,
+        connector_f::ConnectorF,
+        connector_z::ConnectorZ,
+        kickoff_connectors::{
+            ForceSkipConnector, GuardianConnector, KickoffConnector, PrekickoffConnector,
+        },
+        watchtower_connectors::{AckConnector, WatchtowerChallengeConnector},
+    },
     contexts::{base::BaseContext, committee::CommitteeContext, operator::OperatorContext},
     transactions::{
         assert::{DisproveTransaction, OperatorAssertTransaction, VerifierAssertTransaction},
@@ -99,15 +114,32 @@ pub struct BitvmGcCircuitData {
 }
 
 impl BitvmGcInstanceParameters {
+    pub fn n_of_n_taproot_public_key(&self) -> XOnlyPublicKey {
+        XOnlyPublicKey::from(self.committee_agg_pubkey)
+    }
+
+    pub fn user_taproot_public_key(&self) -> XOnlyPublicKey {
+        self.user_info.user_xonly_pubkey
+    }
+
+    pub fn connector_0(&self) -> Connector0 {
+        Connector0::new(self.network, &self.n_of_n_taproot_public_key())
+    }
+
+    pub fn connector_z(&self) -> ConnectorZ {
+        ConnectorZ::new(
+            self.network,
+            &self.n_of_n_taproot_public_key(),
+            &self.user_taproot_public_key(),
+        )
+    }
+
     pub fn build_pegin_tx(
         &self,
     ) -> Result<(PegInDepositTransaction, PegInConfirmTransaction, PegInRefundTransaction)> {
         let network = self.network;
-        let n_of_n_taproot_public_key = XOnlyPublicKey::from(self.committee_agg_pubkey);
-        let user_taproot_public_key = self.user_info.user_xonly_pubkey;
-        let connector_0 = Connector0::new(network, &n_of_n_taproot_public_key);
-        let connector_z =
-            ConnectorZ::new(network, &n_of_n_taproot_public_key, &user_taproot_public_key);
+        let connector_0 = self.connector_0();
+        let connector_z = self.connector_z();
         let pegin_message = [
             get_magic_bytes(&network),
             self.instance_id.as_bytes().to_vec(),
@@ -146,11 +178,8 @@ impl BitvmGcInstanceParameters {
     }
 
     pub fn build_pegin_cancel_psbt(&self) -> Result<bitcoin::psbt::Psbt> {
-        let network = self.network;
-        let n_of_n_taproot_public_key = XOnlyPublicKey::from(self.committee_agg_pubkey);
-        let user_taproot_public_key = self.user_info.user_xonly_pubkey;
-        let connector_z =
-            ConnectorZ::new(network, &n_of_n_taproot_public_key, &user_taproot_public_key);
+        let connector_z = self.connector_z();
+        let n_of_n_taproot_public_key = self.n_of_n_taproot_public_key();
 
         let pegin_deposit = PegInDepositTransaction::new_unsigned(
             &connector_z,
@@ -235,6 +264,187 @@ impl BitvmGcInstanceParameters {
 }
 
 impl BitvmGcGraphParameters {
+    pub fn network(&self) -> Network {
+        self.instance_parameters.network
+    }
+
+    pub fn operator_taproot_public_key(&self) -> XOnlyPublicKey {
+        XOnlyPublicKey::from(self.operator_pubkey)
+    }
+
+    pub fn n_of_n_taproot_public_key(&self) -> XOnlyPublicKey {
+        self.instance_parameters.n_of_n_taproot_public_key()
+    }
+
+    pub fn connector_0(&self) -> Connector0 {
+        self.instance_parameters.connector_0()
+    }
+
+    pub fn connector_z(&self) -> ConnectorZ {
+        self.instance_parameters.connector_z()
+    }
+
+    pub fn prekickoff_connector(&self) -> PrekickoffConnector {
+        PrekickoffConnector::new(self.network(), &self.operator_taproot_public_key())
+    }
+
+    pub fn force_skip_connector(&self) -> ForceSkipConnector {
+        ForceSkipConnector::new(self.network(), &self.operator_taproot_public_key())
+    }
+
+    pub fn kickoff_connector(&self) -> KickoffConnector {
+        KickoffConnector::new(self.network(), &self.operator_taproot_public_key())
+    }
+
+    pub fn connector_a(&self) -> ConnectorA {
+        ConnectorA::new(
+            self.network(),
+            &self.operator_taproot_public_key(),
+            &self.n_of_n_taproot_public_key(),
+        )
+    }
+
+    pub fn connector_b(&self) -> ConnectorB {
+        ConnectorB::new(self.network(), &self.operator_taproot_public_key())
+    }
+
+    pub fn connector_c(&self) -> ConnectorC {
+        ConnectorC::new(
+            self.network(),
+            &self.n_of_n_taproot_public_key(),
+            &self.operator_assert_wots_pubkey,
+        )
+    }
+
+    pub fn connector_d(&self) -> ConnectorD {
+        ConnectorD::new(
+            self.network(),
+            &self.operator_taproot_public_key(),
+            &self.n_of_n_taproot_public_key(),
+            &self.operator_commit_pubin_wots_pubkey,
+            &self.operator_assert_wots_pubkey,
+            &self.pubin_disprove_constant,
+            &self.watchtower_ack_hashlocks,
+        )
+    }
+
+    pub fn connector_e(&self) -> ConnectorE {
+        ConnectorE::new(
+            self.network(),
+            &self.n_of_n_taproot_public_key(),
+            &self.operator_commit_pubin_wots_pubkey,
+        )
+    }
+
+    pub fn connector_f(&self) -> ConnectorF {
+        ConnectorF::new(
+            self.network(),
+            &self.operator_taproot_public_key(),
+            &self.n_of_n_taproot_public_key(),
+        )
+    }
+
+    pub fn guardian_connector(&self) -> GuardianConnector {
+        GuardianConnector::new(self.network(), &self.operator_taproot_public_key())
+    }
+
+    pub fn watchtower_challenge_connector(
+        &self,
+        watchtower_index: usize,
+    ) -> Result<WatchtowerChallengeConnector> {
+        let watchtower_taproot_public_key = self
+            .watchtower_pubkeys
+            .get(watchtower_index)
+            .ok_or_else(|| anyhow::anyhow!("invalid watchtower index {watchtower_index}"))?;
+        Ok(WatchtowerChallengeConnector::new(
+            self.network(),
+            &self.operator_taproot_public_key(),
+            watchtower_taproot_public_key,
+        ))
+    }
+
+    pub fn watchtower_challenge_connectors(&self) -> Vec<WatchtowerChallengeConnector> {
+        self.watchtower_pubkeys
+            .iter()
+            .map(|pubkey| {
+                WatchtowerChallengeConnector::new(
+                    self.network(),
+                    &self.operator_taproot_public_key(),
+                    pubkey,
+                )
+            })
+            .collect()
+    }
+
+    pub fn ack_connector(&self, watchtower_index: usize) -> Result<AckConnector> {
+        let hashlock = self
+            .watchtower_ack_hashlocks
+            .get(watchtower_index)
+            .ok_or_else(|| anyhow::anyhow!("invalid watchtower index {watchtower_index}"))?;
+        Ok(AckConnector::new(self.network(), &self.n_of_n_taproot_public_key(), *hashlock))
+    }
+
+    pub fn ack_connectors(&self) -> Vec<AckConnector> {
+        self.watchtower_ack_hashlocks
+            .iter()
+            .map(|hashlock| {
+                AckConnector::new(self.network(), &self.n_of_n_taproot_public_key(), *hashlock)
+            })
+            .collect()
+    }
+
+    pub fn verifier_connector(&self, verifier_index: usize) -> Result<VerifierConnector> {
+        let gc_data = self
+            .gc_data
+            .get(verifier_index)
+            .ok_or_else(|| anyhow::anyhow!("invalid verifier index {verifier_index}"))?;
+        Ok(VerifierConnector::new(
+            self.network(),
+            &self.n_of_n_taproot_public_key(),
+            &self.operator_assert_wots_pubkey,
+            gc_data.wire_hashes.clone(),
+        ))
+    }
+
+    pub fn verifier_connectors(&self) -> Vec<VerifierConnector> {
+        self.gc_data
+            .iter()
+            .map(|data| {
+                VerifierConnector::new(
+                    self.network(),
+                    &self.n_of_n_taproot_public_key(),
+                    &self.operator_assert_wots_pubkey,
+                    data.wire_hashes.clone(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn prover_connector(&self, verifier_index: usize) -> Result<ProverConnector> {
+        let gc_data = self
+            .gc_data
+            .get(verifier_index)
+            .ok_or_else(|| anyhow::anyhow!("invalid verifier index {verifier_index}"))?;
+        Ok(ProverConnector::new(
+            self.network(),
+            self.n_of_n_taproot_public_key(),
+            gc_data.final_msg_hashlocks.clone(),
+        ))
+    }
+
+    pub fn prover_connectors(&self) -> Vec<ProverConnector> {
+        self.gc_data
+            .iter()
+            .map(|data| {
+                ProverConnector::new(
+                    self.network(),
+                    self.n_of_n_taproot_public_key(),
+                    data.final_msg_hashlocks.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub fn get_operator_context(&self, operator_keypair: Keypair) -> Result<OperatorContext> {
         let network = self.instance_parameters.network;
         let operator_public_key = self.operator_pubkey;
@@ -307,6 +517,69 @@ impl BitvmGcGraph {
     }
     pub fn committee_pre_signed(&self) -> bool {
         self.committee_pre_signed
+    }
+    pub fn connector_0(&self) -> Connector0 {
+        self.parameters.connector_0()
+    }
+    pub fn connector_z(&self) -> ConnectorZ {
+        self.parameters.connector_z()
+    }
+    pub fn prekickoff_connector(&self) -> PrekickoffConnector {
+        self.parameters.prekickoff_connector()
+    }
+    pub fn force_skip_connector(&self) -> ForceSkipConnector {
+        self.parameters.force_skip_connector()
+    }
+    pub fn kickoff_connector(&self) -> KickoffConnector {
+        self.parameters.kickoff_connector()
+    }
+    pub fn connector_a(&self) -> ConnectorA {
+        self.parameters.connector_a()
+    }
+    pub fn connector_b(&self) -> ConnectorB {
+        self.parameters.connector_b()
+    }
+    pub fn connector_c(&self) -> ConnectorC {
+        self.parameters.connector_c()
+    }
+    pub fn connector_d(&self) -> ConnectorD {
+        self.parameters.connector_d()
+    }
+    pub fn connector_e(&self) -> ConnectorE {
+        self.parameters.connector_e()
+    }
+    pub fn connector_f(&self) -> ConnectorF {
+        self.parameters.connector_f()
+    }
+    pub fn guardian_connector(&self) -> GuardianConnector {
+        self.parameters.guardian_connector()
+    }
+    pub fn ack_connector(&self, watchtower_index: usize) -> Result<AckConnector> {
+        self.parameters.ack_connector(watchtower_index)
+    }
+    pub fn ack_connectors(&self) -> Vec<AckConnector> {
+        self.parameters.ack_connectors()
+    }
+    pub fn watchtower_challenge_connector(
+        &self,
+        watchtower_index: usize,
+    ) -> Result<WatchtowerChallengeConnector> {
+        self.parameters.watchtower_challenge_connector(watchtower_index)
+    }
+    pub fn watchtower_challenge_connectors(&self) -> Vec<WatchtowerChallengeConnector> {
+        self.parameters.watchtower_challenge_connectors()
+    }
+    pub fn verifier_connector(&self, verifier_index: usize) -> Result<VerifierConnector> {
+        self.parameters.verifier_connector(verifier_index)
+    }
+    pub fn verifier_connectors(&self) -> Vec<VerifierConnector> {
+        self.parameters.verifier_connectors()
+    }
+    pub fn prover_connector(&self, verifier_index: usize) -> Result<ProverConnector> {
+        self.parameters.prover_connector(verifier_index)
+    }
+    pub fn prover_connectors(&self) -> Vec<ProverConnector> {
+        self.parameters.prover_connectors()
     }
     pub fn to_simplified(&self) -> Result<SimplifiedBitvmGcGraph> {
         fn extract_sig_from_witness(witness: &Witness) -> Result<bitcoin::taproot::Signature> {

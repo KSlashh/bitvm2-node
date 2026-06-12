@@ -1,15 +1,6 @@
 use anyhow::{Result, bail, ensure};
 use bitcoin::XOnlyPublicKey;
 use bitcoin::{PublicKey, Transaction, key::Keypair, taproot::Signature as TaprootSignature};
-use goat::connectors::assert_connectors::ProverConnector;
-use goat::connectors::connector_0::Connector0;
-use goat::connectors::connector_a::ConnectorA;
-use goat::connectors::connector_c::ConnectorC;
-use goat::connectors::connector_d::ConnectorD;
-use goat::connectors::connector_e::ConnectorE;
-use goat::connectors::connector_f::ConnectorF;
-use goat::connectors::connector_z::ConnectorZ;
-use goat::connectors::watchtower_connectors::AckConnector;
 use goat::contexts::base::generate_n_of_n_public_key;
 use goat::transactions::base::BaseTransaction;
 use goat::transactions::pre_signed_musig2::{get_nonce_message, verify_public_nonce};
@@ -71,11 +62,7 @@ pub fn agg_and_push_pegin_confirm_sigs(
         .map_err(|e| {
             anyhow::anyhow!("fail to aggregate pegin confirm {}: {e}", pegin_confirm.name())
         })?;
-    let connector_z = ConnectorZ::new(
-        graph.parameters.instance_parameters.network,
-        &XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey),
-        &graph.parameters.instance_parameters.user_info.user_xonly_pubkey,
-    );
+    let connector_z = graph.parameters.instance_parameters.connector_z();
     pegin_confirm.push_input_0_signature(&connector_z, agg_sig);
     Ok(pegin_confirm.finalize())
 }
@@ -422,33 +409,13 @@ pub fn push_committee_pre_signatures(
     };
     sigs.validate_length(watchtower_num, verifier_num)?;
 
-    let network = graph.parameters.instance_parameters.network;
-    let n_of_n_taproot_public_key =
-        XOnlyPublicKey::from(graph.parameters.instance_parameters.committee_agg_pubkey);
-    let operator_taproot_public_key = XOnlyPublicKey::from(graph.parameters.operator_pubkey);
-    let connector_0 = Connector0::new(network, &n_of_n_taproot_public_key);
-    let connector_a =
-        ConnectorA::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
-    let connector_c = ConnectorC::new(
-        network,
-        &n_of_n_taproot_public_key,
-        &graph.parameters.operator_assert_wots_pubkey,
-    );
-    let connector_d =
-        ConnectorD::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
-    let connector_e = ConnectorE::new(
-        network,
-        &n_of_n_taproot_public_key,
-        &graph.parameters.operator_commit_pubin_wots_pubkey,
-    );
-    let connector_f =
-        ConnectorF::new(network, &operator_taproot_public_key, &n_of_n_taproot_public_key);
-    let ack_connectors = graph
-        .parameters
-        .watchtower_ack_hashlocks
-        .iter()
-        .map(|hashlock| AckConnector::new(network, &n_of_n_taproot_public_key, *hashlock))
-        .collect::<Vec<_>>();
+    let connector_0 = graph.parameters.connector_0();
+    let connector_a = graph.connector_a();
+    let connector_c = graph.connector_c();
+    let connector_d = graph.connector_d();
+    let connector_e = graph.connector_e();
+    let connector_f = graph.connector_f();
+    let ack_connectors = graph.ack_connectors();
 
     // take1
     graph.take1.push_pre_sigs(&connector_0, &connector_c, sigs.take1.clone().try_into().unwrap());
@@ -484,14 +451,10 @@ pub fn push_committee_pre_signatures(
     );
 
     // disprove
+    let prover_connectors = graph.parameters.prover_connectors();
     for (i, disprove_tx) in graph.disproves.iter_mut().enumerate() {
-        let prover_connector = ProverConnector::new(
-            network,
-            n_of_n_taproot_public_key,
-            graph.parameters.gc_data[i].final_msg_hashlocks.clone(),
-        );
         disprove_tx.push_pre_sigs(
-            &prover_connector,
+            &prover_connectors[i],
             &connector_d,
             sigs.disprove[i * 2..(i * 2 + 2)].try_into().unwrap(),
         );

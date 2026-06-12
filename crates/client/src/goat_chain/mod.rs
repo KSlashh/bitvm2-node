@@ -376,7 +376,6 @@ impl GOATClient {
                     DisproveTxType::QuickChallenge
                         | DisproveTxType::ChallengeIncompleteKickoff
                         | DisproveTxType::PubinDisprove
-                        | DisproveTxType::WatchtowerChallengeTimeout
                         | DisproveTxType::OperatorChallengeNack
                         | DisproveTxType::OperatorCommitTimeout
                 ) {

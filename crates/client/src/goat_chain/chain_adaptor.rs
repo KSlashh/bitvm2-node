@@ -278,7 +278,6 @@ pub enum DisproveTxType {
     QuickChallenge,
     ChallengeIncompleteKickoff,
     PubinDisprove,
-    WatchtowerChallengeTimeout,
     OperatorChallengeNack,
     OperatorCommitTimeout,
 }
