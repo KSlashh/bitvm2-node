@@ -135,7 +135,6 @@ pub struct NonceGeneration {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub committee_pubkey: PublicKey,
-    pub verifier_num: usize,
     pub pub_nonces: CommitteePubNonces,
     pub nonce_sigs: CommitteeNonceSignatures,
 }
@@ -225,7 +224,6 @@ pub struct WatchtowerChallengeTimeout {
 pub struct NackReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub watchtower_index: usize,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct OperatorCommitPubinReady {

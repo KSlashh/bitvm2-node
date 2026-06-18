@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Transaction, TxIn, key::Keypair};
 use bitcoin::{Network, PublicKey, Witness};
 use goat::assert_scripts::{
-    Label, OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
+    OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
     OperatorCommitPubinSecretKey,
 };
 use goat::constants::{CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK};
@@ -571,7 +571,7 @@ pub fn operator_sign_assert(
 pub fn operator_sign_wrongly_challenged(
     graph: &BitvmGcGraph,
     verifier_index: usize,
-    final_msgs: &[Label],
+    final_msg: &[u8],
 ) -> Result<(TxIn, Amount)> {
     if verifier_index >= graph.verifier_asserts.len() {
         bail!("invalid verifier index {verifier_index}".to_string())
@@ -582,7 +582,8 @@ pub fn operator_sign_wrongly_challenged(
         .prover_connector_input()
         .map_err(|e| anyhow::anyhow!("failed to get prover connector input: {e}"))?;
 
-    wrongly_challenged(&prover_connector, &input, final_msgs)
+    let final_msg = final_msg.to_vec();
+    wrongly_challenged(&prover_connector, &input, &final_msg)
         .map(|txin| (txin, input.amount))
         .map_err(|e| anyhow::anyhow!("failed to sign wrongly challenged: {e}"))
 }

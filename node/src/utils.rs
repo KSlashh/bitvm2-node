@@ -46,7 +46,7 @@ use goat::connectors::{
     kickoff_connectors::{ForceSkipConnector, KickoffConnector, PrekickoffConnector},
 };
 use goat::contexts::base::generate_n_of_n_public_key;
-use goat::scripts::generate_opreturn_script;
+use goat::scripts::{generate_opreturn_script, p2a_output};
 use goat::transactions::base::{Input, output_topology};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::prekickoff::PrekickoffTransaction;
@@ -159,8 +159,7 @@ pub mod todo_funcs {
         // todo!("get min required watchtower number")
         1
     }
-    #[inline]
-    pub fn verifier_num() -> usize {
+    pub fn min_required_verifier() -> usize {
         // todo!("get verifier num")
         1
     }
@@ -355,7 +354,7 @@ pub mod todo_funcs {
         Amount::from_sat(500000)
     }
     pub fn min_prekickoff_input_amount() -> Amount {
-        Amount::from_sat(100000)
+        Amount::from_sat(200000)
     }
     pub fn challenge_amount() -> Amount {
         Amount::from_sat(20000)
@@ -989,8 +988,6 @@ async fn scan_graph_chain_state(
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let take1_txid = graph.take1.tx().compute_txid();
     let take2_txid = graph.take2.tx().compute_txid();
-    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let operator_assert_txid = graph.operator_assert.tx().compute_txid();
 
     // check if Graph has been posted on GoatChain
     if current_status == GraphStatus::CommitteePresigned {
@@ -1117,6 +1114,16 @@ async fn scan_graph_chain_state(
         }
     }
 
+    if current_status == GraphStatus::Challenge && challenge_txid.is_none() {
+        let connector_a = connector_a_outpoint(graph)?;
+        if let Some(spent_txid) =
+            outpoint_spent_txid(btc_client, &connector_a.txid, connector_a.vout as u64).await?
+            && spent_txid != take1_txid
+        {
+            challenge_txid = Some(spent_txid);
+        }
+    }
+
     let mut watchtower_challenge_init_on_chain = false;
     let mut operator_assert_on_chain = false;
     if current_status == GraphStatus::Challenge {
@@ -1133,8 +1140,29 @@ async fn scan_graph_chain_state(
             });
         }
 
+        let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
         watchtower_challenge_init_on_chain =
             tx_on_chain(btc_client, &watchtower_challenge_init_txid).await?;
+        if watchtower_challenge_init_on_chain {
+            for watchtower_index in 0..watchtower_num {
+                let watchtower_vout =
+                    output_topology::watchtower_challenge_init::watchtower_connector(
+                        watchtower_index,
+                    ) as u64;
+                let spent = outpoint_spent_txid(
+                    btc_client,
+                    &watchtower_challenge_init_txid,
+                    watchtower_vout,
+                )
+                .await?
+                .is_some();
+                if let Some(status) =
+                    sub_status.watchtower_challenge_status.get_mut(watchtower_index)
+                {
+                    *status = spent;
+                }
+            }
+        }
         if !watchtower_challenge_init_on_chain {
             return Ok(GraphChainScan {
                 status: current_status,
@@ -1145,21 +1173,7 @@ async fn scan_graph_chain_state(
                 disprove: None,
             });
         }
-        for watchtower_index in 0..watchtower_num {
-            let watchtower_challenge_vout =
-                output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
-                    as u64;
-            if outpoint_spent_txid(
-                btc_client,
-                &watchtower_challenge_init_txid,
-                watchtower_challenge_vout,
-            )
-            .await?
-            .is_some()
-            {
-                sub_status.watchtower_challenge_status[watchtower_index] = true;
-            }
-        }
+        let operator_assert_txid = graph.operator_assert.tx().compute_txid();
         operator_assert_on_chain = tx_on_chain(btc_client, &operator_assert_txid).await?;
         if !operator_assert_on_chain {
             return Ok(GraphChainScan {
@@ -2436,6 +2450,36 @@ pub async fn build_cpfp_txns(
     }
 }
 
+pub async fn broadcast_tx_with_cpfp(
+    btc_client: &BTCClient,
+    parent_tx: Transaction,
+    parent_tx_total_input_amount: Amount,
+) -> Result<()> {
+    let anchor_output = p2a_output();
+    let anchor_vout = parent_tx
+        .output
+        .iter()
+        .position(|output| output == &anchor_output)
+        .ok_or_else(|| anyhow!("cannot CPFP transaction without a P2A anchor output"))?;
+    if let Some(duplicate_vout) = parent_tx
+        .output
+        .iter()
+        .enumerate()
+        .skip(anchor_vout + 1)
+        .find_map(|(vout, output)| if output == &anchor_output { Some(vout) } else { None })
+    {
+        bail!("transaction has multiple P2A anchor outputs at {anchor_vout} and {duplicate_vout}");
+    };
+    let child_tx =
+        build_cpfp_txns(btc_client, &parent_tx, anchor_vout as u64, parent_tx_total_input_amount)
+            .await?;
+    match child_tx {
+        Some(tx) => broadcast_package(btc_client, &[parent_tx, tx], true).await?,
+        None => broadcast_tx(btc_client, &parent_tx).await?,
+    };
+    Ok(())
+}
+
 /// Returns:
 /// - `Ok(None)` if given address does not have enough btc,
 /// - `Ok(Some((utxos, fee_amount, change_amount)))`
@@ -2630,7 +2674,7 @@ pub async fn build_genesis_prekickoff_tx(
     goat_client: &GOATClient,
 ) -> Result<PrekickoffTransaction> {
     let watchtower_num = goat_client.committee_mana_get_watchtowers().await?.len();
-    let verifier_num = todo_funcs::verifier_num();
+    let verifier_num = todo_funcs::min_required_verifier();
     let network = get_network();
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let node_keypair = operator_master_key.master_keypair();

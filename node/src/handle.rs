@@ -12,7 +12,7 @@ use crate::soldering_payload_store::{
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use bitcoin::{OutPoint, Txid};
+use bitcoin::{Amount, OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
@@ -241,7 +241,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 instance_id,
                 graph_id,
                 committee_pubkey: received_committee_pubkey,
-                verifier_num,
                 pub_nonces,
                 nonce_sigs,
             }),
@@ -252,7 +251,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *instance_id,
                 *graph_id,
                 received_committee_pubkey,
-                *verifier_num,
                 pub_nonces,
                 nonce_sigs,
                 content,
@@ -264,7 +262,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 instance_id,
                 graph_id,
                 committee_pubkey: received_committee_pubkey,
-                verifier_num,
                 pub_nonces,
                 nonce_sigs,
             }),
@@ -275,7 +272,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *instance_id,
                 *graph_id,
                 received_committee_pubkey,
-                *verifier_num,
                 pub_nonces,
                 nonce_sigs,
             )
@@ -476,12 +472,8 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             handle_watchtower_challenge_timeout_operator(ctx, *instance_id, *graph_id, content)
                 .await
         }
-        (
-            GOATMessageContent::NackReady(NackReady { instance_id, graph_id, watchtower_index }),
-            Actor::Verifier,
-        ) => {
-            handle_nack_ready_verifier(ctx, *instance_id, *graph_id, *watchtower_index, content)
-                .await
+        (GOATMessageContent::NackReady(NackReady { instance_id, graph_id }), Actor::Verifier) => {
+            handle_nack_ready_verifier(ctx, *instance_id, *graph_id, content).await
         }
         (
             GOATMessageContent::OperatorCommitPubinReady(OperatorCommitPubinReady {
@@ -629,14 +621,14 @@ fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> 
     if state.frozen_verifier_pubkeys.is_some() {
         return Ok(());
     }
-    if state.candidates.len() < todo_funcs::verifier_num() {
+    if state.candidates.len() < todo_funcs::min_required_verifier() {
         bail!(
             "cannot freeze {} verifier candidates before reaching target {}",
             state.candidates.len(),
-            todo_funcs::verifier_num()
+            todo_funcs::min_required_verifier()
         );
     }
-    state.candidates.truncate(todo_funcs::verifier_num());
+    state.candidates.truncate(todo_funcs::min_required_verifier());
     state.candidates.sort_by_key(|candidate| candidate.verifier_pubkey.to_bytes());
     for (verifier_index, candidate) in state.candidates.iter_mut().enumerate() {
         candidate.verifier_index = Some(verifier_index);
@@ -742,6 +734,26 @@ fn validate_verifier_slot(graph: &BitvmGcGraph, verifier_index: usize) -> Result
         graph.verifier_asserts.len(),
         graph.disproves.len(),
     )
+}
+
+fn validate_watchtower_branches(graph: &BitvmGcGraph) -> Result<usize> {
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    if watchtower_num == 0 {
+        bail!("graph has no watchtower slots");
+    }
+    if graph.parameters.watchtower_ack_hashlocks.len() != watchtower_num
+        || graph.watchtower_challenge_timeouts.len() != watchtower_num
+        || graph.operator_challenge_nacks.len() != watchtower_num
+    {
+        bail!(
+            "graph watchtower branch lengths differ: watchtowers={}, ack_hashlocks={}, timeouts={}, nacks={}",
+            watchtower_num,
+            graph.parameters.watchtower_ack_hashlocks.len(),
+            graph.watchtower_challenge_timeouts.len(),
+            graph.operator_challenge_nacks.len()
+        );
+    }
+    Ok(watchtower_num)
 }
 
 fn find_verifier_index_by_pubkey(
@@ -1294,7 +1306,7 @@ async fn handle_gen_circuits_operator(
     }
 
     if operator_state.frozen_verifier_pubkeys.is_none()
-        && operator_state.candidates.len() < todo_funcs::verifier_num()
+        && operator_state.candidates.len() < todo_funcs::min_required_verifier()
     {
         save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
 
@@ -1800,7 +1812,6 @@ async fn handle_create_graph_committee(
         instance_id,
         graph_id,
         committee_pubkey: local_committee_pubkey,
-        verifier_num,
         pub_nonces: pub_nonces.clone(),
         nonce_sigs,
     });
@@ -1853,14 +1864,12 @@ async fn handle_create_graph_committee(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_nonce_generation_committee(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
     received_committee_pubkey: &PublicKey,
-    verifier_num: usize,
     pub_nonces: &CommitteePubNonces,
     nonce_sigs: &CommitteeNonceSignatures,
     content: &GOATMessageContent,
@@ -1987,14 +1996,12 @@ async fn handle_nonce_generation_committee(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_nonce_generation_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
     received_committee_pubkey: &PublicKey,
-    verifier_num: usize,
     pub_nonces: &CommitteePubNonces,
     nonce_sigs: &CommitteeNonceSignatures,
 ) -> Result<()> {
@@ -3308,20 +3315,85 @@ async fn handle_watchtower_challenge_sent_operator(
     content: &GOATMessageContent,
 ) -> Result<()> {
     let message = make_message(ctx, content);
-    let _graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
+    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
+        ctx,
         instance_id,
         graph_id,
-        &message,
+        Some(&message),
+        GraphStatus::Challenge,
     )
     .await?
     {
-        Some(graph) => graph,
+        Some(v) => v,
         None => return Ok(()),
     };
-    todo!("operator send ack")
+    if graph_status != GraphStatus::Challenge {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+        );
+        return Ok(());
+    }
+    let watchtower_num = validate_watchtower_branches(&graph)?;
+    if watchtower_index >= watchtower_num {
+        bail!("watchtower index {watchtower_index} out of range for {watchtower_num} slots");
+    }
+
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let watchtower_vout =
+        output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index) as u64;
+    let Some((watchtower_spent_txid, watchtower_vin, _txin)) =
+        outpoint_spent_txin(ctx.btc_client, &watchtower_challenge_init_txid, watchtower_vout)
+            .await?
+    else {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower connector {watchtower_index} is not spent yet"
+        );
+        return Ok(());
+    };
+    if watchtower_vin != 0 {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower connector {watchtower_index} was spent by tx {watchtower_spent_txid} at unexpected input index {watchtower_vin}"
+        );
+        return Ok(());
+    }
+    let timeout_txid = graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid();
+    if watchtower_spent_txid == timeout_txid {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower connector {watchtower_index} was spent by timeout tx {timeout_txid}"
+        );
+        return Ok(());
+    }
+
+    let ack_vout =
+        output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
+    if let Some(spent_txid) =
+        outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout).await?
+    {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: ack connector {watchtower_index} already spent by {spent_txid}"
+        );
+        return Ok(());
+    }
+
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let preimage = operator_master_key.preimage_for_graph(graph_id, watchtower_index);
+    let ack_connector_input = graph
+        .watchtower_challenge_init
+        .ack_connector_input(watchtower_index)
+        .map_err(|e| anyhow!("failed to get ack connector input: {e}"))?;
+    let ack_input = operator_sign_challenge_ack(&graph, watchtower_index, &preimage)?;
+    let ack_txid = build_sign_and_broadcast_tx(
+        ctx.btc_client,
+        operator_master_key.master_keypair(),
+        vec![ack_input],
+        ack_connector_input.amount,
+        vec![goat::scripts::p2a_output()],
+    )
+    .await?;
+    tracing::info!(
+        "Operator challenge ACK sent for {instance_id}:{graph_id}: watchtower_index={watchtower_index}, txid={ack_txid}"
+    );
+    Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -3332,45 +3404,152 @@ async fn handle_watchtower_challenge_timeout_operator(
     content: &GOATMessageContent,
 ) -> Result<()> {
     let message = make_message(ctx, content);
-    let _graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
+    let (mut graph, graph_status, _graph_sub_status) = match refresh_graph_status(
+        ctx,
         instance_id,
         graph_id,
-        &message,
+        Some(&message),
+        GraphStatus::Challenge,
     )
     .await?
     {
-        Some(graph) => graph,
+        Some(v) => v,
         None => return Ok(()),
     };
-    todo!("operator send watchtower-challenge-timeout")
+    if graph_status != GraphStatus::Challenge {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+        );
+        return Ok(());
+    }
+
+    let watchtower_num = validate_watchtower_branches(&graph)?;
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    for watchtower_index in 0..watchtower_num {
+        let watchtower_vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                as u64;
+        let ack_vout =
+            output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
+        if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, watchtower_vout)
+            .await?
+            .is_some()
+            || outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout)
+                .await?
+                .is_some()
+        {
+            continue;
+        }
+
+        let timeout_tx = operator_sign_watchtower_challenge_timeout(
+            operator_master_key.master_keypair(),
+            &mut graph,
+            watchtower_index,
+        )?;
+        if tx_on_chain(ctx.btc_client, &timeout_tx.compute_txid()).await? {
+            continue;
+        }
+        let timeout_txid = timeout_tx.compute_txid();
+        let timeout_tx_total_input_amount = graph.watchtower_challenge_timeouts[watchtower_index]
+            .prev_outs()
+            .iter()
+            .map(|o| o.value)
+            .sum::<Amount>();
+        broadcast_tx_with_cpfp(ctx.btc_client, timeout_tx, timeout_tx_total_input_amount).await?;
+        tracing::info!(
+            "Watchtower challenge timeout sent for {instance_id}:{graph_id}: watchtower_index={watchtower_index}, txid={timeout_txid}"
+        );
+    }
+    Ok(())
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id, watchtower_index = watchtower_index))]
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_nack_ready_verifier(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    watchtower_index: usize,
     content: &GOATMessageContent,
 ) -> Result<()> {
     let message = make_message(ctx, content);
-    let _graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
+    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
+        ctx,
         instance_id,
         graph_id,
-        &message,
+        Some(&message),
+        GraphStatus::Challenge,
     )
     .await?
     {
-        Some(graph) => graph,
+        Some(v) => v,
         None => return Ok(()),
     };
-    todo!("verifier send nack")
+    if graph_status != GraphStatus::Challenge {
+        tracing::warn!(
+            "Ignore NackReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+        );
+        return Ok(());
+    }
+    let watchtower_num = validate_watchtower_branches(&graph)?;
+
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let connector_f_vout =
+        output_topology::watchtower_challenge_init::connector_f(watchtower_num) as u64;
+    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_f_vout)
+        .await?
+        .is_some()
+    {
+        tracing::warn!("Ignore NackReady for {instance_id}:{graph_id}: connector-F already spent");
+        return Ok(());
+    }
+
+    for watchtower_index in 0..watchtower_num {
+        let watchtower_vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                as u64;
+        let Some(watchtower_spent_txid) =
+            outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, watchtower_vout)
+                .await?
+        else {
+            continue;
+        };
+
+        let timeout_txid =
+            graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid();
+        if watchtower_spent_txid == timeout_txid {
+            continue;
+        }
+
+        let ack_vout =
+            output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
+        if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+
+        let nack = graph
+            .operator_challenge_nacks
+            .get(watchtower_index)
+            .ok_or_else(|| anyhow!("invalid watchtower index {watchtower_index}"))?;
+        let nack_tx = nack.tx().clone();
+        let nack_txid = nack_tx.compute_txid();
+        if tx_on_chain(ctx.btc_client, &nack_txid).await? {
+            return Ok(());
+        }
+        let nack_tx_total_input_amount = nack.prev_outs().iter().map(|o| o.value).sum::<Amount>();
+        broadcast_tx_with_cpfp(ctx.btc_client, nack_tx, nack_tx_total_input_amount).await?;
+        tracing::info!(
+            "Operator challenge NACK sent for {instance_id}:{graph_id}: watchtower_index={watchtower_index}, txid={nack_txid}"
+        );
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "Ignore NackReady for {instance_id}:{graph_id}: no watchtower branch is ready for NACK"
+    );
+    Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -3381,20 +3560,18 @@ async fn handle_operator_commit_pubin_ready_operator(
     content: &GOATMessageContent,
 ) -> Result<()> {
     let message = make_message(ctx, content);
-    let _graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        &message,
-    )
-    .await?
-    {
-        Some(graph) => graph,
-        None => return Ok(()),
+    let Some((_graph, graph_status, _graph_sub_status)) =
+        refresh_graph_status(ctx, instance_id, graph_id, Some(&message), GraphStatus::Challenge)
+            .await?
+    else {
+        return Ok(());
     };
-    todo!("operator send operator-commit-pubin")
+    // TODO(gc-v2): build operator-commit-pubin after pubin commitment data is wired.
+    // It is not pre-signed, so add a funding input for fees and broadcast it normally.
+    tracing::warn!(
+        "OperatorCommitPubinReady for {instance_id}:{graph_id} is not implemented yet; graph status is {graph_status:?}"
+    );
+    Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -3405,20 +3582,56 @@ async fn handle_operator_commit_pubin_timeout_verifier(
     content: &GOATMessageContent,
 ) -> Result<()> {
     let message = make_message(ctx, content);
-    let _graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
+    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
+        ctx,
         instance_id,
         graph_id,
-        &message,
+        Some(&message),
+        GraphStatus::Challenge,
     )
     .await?
     {
-        Some(graph) => graph,
+        Some(v) => v,
         None => return Ok(()),
     };
-    todo!("verifier send operator-commit-pubin-timeout")
+    if graph_status != GraphStatus::Challenge {
+        tracing::warn!(
+            "Ignore OperatorCommitPubinTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+        );
+        return Ok(());
+    }
+
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    let connector_e_vout =
+        output_topology::watchtower_challenge_init::connector_e(watchtower_num) as u64;
+    let connector_f_vout =
+        output_topology::watchtower_challenge_init::connector_f(watchtower_num) as u64;
+    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_e_vout)
+        .await?
+        .is_some()
+        || outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_f_vout)
+            .await?
+            .is_some()
+    {
+        tracing::warn!(
+            "Ignore OperatorCommitPubinTimeout for {instance_id}:{graph_id}: timeout input already spent"
+        );
+        return Ok(());
+    }
+
+    let timeout_tx = graph.operator_commit_timeout.tx().clone();
+    let timeout_txid = timeout_tx.compute_txid();
+    if tx_on_chain(ctx.btc_client, &timeout_txid).await? {
+        return Ok(());
+    }
+    let timeout_tx_total_input_amount =
+        graph.operator_commit_timeout.prev_outs().iter().map(|o| o.value).sum::<Amount>();
+    broadcast_tx_with_cpfp(ctx.btc_client, timeout_tx, timeout_tx_total_input_amount).await?;
+    tracing::info!(
+        "Operator commit pubin timeout sent for {instance_id}:{graph_id}: txid={timeout_txid}"
+    );
+    Ok(())
 }
 
 // after the watchtower challenge flow is complete, build proof and broadcast Assert transaction.
@@ -3517,6 +3730,7 @@ async fn handle_assert_sent_verifier(
         return Ok(());
     };
     let Some(assert_witness) = assert_witness else {
+        // TODO(gc-v2): recover BabeAssertWitness from the assert tx witness and graph.
         tracing::warn!(
             "Ignore AssertSent for {instance_id}:{graph_id}: assert witness is not available in message"
         );
@@ -3612,6 +3826,7 @@ async fn handle_challenge_assert_sent_operator(
             None => return Ok(()),
         };
     let Some(challenge_witness) = challenge_witness else {
+        // TODO(gc-v2): recover BabeChallengeAssertWitness from the challenge tx witness and graph.
         tracing::warn!(
             "Ignore ChallengeAssertSent for {instance_id}:{graph_id}: challenge witness is not available in message"
         );
@@ -3691,11 +3906,13 @@ async fn handle_challenge_assert_sent_operator(
         .context("deserialize asserted wrapper proof")?;
     let wrongly_challenged_witness =
         recover_real_wrongly_challenged_witness(prover_state, challenge_witness, &proof)?;
-    let (wrongly_challenged_input, _amount) = operator_sign_wrongly_challenged(
-        &graph,
-        verifier_index,
-        &wrongly_challenged_witness.final_msgs,
-    )?;
+    // TODO: The wrongly-challenged script accepts any one finalized-message preimage.
+    let final_msg = wrongly_challenged_witness
+        .final_msgs
+        .first()
+        .ok_or_else(|| anyhow!("wrongly challenged witness has no final message preimage"))?;
+    let (wrongly_challenged_input, _amount) =
+        operator_sign_wrongly_challenged(&graph, verifier_index, final_msg)?;
     let wrongly_challenged_tx = bitcoin::Transaction {
         version: bitcoin::transaction::Version(2),
         lock_time: bitcoin::absolute::LockTime::ZERO,
