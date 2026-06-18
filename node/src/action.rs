@@ -8,11 +8,15 @@ use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bitcoin::{PublicKey, Txid};
-use bitvm2_lib::actors::Actor;
-use bitvm2_lib::committee::*;
-use bitvm2_lib::types::{Bitvm2Graph, SimplifiedBitvm2Graph};
+use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::{
+    BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness, BabeWronglyChallengedWitness,
+    CACSetupPackage,
+};
+use bitvm_lib::committee::*;
+use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
 use client::goat_chain::DisproveTxType;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -21,6 +25,7 @@ use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use store::MessageState;
 use store::localdb::LocalDB;
 use tracing::warn;
@@ -32,11 +37,17 @@ pub struct GOATMessage {
     pub content: GOATMessageContent,
 }
 
+const GOAT_MESSAGE_BIN_PREFIX: &[u8] = b"GOATBIN1";
+
 #[derive(Serialize, Deserialize, Clone)]
 pub enum GOATMessageContent {
     PeginRequest(PeginRequest),
     CreateGraph(CreateGraph),
     ConfirmInstance(ConfirmInstance),
+    InitGraph(InitGraph),
+    GenCircuits(GenCircuits),
+    CutCircuits(CutCircuits),
+    SolderingProofReady(SolderingProofReady),
     NonceGeneration(NonceGeneration),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
@@ -51,12 +62,13 @@ pub enum GOATMessageContent {
     WatchtowerChallengeInitSent(WatchtowerChallengeInitSent),
     WatchtowerChallengeSent(WatchtowerChallengeSent),
     WatchtowerChallengeTimeout(WatchtowerChallengeTimeout),
-    OperatorAckTimeout(OperatorAckTimeout),
-    OperatorCommitBlockHashReady(OperatorCommitBlockHashReady),
-    OperatorCommitBlockHashTimeout(OperatorCommitBlockHashTimeout),
-    AssertInitReady(AssertInitReady),
-    AssertCommitTimeout(AssertCommitTimeout),
-    DisproveReady(DisproveReady),
+    NackReady(NackReady),
+    OperatorCommitPubinReady(OperatorCommitPubinReady),
+    OperatorCommitPubinTimeout(OperatorCommitPubinTimeout),
+    AssertReady(AssertReady),
+    AssertSent(AssertSent),
+    ChallengeAssertSent(ChallengeAssertSent),
+    WronglyChallengeTimeout(WronglyChallengeTimeout),
     DisproveSent(DisproveSent),
     Take1Ready(Take1Ready),
     Take1Sent(Take1Sent),
@@ -84,19 +96,45 @@ pub struct ConfirmInstance {
     pub instance_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
+pub struct InitGraph {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GenCircuits {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_pubkey: PublicKey,
+    pub setup_package: CACSetupPackage,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CutCircuits {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_pubkey: PublicKey,
+    pub verifier_index: usize,
+    pub selected_circuit_indexes: Vec<usize>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SolderingProofReady {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub verifier_index: usize,
+    pub payload_hash: [u8; 32],
+    pub total_len: usize,
+}
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CreateGraph {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub graph_nonce: u64,
-    pub graph: SimplifiedBitvm2Graph,
+    pub graph: SimplifiedBitvmGcGraph,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NonceGeneration {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub committee_pubkey: PublicKey,
-    pub watchtower_num: usize,
-    pub assert_commit_num: usize,
     pub pub_nonces: CommitteePubNonces,
     pub nonce_sigs: CommitteeNonceSignatures,
 }
@@ -121,7 +159,7 @@ pub struct GraphFinalize {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub graph_nonce: u64,
-    pub graph: SimplifiedBitvm2Graph,
+    pub graph: SimplifiedBitvmGcGraph,
     pub endorse_sigs: Vec<(PublicKey, EvmAddress, Vec<u8>)>,
 }
 #[derive(Serialize, Deserialize, Clone)]
@@ -175,43 +213,55 @@ pub struct WatchtowerChallengeInitSent {
 pub struct WatchtowerChallengeSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub watchtower_challenge_txids: Vec<(usize, Txid)>,
+    pub watchtower_index: usize,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WatchtowerChallengeTimeout {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub watchtower_indexes: Vec<usize>,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorAckTimeout {
+pub struct NackReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorCommitBlockHashReady {
+pub struct OperatorCommitPubinReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorCommitBlockHashTimeout {
+pub struct OperatorCommitPubinTimeout {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct AssertInitReady {
+pub struct AssertReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct AssertCommitTimeout {
+pub struct AssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+    pub assert_txid: Txid,
+    pub assert_witness: Option<BabeAssertWitness>,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct DisproveReady {
+pub struct ChallengeAssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+    pub challenge_assert_txid: Txid,
+    pub verifier_index: usize,
+    pub challenge_witness: Option<BabeChallengeAssertWitness>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WronglyChallengeTimeout {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub challenge_assert_txid: Txid,
+    pub verifier_index: usize,
+    pub wrongly_challenged_witness: Option<BabeWronglyChallengedWitness>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DisproveSent {
@@ -267,7 +317,7 @@ pub struct SyncGraphRequest {
 pub struct SyncGraph {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub graph: SimplifiedBitvm2Graph,
+    pub graph: SimplifiedBitvmGcGraph,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -291,12 +341,32 @@ impl GOATMessage {
 
     pub async fn serialize_message(&self) -> Result<Vec<u8>> {
         let cloned = self.clone();
-        Ok(tokio::task::spawn_blocking(move || serde_json::to_vec(&cloned)).await??)
+        tokio::task::spawn_blocking(move || {
+            if matches!(&cloned.content, GOATMessageContent::GenCircuits(_)) {
+                let mut encoded = bincode::serialize(&cloned)
+                    .context("failed to serialize bincode GOATMessage")?;
+                let mut message = Vec::with_capacity(GOAT_MESSAGE_BIN_PREFIX.len() + encoded.len());
+                message.extend_from_slice(GOAT_MESSAGE_BIN_PREFIX);
+                message.append(&mut encoded);
+                Ok(message)
+            } else {
+                serde_json::to_vec(&cloned).context("failed to serialize legacy JSON GOATMessage")
+            }
+        })
+        .await?
     }
 
     pub async fn deserialize_message(message: &[u8]) -> Result<GOATMessage> {
         let cloned = message.to_vec();
-        Ok(tokio::task::spawn_blocking(move || serde_json::from_slice(&cloned)).await??)
+        tokio::task::spawn_blocking(move || {
+            if let Some(encoded) = cloned.strip_prefix(GOAT_MESSAGE_BIN_PREFIX) {
+                bincode::deserialize(encoded).context("failed to deserialize bincode GOATMessage")
+            } else {
+                serde_json::from_slice(&cloned)
+                    .context("failed to deserialize legacy JSON GOATMessage")
+            }
+        })
+        .await?
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -306,6 +376,7 @@ pub async fn handle_self_p2p_msg(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     http_client: &HttpAsyncClient,
+    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
     actor: Actor,
     from_peer_id: PeerId,
     id: MessageId,
@@ -332,6 +403,7 @@ pub async fn handle_self_p2p_msg(
             btc_client,
             goat_client,
             http_client,
+            soldering_builder,
             actor.clone(),
             from_peer_id,
             id.clone(),
@@ -380,6 +452,7 @@ pub async fn recv_and_dispatch(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     http_client: &HttpAsyncClient,
+    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
     actor: Actor,
     from_peer_id: PeerId,
     id: MessageId,
@@ -397,6 +470,7 @@ pub async fn recv_and_dispatch(
         btc_client,
         goat_client,
         http_client,
+        soldering_builder,
         actor,
         from_peer_id,
         id,
@@ -411,7 +485,7 @@ pub async fn try_finalize_graph(
     goat_client: &GOATClient,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: Option<&SimplifiedBitvm2Graph>,
+    graph: Option<&SimplifiedBitvmGcGraph>,
     broadcast_graph_finalize: bool,
 ) -> Result<()> {
     let endorsements =
@@ -425,12 +499,12 @@ pub async fn try_finalize_graph(
         && partial_sigs.len() == committee_pubkeys.len()
     {
         let mut graph = match graph {
-            Some(g) => Bitvm2Graph::from_simplified(g)?,
+            Some(g) => BitvmGcGraph::from_simplified(g)?,
             None => {
                 let g = get_graph(local_db, instance_id, graph_id)
                     .await?
                     .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-                Bitvm2Graph::from_simplified(&g)?
+                BitvmGcGraph::from_simplified(&g)?
             }
         };
         let pub_nonces = pub_nonoces.into_iter().map(|(_, pn)| pn).collect::<Vec<_>>();
@@ -498,7 +572,7 @@ pub(crate) async fn get_graph_or_defer(
     instance_id: Uuid,
     graph_id: Uuid,
     message: &GOATMessage,
-) -> Result<Option<SimplifiedBitvm2Graph>> {
+) -> Result<Option<SimplifiedBitvmGcGraph>> {
     match get_graph(local_db, instance_id, graph_id).await? {
         Some(g) => Ok(Some(g)),
         None => {
@@ -536,4 +610,33 @@ pub async fn try_send_sync_graph_request(
     let message = GOATMessage::new(Actor::All, message_content);
     send_to_peer(swarm, message).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soldering_proof_ready_is_descriptor_only() {
+        let ready = SolderingProofReady {
+            instance_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            graph_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            verifier_index: 3,
+            payload_hash: [0xabu8; 32],
+            total_len: 1024,
+        };
+
+        let value = serde_json::to_value(ready).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert!(object.contains_key("instance_id"));
+        assert!(object.contains_key("graph_id"));
+        assert!(object.contains_key("verifier_index"));
+        assert!(object.contains_key("payload_hash"));
+        assert!(object.contains_key("total_len"));
+        assert!(!object.contains_key("payload_path"));
+        assert!(!object.contains_key("payload"));
+        assert!(!object.contains_key("setup_package"));
+        assert!(!object.contains_key("verifier_pubkey"));
+    }
 }

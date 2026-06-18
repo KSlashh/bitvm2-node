@@ -1,30 +1,42 @@
 use crate::action::*;
 use crate::env::{
-    COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_network, get_node_goat_address, is_relayer,
+    COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
+    get_soldering_proof_payload_store_path, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
+use crate::soldering_payload_store::{
+    read_soldering_proof_store_payload, soldering_proof_payload_store_path,
+};
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
-use bitcoin::hashes::Hash;
-use bitcoin::{OutPoint, Txid};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use bitcoin::{Amount, OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
-use bitvm2_lib::actors::Actor;
-use bitvm2_lib::challenger::*;
-use bitvm2_lib::committee::*;
-use bitvm2_lib::keys::*;
-use bitvm2_lib::operator::*;
-use bitvm2_lib::types::{Bitvm2Graph, SimplifiedBitvm2Graph};
+use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::{
+    BABE_M_CC, BABE_N_CC, BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness,
+    BabeProverState, CACSetupPackage, CompactSolderingProofPayload, assert_wots_message,
+    build_assert_witness, build_real_challenge_assert_witness, build_real_setup_package,
+    derive_finalized_indices, expand_compact_soldering_proof_payload, extract_gc_circuit_data,
+    open_real_setup_and_solder, recover_real_wrongly_challenged_witness, verify_real_setup,
+};
+use bitvm_lib::committee::*;
+use bitvm_lib::keys::*;
+use bitvm_lib::operator::*;
+use bitvm_lib::types::{BitvmGcCircuitData, BitvmGcGraph, SimplifiedBitvmGcGraph};
+use bitvm_lib::verifier::*;
 use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::connectors::connector_z::ConnectorZ;
-use goat::transactions::base::{BaseTransaction, Input};
+use goat::transactions::base::output_topology;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm};
+use std::sync::Arc;
 use store::GraphStatus;
 use store::localdb::LocalDB;
 use uuid::Uuid;
@@ -35,6 +47,7 @@ pub struct HandlerContext<'a> {
     pub btc_client: &'a BTCClient,
     pub goat_client: &'a GOATClient,
     pub http_client: &'a HttpAsyncClient,
+    pub soldering_builder: &'a Option<Arc<BabeBundleBuilder>>,
     pub actor: Actor,
     pub from_peer_id: PeerId,
     pub id: MessageId,
@@ -158,6 +171,67 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         (GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id }), _) => {
             handle_confirm_instance_default(ctx, *instance_id).await
         }
+        (GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id }), Actor::Verifier) => {
+            handle_init_graph_verifier(ctx, *instance_id, *graph_id).await
+        }
+        (
+            GOATMessageContent::GenCircuits(GenCircuits {
+                instance_id,
+                graph_id,
+                verifier_pubkey,
+                setup_package,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_gen_circuits_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                verifier_pubkey,
+                setup_package,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::CutCircuits(CutCircuits {
+                instance_id,
+                graph_id,
+                verifier_pubkey,
+                verifier_index,
+                selected_circuit_indexes,
+            }),
+            Actor::Verifier,
+        ) => {
+            handle_cut_circuits_verifier(
+                ctx,
+                *instance_id,
+                *graph_id,
+                verifier_pubkey,
+                *verifier_index,
+                selected_circuit_indexes,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::SolderingProofReady(SolderingProofReady {
+                instance_id,
+                graph_id,
+                verifier_index,
+                payload_hash,
+                total_len,
+            }),
+            Actor::Operator,
+        ) => {
+            handle_soldering_proof_ready_operator(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *verifier_index,
+                *payload_hash,
+                *total_len,
+            )
+            .await
+        }
         (
             GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph, .. }),
             Actor::Committee,
@@ -167,8 +241,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 instance_id,
                 graph_id,
                 committee_pubkey: received_committee_pubkey,
-                watchtower_num,
-                assert_commit_num,
                 pub_nonces,
                 nonce_sigs,
             }),
@@ -179,8 +251,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *instance_id,
                 *graph_id,
                 received_committee_pubkey,
-                *watchtower_num,
-                *assert_commit_num,
                 pub_nonces,
                 nonce_sigs,
                 content,
@@ -192,8 +262,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 instance_id,
                 graph_id,
                 committee_pubkey: received_committee_pubkey,
-                watchtower_num,
-                assert_commit_num,
                 pub_nonces,
                 nonce_sigs,
             }),
@@ -204,8 +272,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *instance_id,
                 *graph_id,
                 received_committee_pubkey,
-                *watchtower_num,
-                *assert_commit_num,
                 pub_nonces,
                 nonce_sigs,
             )
@@ -343,15 +409,15 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         ) => handle_kickoff_sent_committee(ctx, *instance_id, *graph_id, content).await,
         (
             GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
-            Actor::Challenger,
-        ) => handle_kickoff_sent_challenger(ctx, *instance_id, *graph_id, content).await,
+            Actor::Verifier,
+        ) => handle_kickoff_sent_verifier(ctx, *instance_id, *graph_id, content).await,
         (GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }), _) => {
             handle_kickoff_sent_default(ctx, *instance_id, *graph_id, content).await
         }
         (
             GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
-            Actor::Challenger,
-        ) => handle_prekickoff_sent_challenger(ctx, *instance_id, *graph_id, content).await,
+            Actor::Verifier,
+        ) => handle_prekickoff_sent_verifier(ctx, *instance_id, *graph_id, content).await,
         (GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }), _) => {
             handle_prekickoff_sent_default(ctx, *instance_id, *graph_id).await
         }
@@ -383,7 +449,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
                 instance_id,
                 graph_id,
-                watchtower_challenge_txids,
+                watchtower_index,
             }),
             Actor::Operator,
         ) => {
@@ -391,7 +457,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 ctx,
                 *instance_id,
                 *graph_id,
-                watchtower_challenge_txids,
+                *watchtower_index,
                 content,
             )
             .await
@@ -400,60 +466,92 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             GOATMessageContent::WatchtowerChallengeTimeout(WatchtowerChallengeTimeout {
                 instance_id,
                 graph_id,
-                watchtower_indexes,
             }),
             Actor::Operator,
         ) => {
-            handle_watchtower_challenge_timeout_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                watchtower_indexes,
-                content,
-            )
-            .await
+            handle_watchtower_challenge_timeout_operator(ctx, *instance_id, *graph_id, content)
+                .await
+        }
+        (GOATMessageContent::NackReady(NackReady { instance_id, graph_id }), Actor::Verifier) => {
+            handle_nack_ready_verifier(ctx, *instance_id, *graph_id, content).await
         }
         (
-            GOATMessageContent::OperatorAckTimeout(OperatorAckTimeout { instance_id, graph_id }),
-            Actor::Challenger,
-        ) => handle_operator_ack_timeout_challenger(ctx, *instance_id, *graph_id, content).await,
-        (
-            GOATMessageContent::OperatorCommitBlockHashReady(OperatorCommitBlockHashReady {
+            GOATMessageContent::OperatorCommitPubinReady(OperatorCommitPubinReady {
                 instance_id,
                 graph_id,
             }),
             Actor::Operator,
         ) => {
-            handle_operator_commit_blockhash_ready_operator(ctx, *instance_id, *graph_id, content)
+            handle_operator_commit_pubin_ready_operator(ctx, *instance_id, *graph_id, content).await
+        }
+        (
+            GOATMessageContent::OperatorCommitPubinTimeout(OperatorCommitPubinTimeout {
+                instance_id,
+                graph_id,
+            }),
+            Actor::Verifier,
+        ) => {
+            handle_operator_commit_pubin_timeout_verifier(ctx, *instance_id, *graph_id, content)
                 .await
         }
         (
-            GOATMessageContent::OperatorCommitBlockHashTimeout(OperatorCommitBlockHashTimeout {
+            GOATMessageContent::AssertReady(AssertReady { instance_id, graph_id }),
+            Actor::Operator,
+        ) => handle_assert_ready_operator(ctx, *instance_id, *graph_id).await,
+        (
+            GOATMessageContent::AssertSent(AssertSent {
                 instance_id,
                 graph_id,
+                assert_txid,
+                assert_witness,
             }),
-            Actor::Challenger,
+            Actor::Verifier,
         ) => {
-            handle_operator_commit_blockhash_timeout_challenger(
+            handle_assert_sent_verifier(ctx, *instance_id, *graph_id, *assert_txid, assert_witness)
+                .await
+        }
+        (
+            GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
+                instance_id,
+                graph_id,
+                challenge_assert_txid,
+                verifier_index,
+                challenge_witness,
+                ..
+            }),
+            Actor::Operator,
+        ) => {
+            handle_challenge_assert_sent_operator(
                 ctx,
                 *instance_id,
                 *graph_id,
+                *challenge_assert_txid,
+                *verifier_index,
+                challenge_witness,
                 content,
             )
             .await
         }
         (
-            GOATMessageContent::AssertInitReady(AssertInitReady { instance_id, graph_id }),
-            Actor::Operator,
-        ) => handle_assert_init_ready_operator(ctx, *instance_id, *graph_id, content).await,
-        (
-            GOATMessageContent::AssertCommitTimeout(AssertCommitTimeout { instance_id, graph_id }),
-            Actor::Challenger,
-        ) => handle_assert_commit_timeout_challenger(ctx, *instance_id, *graph_id, content).await,
-        (
-            GOATMessageContent::DisproveReady(DisproveReady { instance_id, graph_id }),
-            Actor::Challenger,
-        ) => handle_disprove_ready_challenger(ctx, *instance_id, *graph_id, content).await,
+            GOATMessageContent::WronglyChallengeTimeout(WronglyChallengeTimeout {
+                instance_id,
+                graph_id,
+                challenge_assert_txid,
+                verifier_index,
+                ..
+            }),
+            Actor::Verifier,
+        ) => {
+            handle_wrongly_challenge_timeout_verifier(
+                ctx,
+                *instance_id,
+                *graph_id,
+                *challenge_assert_txid,
+                *verifier_index,
+                content,
+            )
+            .await
+        }
         (
             GOATMessageContent::DisproveSent(DisproveSent {
                 instance_id,
@@ -516,6 +614,190 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
 
 fn make_message(ctx: &HandlerContext<'_>, content: &GOATMessageContent) -> GOATMessage {
     GOATMessage::new(ctx.actor.clone(), content.clone())
+}
+
+/// Freezes the first accepted Verifiers and assigns deterministic graph slots.
+fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> {
+    if state.frozen_verifier_pubkeys.is_some() {
+        return Ok(());
+    }
+    if state.candidates.len() < todo_funcs::min_required_verifier() {
+        bail!(
+            "cannot freeze {} verifier candidates before reaching target {}",
+            state.candidates.len(),
+            todo_funcs::min_required_verifier()
+        );
+    }
+    state.candidates.truncate(todo_funcs::min_required_verifier());
+    state.candidates.sort_by_key(|candidate| candidate.verifier_pubkey.to_bytes());
+    for (verifier_index, candidate) in state.candidates.iter_mut().enumerate() {
+        candidate.verifier_index = Some(verifier_index);
+        candidate.selected_circuit_indexes =
+            derive_finalized_indices(&candidate.setup_package, BABE_M_CC)?;
+    }
+    state.frozen_verifier_pubkeys =
+        Some(state.candidates.iter().map(|candidate| candidate.verifier_pubkey).collect());
+    Ok(())
+}
+
+/// Stores one selected Verifier slot and emits ordered graph data when complete.
+fn record_candidate_gc_data(
+    state: &mut OperatorBabeSetupState,
+    verifier_pubkey: PublicKey,
+    verifier_index: usize,
+    setup_package: &CACSetupPackage,
+    gc_data: BitvmGcCircuitData,
+    prover_state: BabeProverState,
+) -> Result<Option<Vec<BitvmGcCircuitData>>> {
+    let frozen = state
+        .frozen_verifier_pubkeys
+        .as_ref()
+        .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
+    let expected_pubkey = frozen
+        .get(verifier_index)
+        .ok_or_else(|| anyhow!("verifier index {verifier_index} out of frozen slot range"))?;
+    if expected_pubkey != &verifier_pubkey {
+        bail!("verifier public key does not own slot {verifier_index}");
+    }
+    if gc_data.verifier_pubkey != verifier_pubkey {
+        bail!("GC slot owner does not match soldering proof verifier");
+    }
+    let candidate = state
+        .candidates
+        .iter_mut()
+        .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
+        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
+    if candidate.verifier_index != Some(verifier_index) {
+        bail!("candidate verifier index does not match soldering proof slot");
+    }
+    if candidate.setup_package != *setup_package {
+        bail!("soldering proof setup package does not match selected verifier candidate");
+    }
+    if prover_state.package != *setup_package {
+        bail!("BABE prover state setup package does not match selected verifier candidate");
+    }
+    if candidate.selected_circuit_indexes != prover_state.soldering.finalized_indices {
+        bail!("BABE prover state finalized indices do not match selected verifier cut");
+    }
+    if prover_state.finalized.len() != BABE_M_CC || prover_state.h_msgs.len() != BABE_M_CC {
+        bail!("BABE prover state must contain exactly {BABE_M_CC} finalized instances and hashes");
+    }
+    if prover_state.h_msgs != gc_data.final_msg_hashlocks {
+        bail!("BABE prover state hashes do not match GC slot hashes");
+    }
+    if let Some(existing) = &candidate.gc_data
+        && existing != &gc_data
+    {
+        bail!("conflicting GC slot received for selected verifier");
+    }
+    if let Some(existing) = &candidate.prover_state
+        && existing != &prover_state
+    {
+        bail!("conflicting BABE prover state received for selected verifier");
+    }
+    if candidate.gc_data.is_none() {
+        candidate.gc_data = Some(gc_data);
+    }
+    if candidate.prover_state.is_none() {
+        candidate.prover_state = Some(prover_state);
+    }
+    if state.candidates.iter().any(|candidate| candidate.gc_data.is_none()) {
+        return Ok(None);
+    }
+    Ok(Some(state.candidates.iter().map(|candidate| candidate.gc_data.clone().unwrap()).collect()))
+}
+
+fn validate_verifier_slot_lengths(
+    verifier_index: usize,
+    gc_data_len: usize,
+    verifier_asserts_len: usize,
+    disproves_len: usize,
+) -> Result<()> {
+    if gc_data_len == 0 {
+        bail!("graph has no verifier GC slots");
+    }
+    if gc_data_len != verifier_asserts_len || gc_data_len != disproves_len {
+        bail!(
+            "graph verifier branch lengths differ: gc_data={gc_data_len}, verifier_asserts={verifier_asserts_len}, disproves={disproves_len}"
+        );
+    }
+    if verifier_index >= gc_data_len {
+        bail!("verifier index {verifier_index} out of range for {gc_data_len} slots");
+    }
+    Ok(())
+}
+
+fn validate_verifier_slot(graph: &BitvmGcGraph, verifier_index: usize) -> Result<()> {
+    validate_verifier_slot_lengths(
+        verifier_index,
+        graph.parameters.gc_data.len(),
+        graph.verifier_asserts.len(),
+        graph.disproves.len(),
+    )
+}
+
+fn validate_watchtower_branches(graph: &BitvmGcGraph) -> Result<usize> {
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    if watchtower_num == 0 {
+        bail!("graph has no watchtower slots");
+    }
+    if graph.parameters.watchtower_ack_hashlocks.len() != watchtower_num
+        || graph.watchtower_challenge_timeouts.len() != watchtower_num
+        || graph.operator_challenge_nacks.len() != watchtower_num
+    {
+        bail!(
+            "graph watchtower branch lengths differ: watchtowers={}, ack_hashlocks={}, timeouts={}, nacks={}",
+            watchtower_num,
+            graph.parameters.watchtower_ack_hashlocks.len(),
+            graph.watchtower_challenge_timeouts.len(),
+            graph.operator_challenge_nacks.len()
+        );
+    }
+    Ok(watchtower_num)
+}
+
+fn find_verifier_index_by_pubkey(
+    gc_data: &[BitvmGcCircuitData],
+    verifier_pubkey: &PublicKey,
+) -> Result<Option<usize>> {
+    let matches = gc_data
+        .iter()
+        .enumerate()
+        .filter_map(|(index, data)| (data.verifier_pubkey == *verifier_pubkey).then_some(index))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => bail!("graph contains duplicate slots for verifier {verifier_pubkey}"),
+    }
+}
+
+fn validate_challenge_witness_index(
+    verifier_index: usize,
+    challenge_witness: &BabeChallengeAssertWitness,
+) -> Result<()> {
+    if challenge_witness.verifier_index != verifier_index {
+        bail!(
+            "challenge witness verifier index {} does not match message verifier index {verifier_index}",
+            challenge_witness.verifier_index
+        );
+    }
+    Ok(())
+}
+
+fn validate_expected_challenge_assert_txid(
+    graph: &BitvmGcGraph,
+    verifier_index: usize,
+    challenge_assert_txid: Txid,
+) -> Result<()> {
+    validate_verifier_slot(graph, verifier_index)?;
+    let expected_txid = graph.verifier_asserts[verifier_index].tx().compute_txid();
+    if challenge_assert_txid != expected_txid {
+        bail!(
+            "challenge assert txid {challenge_assert_txid} does not match graph verifier assert txid {expected_txid}"
+        );
+    }
+    Ok(())
 }
 
 fn should_ignore_invalid_pegin_request(e: &anyhow::Error, instance_id: Uuid) -> bool {
@@ -648,11 +930,11 @@ async fn refresh_and_compensate(
     ctx: &HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: Option<&Bitvm2Graph>,
+    graph: Option<&BitvmGcGraph>,
     scan_from_status: Option<GraphStatus>,
     compensate_from_status: GraphStatus,
 ) -> Result<(GraphStatus, Option<ChallengeSubStatus>)> {
-    let (graph_status, sub_status) = refresh_graph(
+    let (graph_status, sub_status, scan) = refresh_graph(
         ctx.local_db,
         ctx.btc_client,
         ctx.goat_client,
@@ -670,10 +952,10 @@ async fn refresh_and_compensate(
         instance_id,
         graph_id,
         graph,
+        scan.as_ref(),
         scan_from_status,
         compensate_from_status,
         graph_status,
-        sub_status,
     )
     .await?;
     Ok((graph_status, sub_status))
@@ -683,11 +965,11 @@ async fn get_graph_and_status(
     ctx: &HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-) -> Result<(Bitvm2Graph, GraphStatus)> {
+) -> Result<(BitvmGcGraph, GraphStatus)> {
     let graph = get_graph(ctx.local_db, instance_id, graph_id)
         .await?
         .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-    let graph = Bitvm2Graph::from_simplified(&graph)?;
+    let graph = BitvmGcGraph::from_simplified(&graph)?;
     let graph_start_status = get_graph_status(ctx.local_db, instance_id, graph_id)
         .await?
         .ok_or_else(|| anyhow!("Graph status not found for {instance_id}:{graph_id}"))?;
@@ -699,7 +981,7 @@ async fn get_graph_and_status_or_defer(
     instance_id: Uuid,
     graph_id: Uuid,
     message: &GOATMessage,
-) -> Result<Option<(Bitvm2Graph, GraphStatus)>> {
+) -> Result<Option<(BitvmGcGraph, GraphStatus)>> {
     let graph = match get_graph_or_defer(
         ctx.swarm,
         ctx.local_db,
@@ -713,7 +995,7 @@ async fn get_graph_and_status_or_defer(
         Some(g) => g,
         None => return Ok(None),
     };
-    let graph = Bitvm2Graph::from_simplified(&graph)?;
+    let graph = BitvmGcGraph::from_simplified(&graph)?;
     let graph_start_status = get_graph_status(ctx.local_db, instance_id, graph_id)
         .await?
         .ok_or_else(|| anyhow!("Graph status not found for {instance_id}:{graph_id}"))?;
@@ -726,7 +1008,7 @@ async fn refresh_graph_status(
     graph_id: Uuid,
     message: Option<&GOATMessage>,
     compensate_from_status: GraphStatus,
-) -> Result<Option<(Bitvm2Graph, GraphStatus, Option<ChallengeSubStatus>)>> {
+) -> Result<Option<(BitvmGcGraph, GraphStatus, Option<ChallengeSubStatus>)>> {
     let (graph, graph_start_status) = match message {
         Some(message) => {
             match get_graph_and_status_or_defer(ctx, instance_id, graph_id, message).await? {
@@ -857,6 +1139,25 @@ async fn handle_confirm_instance_operator(
         send_to_peer(ctx.swarm, msg).await?;
         return Ok(());
     }
+
+    let pending_graph_id = {
+        let mut storage = ctx.local_db.acquire().await?;
+        storage
+            .find_pending_graph_init_by_instance_and_operator_pubkey(
+                &instance_id,
+                &local_operator_pubkey.to_string(),
+            )
+            .await?
+            .map(|pending| pending.graph_id)
+    };
+    if let Some(graph_id) = pending_graph_id {
+        tracing::info!("Resume pending graph setup for {instance_id}, graph_id: {graph_id}");
+        let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+
+        return Ok(());
+    }
+
     // 1. read & check parameters
     let instance_params = match read_instance_info_from_goat(ctx.goat_client, instance_id).await {
         Ok(v) => v,
@@ -874,42 +1175,576 @@ async fn handle_confirm_instance_operator(
         );
         bail!("Invalid ConfirmInstance: pegin deposit tx {pegin_deposit_txid} not found on chain");
     }
+    // after PeginPrepare is confirmed, broadcast InitGraph and let Verifiers generate GC.
+
     // 2. save the instance data to local db
     store_instance_parameters(ctx.local_db, &instance_params).await?;
-    // 3. create & presign graph
-    let (graph_nonce, cur_prekickoff_tx) =
+    let graph_id = Uuid::new_v4();
+    let mut storage = ctx.local_db.acquire().await?;
+    storage
+        .upsert_pending_graph_init(&instance_id, &local_operator_pubkey.to_string(), &graph_id)
+        .await?;
+    let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+
+    Ok(())
+}
+
+// generate garbled circuits and broadcast GenCircuits.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_init_graph_verifier(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<()> {
+    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
+    let verifier_pubkey = verifier_master_key.master_keypair().public_key().into();
+
+    let saved_verifier_state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .and_then(|state| state.verifier)
+        .filter(|state| state.verifier_pubkey == verifier_pubkey);
+    let verifier_state = if let Some(saved) = saved_verifier_state {
+        saved
+    } else {
+        get_babe_gc_asset_paths()?;
+        let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE setup")?;
+        let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
+        let (setup_package, private_state) = tokio::task::spawn_blocking(move || {
+            build_real_setup_package(BABE_N_CC, &vk, &public_inputs)
+        })
+        .await
+        .context("real BABE setup task failed")??;
+        tracing::info!("Verifier setup done.");
+        VerifierBabeSetupState {
+            verifier_pubkey,
+            setup_package,
+            private_state,
+            verifier_index: None,
+            finalized_indices: vec![],
+            opened: vec![],
+            finalized: vec![],
+            soldering: None,
+        }
+    };
+
+    let setup_package = verifier_state.setup_package.clone();
+    update_babe_setup_state(ctx.local_db, instance_id, graph_id, |state| {
+        state.verifier = Some(verifier_state);
+    })?;
+
+    let message_content = GOATMessageContent::GenCircuits(GenCircuits {
+        instance_id,
+        graph_id,
+        verifier_pubkey,
+        setup_package,
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+
+    Ok(())
+}
+
+//  select a subset of GC and broadcast CutCircuits.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_gen_circuits_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_pubkey: &PublicKey,
+    setup_package: &CACSetupPackage,
+) -> Result<()> {
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
+    if !pending_graph_belongs_to_operator(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        &local_operator_pubkey,
+    )
+    .await?
+    {
+        tracing::debug!(
+            "Ignore GenCircuits for {instance_id}:{graph_id}: no local pending graph session"
+        );
+        return Ok(());
+    }
+
+    if setup_package.commits.is_empty() {
+        bail!("GenCircuits setup package has no commitments");
+    }
+
+    let mut state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?.unwrap_or_default();
+    let operator_state = state.operator.get_or_insert_with(|| OperatorBabeSetupState {
+        frozen_verifier_pubkeys: None,
+        candidates: vec![],
+        asserted_wrapper_proof: None,
+    });
+
+    let was_frozen = operator_state.frozen_verifier_pubkeys.is_some();
+    if let Some(existing) = operator_state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+    {
+        if existing.setup_package != *setup_package {
+            bail!("conflicting GenCircuits setup package for verifier {verifier_pubkey}");
+        }
+    } else if was_frozen {
+        tracing::debug!(
+            "Ignore GenCircuits for {instance_id}:{graph_id}: verifier membership is frozen"
+        );
+
+        return Ok(());
+    } else {
+        operator_state.candidates.push(OperatorVerifierCandidate {
+            verifier_pubkey: *verifier_pubkey,
+            setup_package: setup_package.clone(),
+            verifier_index: None,
+            selected_circuit_indexes: vec![],
+            gc_data: None,
+            prover_state: None,
+        });
+    }
+
+    if operator_state.frozen_verifier_pubkeys.is_none()
+        && operator_state.candidates.len() < todo_funcs::min_required_verifier()
+    {
+        save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+
+        return Ok(());
+    }
+
+    freeze_operator_candidates(operator_state)?;
+    let cut_candidates = if was_frozen {
+        operator_state
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        operator_state.candidates.clone()
+    };
+
+    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+    for candidate in cut_candidates {
+        let message_content = GOATMessageContent::CutCircuits(CutCircuits {
+            instance_id,
+            graph_id,
+            verifier_pubkey: candidate.verifier_pubkey,
+            verifier_index: candidate.verifier_index.unwrap(),
+            selected_circuit_indexes: candidate.selected_circuit_indexes,
+        });
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+    }
+
+    Ok(())
+}
+
+// generate proofs for the chosen GC and broadcast SolderingProof.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_cut_circuits_verifier(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_pubkey: &PublicKey,
+    verifier_index: usize,
+    selected_circuit_indexes: &Vec<usize>,
+) -> Result<()> {
+    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
+    let local_verifier_pubkey: PublicKey = verifier_master_key.master_keypair().public_key().into();
+    if &local_verifier_pubkey != verifier_pubkey {
+        tracing::debug!(
+            "Ignore CutCircuits for {instance_id}:{graph_id}: target verifier pubkey does not match local verifier"
+        );
+
+        return Ok(());
+    }
+
+    let Some(mut verifier_state) = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .and_then(|state| state.verifier)
+    else {
+        tracing::warn!(
+            "Ignore CutCircuits for {instance_id}:{graph_id}: missing BABE verifier setup state"
+        );
+        return Ok(());
+    };
+
+    if verifier_state.verifier_pubkey != *verifier_pubkey {
+        tracing::warn!(
+            "Ignore CutCircuits for {instance_id}:{graph_id}: verifier pubkey does not match saved BABE setup state"
+        );
+
+        return Ok(());
+    }
+
+    if let Some(saved_index) = verifier_state.verifier_index {
+        if saved_index != verifier_index {
+            bail!(
+                "CutCircuits verifier index {verifier_index} conflicts with persisted slot {saved_index}"
+            );
+        }
+        if verifier_state.finalized_indices != *selected_circuit_indexes {
+            bail!("CutCircuits finalized indices conflict with persisted selection");
+        }
+        if let Some(soldering) = verifier_state.soldering.clone() {
+            let setup_state = verifier_state;
+            send_soldering_proof_to_operator(
+                ctx.swarm,
+                instance_id,
+                graph_id,
+                verifier_index,
+                &setup_state.opened,
+                &setup_state.finalized,
+                &soldering,
+            )
+            .await?;
+
+            return Ok(());
+        }
+    }
+
+    let setup_package = verifier_state.setup_package.clone();
+    get_babe_gc_asset_paths()?;
+
+    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE opening")?;
+    let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
+    let private_state = verifier_state.private_state.clone();
+    let selected_indices = selected_circuit_indexes.clone();
+    let package_for_opening = setup_package.clone();
+    let soldering_builder = Arc::clone(
+        ctx.soldering_builder
+            .as_ref()
+            .context("BABE soldering builder is not initialized for Verifier")?,
+    );
+    let (opened, finalized, soldering) = tokio::task::spawn_blocking(move || {
+        open_real_setup_and_solder(
+            &soldering_builder,
+            &private_state,
+            &package_for_opening,
+            &selected_indices,
+            &vk,
+            &public_inputs,
+        )
+    })
+    .await
+    .context("real BABE opening task failed")??;
+
+    verifier_state.verifier_index = Some(verifier_index);
+    verifier_state.finalized_indices = selected_circuit_indexes.clone();
+    verifier_state.opened = opened.clone();
+    verifier_state.finalized = finalized.clone();
+    verifier_state.soldering = Some(soldering.clone());
+
+    update_babe_setup_state(ctx.local_db, instance_id, graph_id, |state| {
+        state.verifier = Some(verifier_state);
+    })?;
+
+    send_soldering_proof_to_operator(
+        ctx.swarm,
+        instance_id,
+        graph_id,
+        verifier_index,
+        &opened,
+        &finalized,
+        &soldering,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_soldering_proof_ready_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: [u8; 32],
+    total_len: usize,
+) -> Result<()> {
+    if total_len == 0 {
+        bail!("SolderingProofReady total_len must be greater than zero");
+    }
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
+    if !pending_graph_belongs_to_operator(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        &local_operator_pubkey,
+    )
+    .await?
+    {
+        tracing::debug!(
+            "Ignore SolderingProofReady for {instance_id}:{graph_id}: no local pending graph session"
+        );
+
+        return Ok(());
+    }
+
+    let state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing BABE setup state for pending graph {graph_id}"))?;
+    let operator_state = state
+        .operator
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for pending graph {graph_id}"))?;
+    let frozen = operator_state
+        .frozen_verifier_pubkeys
+        .as_ref()
+        .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
+    let verifier_pubkey = frozen.get(verifier_index).ok_or_else(|| {
+        anyhow!("SolderingProofReady verifier index {verifier_index} out of range")
+    })?;
+    let candidate = operator_state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
+    if candidate.verifier_index != Some(verifier_index) {
+        bail!("selected verifier candidate index does not match SolderingProofReady slot");
+    }
+
+    let store_base_path = get_soldering_proof_payload_store_path()?;
+    let payload_path = soldering_proof_payload_store_path(
+        &store_base_path,
+        instance_id,
+        graph_id,
+        verifier_index,
+        &payload_hash,
+    )?;
+    tracing::info!(
+        from_peer_id = %ctx.from_peer_id,
+        instance_id = %instance_id,
+        graph_id = %graph_id,
+        verifier_index,
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        payload_path = %payload_path,
+        "received SolderingProofReady; reading payload from store"
+    );
+    let payload = match read_soldering_proof_store_payload(&payload_path).await {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::error!(
+                instance_id = %instance_id,
+                graph_id = %graph_id,
+                verifier_index,
+                payload_path = %payload_path,
+                error = %err,
+                "failed to read soldering proof payload from store"
+            );
+            return Err(err).context("read soldering proof payload from store");
+        }
+    };
+    tracing::info!(
+        instance_id = %instance_id,
+        graph_id = %graph_id,
+        verifier_index,
+        bytes = payload.len(),
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        payload_path = %payload_path,
+        "read soldering proof payload from store"
+    );
+    tracing::info!(
+        instance_id = %instance_id,
+        graph_id = %graph_id,
+        verifier_index,
+        total_len,
+        payload_hash = %soldering_payload_hash_hex(&payload_hash),
+        "start processing soldering proof payload"
+    );
+    handle_soldering_proof_payload_operator(
+        ctx,
+        instance_id,
+        graph_id,
+        verifier_index,
+        payload_hash,
+        total_len,
+        &payload,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_soldering_proof_payload_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload_hash: [u8; 32],
+    total_len: usize,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() != total_len {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            verifier_index,
+            actual_len = payload.len(),
+            total_len,
+            payload_hash = %soldering_payload_hash_hex(&payload_hash),
+            "SolderingProof payload length mismatch"
+        );
+        bail!(
+            "SolderingProof payload length {} does not match total_len {total_len}",
+            payload.len()
+        );
+    }
+    let actual_hash = soldering_payload_hash(payload);
+    if actual_hash != payload_hash {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            verifier_index,
+            expected_hash = %soldering_payload_hash_hex(&payload_hash),
+            actual_hash = %soldering_payload_hash_hex(&actual_hash),
+            "SolderingProof payload hash mismatch"
+        );
+        bail!("SolderingProof payload hash mismatch");
+    }
+    let payload: CompactSolderingProofPayload =
+        bincode::deserialize(payload).context("deserialize compact soldering proof payload")?;
+    handle_compact_soldering_proof_operator(ctx, instance_id, graph_id, verifier_index, payload)
+        .await
+}
+
+// verify Verifier SolderingProof, build Graph and broadcast CreateGraph.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_compact_soldering_proof_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_index: usize,
+    payload: CompactSolderingProofPayload,
+) -> Result<()> {
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
+    if !pending_graph_belongs_to_operator(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        &local_operator_pubkey,
+    )
+    .await?
+    {
+        tracing::debug!(
+            "Ignore SolderingProof for {instance_id}:{graph_id}: no local pending graph session"
+        );
+
+        return Ok(());
+    }
+
+    let mut state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing BABE setup state for pending graph {graph_id}"))?;
+    let operator_state = state
+        .operator
+        .as_mut()
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for pending graph {graph_id}"))?;
+    let frozen = operator_state
+        .frozen_verifier_pubkeys
+        .as_ref()
+        .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
+    let verifier_pubkey = *frozen
+        .get(verifier_index)
+        .ok_or_else(|| anyhow!("SolderingProof verifier index {verifier_index} out of range"))?;
+
+    let candidate = operator_state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
+        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
+    if candidate.verifier_index != Some(verifier_index) {
+        bail!("selected verifier candidate index does not match SolderingProof slot");
+    }
+    let setup_package = candidate.setup_package.clone();
+    let (opened, finalized, soldering) =
+        expand_compact_soldering_proof_payload(&setup_package, payload)
+            .context("expand compact soldering proof payload")?;
+
+    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE validation")?;
+    let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
+    let package_for_validation = setup_package.clone();
+    let opened_for_validation = opened.clone();
+    let finalized_for_validation = finalized.clone();
+    let soldering_for_validation = soldering.clone();
+    let soldering_builder = Arc::clone(
+        ctx.soldering_builder
+            .as_ref()
+            .context("BABE soldering builder is not initialized for Operator")?,
+    );
+
+    tokio::task::spawn_blocking(move || {
+        verify_real_setup(
+            &soldering_builder,
+            &package_for_validation,
+            &opened_for_validation,
+            &finalized_for_validation,
+            &soldering_for_validation,
+            &vk,
+            &public_inputs,
+        )
+    })
+    .await
+    .context("real BABE setup verification task failed")??;
+
+    let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey)?;
+    let prover_state = BabeProverState {
+        package: setup_package.clone(),
+        finalized,
+        soldering,
+        h_msgs: gc_data.final_msg_hashlocks.clone(),
+    };
+    let Some(bitvm_gc_circuit_datas) = record_candidate_gc_data(
+        operator_state,
+        verifier_pubkey,
+        verifier_index,
+        &setup_package,
+        gc_data,
+        prover_state,
+    )?
+    else {
+        save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+        return Ok(());
+    };
+    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+
+    let instance_params = get_instance_parameters(ctx.local_db, instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
+
+    let (graph_nonce, cur_prekickoff_txn) =
         match get_current_prekickoff_tx(ctx.local_db, &local_operator_pubkey).await? {
-            Some(v) => v,
-            None => {
-                let genesis_prekickoff_tx =
-                    build_genesis_prekickoff_tx(ctx.btc_client, ctx.goat_client).await?;
-                (0, genesis_prekickoff_tx)
-            }
+            Some((graph_nonce, prekickoff_tx)) => (graph_nonce, prekickoff_tx),
+            None => (0, build_genesis_prekickoff_tx(ctx.btc_client, ctx.goat_client).await?),
         };
     let prekickoff_params =
-        build_prekickoff_params(ctx.btc_client, graph_nonce, cur_prekickoff_tx).await?;
+        build_prekickoff_params(ctx.btc_client, graph_nonce, cur_prekickoff_txn).await?;
+
     let graph_params = build_graph_params(
         ctx.local_db,
         ctx.goat_client,
         instance_params,
         prekickoff_params,
+        bitvm_gc_circuit_datas,
         graph_nonce,
-        Uuid::new_v4(),
+        graph_id,
     )
     .await?;
-    let graph_id = graph_params.graph_id;
-    let disprove_scripts = get_disprove_scripts(&graph_params).await?;
-    let mut graph = generate_bitvm_graph(graph_params, disprove_scripts)?;
+
+    let mut graph = generate_bitvm_graph(graph_params)?;
     operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
-    store_graph(ctx.local_db, &graph.to_simplified()?).await?;
-    // 4. broadcast CreateGraph
-    let message_content = GOATMessageContent::CreateGraph(CreateGraph {
-        instance_id,
-        graph_id,
-        graph_nonce,
-        graph: graph.to_simplified()?,
-    });
+
+    let graph = graph.to_simplified()?;
+    store_graph(ctx.local_db, &graph).await?;
+
+    let mut storage = ctx.local_db.acquire().await?;
+    storage.delete_pending_graph_init(&instance_id, &local_operator_pubkey.to_string()).await?;
+
+    let message_content =
+        GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph_nonce, graph });
     send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+
     Ok(())
 }
 
@@ -946,7 +1781,7 @@ async fn handle_create_graph_committee(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: &SimplifiedBitvm2Graph,
+    graph: &SimplifiedBitvmGcGraph,
 ) -> Result<()> {
     // received from Operator
     // 1. check graph data & operator stake
@@ -963,11 +1798,13 @@ async fn handle_create_graph_committee(
     // 3. generate Musig2 nonces & broadcast NonceGeneration
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+    let verifier_num = graph.parameters.gc_data.len();
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph_with_keypair(
         instance_id,
         graph_id,
-        graph.parameters.watchtower_pubkeys.len(),
-        graph.assert_commit_num,
+        watchtower_num,
+        verifier_num,
         instance_keypair,
     );
     let local_committee_pubkey = instance_keypair.public_key().into();
@@ -975,8 +1812,6 @@ async fn handle_create_graph_committee(
         instance_id,
         graph_id,
         committee_pubkey: local_committee_pubkey,
-        watchtower_num: graph.parameters.watchtower_pubkeys.len(),
-        assert_commit_num: graph.assert_commit_num,
         pub_nonces: pub_nonces.clone(),
         nonce_sigs,
     });
@@ -994,12 +1829,12 @@ async fn handle_create_graph_committee(
     let pub_nonces_unchecked =
         get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
     if pub_nonces_unchecked.len() == committee_pubkeys.len() {
-        let mut graph = Bitvm2Graph::from_simplified(graph)?;
+        let mut graph = BitvmGcGraph::from_simplified(graph)?;
+        let verifier_num = graph.verifier_asserts.len();
         let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-        let assert_commit_num = graph.assert_commit_timeout_txns.len();
         let mut pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
         for (pk, pn) in pub_nonces_unchecked.into_iter() {
-            if let Err(e) = pn.validate_length(watchtower_num, assert_commit_num) {
+            if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
                 tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
                 return Ok(());
             }
@@ -1012,7 +1847,7 @@ async fn handle_create_graph_committee(
             instance_id,
             graph_id,
             watchtower_num,
-            assert_commit_num,
+            verifier_num,
             instance_keypair,
         );
         let committee_partial_sigs =
@@ -1029,15 +1864,12 @@ async fn handle_create_graph_committee(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_nonce_generation_committee(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
     received_committee_pubkey: &PublicKey,
-    watchtower_num: usize,
-    assert_commit_num: usize,
     pub_nonces: &CommitteePubNonces,
     nonce_sigs: &CommitteeNonceSignatures,
     content: &GOATMessageContent,
@@ -1055,13 +1887,29 @@ async fn handle_nonce_generation_committee(
         return Ok(());
     }
     // 1. check pub_nonces & nonce signatures
+    let message = make_message(ctx, content);
+    let graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(g) => g,
+        None => return Ok(()),
+    };
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    let verifier_num = graph.parameters.gc_data.len();
     let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
     if !verify_nonce_signatures(
         &committee_xonly_pubkey,
         pub_nonces,
         nonce_sigs,
         watchtower_num,
-        assert_commit_num,
+        verifier_num,
     )? {
         tracing::warn!(
             "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
@@ -1087,26 +1935,12 @@ async fn handle_nonce_generation_committee(
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
         let local_committee_pubkey = instance_keypair.public_key().into();
-        let message = make_message(ctx, content);
-        let graph = match get_graph_or_defer(
-            ctx.swarm,
-            ctx.local_db,
-            ctx.goat_client,
-            instance_id,
-            graph_id,
-            &message,
-        )
-        .await?
-        {
-            Some(g) => g,
-            None => return Ok(()),
-        };
-        let mut graph = Bitvm2Graph::from_simplified(&graph)?;
+        let mut graph = BitvmGcGraph::from_simplified(&graph)?;
+        let verifier_num = graph.verifier_asserts.len();
         let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-        let assert_commit_num = graph.assert_commit_timeout_txns.len();
         let mut pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
         for (pk, pn) in pub_nonces_unchecked.into_iter() {
-            if let Err(e) = pn.validate_length(watchtower_num, assert_commit_num) {
+            if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
                 tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
                 return Ok(());
             }
@@ -1117,7 +1951,7 @@ async fn handle_nonce_generation_committee(
             instance_id,
             graph_id,
             watchtower_num,
-            assert_commit_num,
+            verifier_num,
             instance_keypair,
         );
         // 4. if received enough valid committee partial sigs, endorse the graph
@@ -1162,15 +1996,12 @@ async fn handle_nonce_generation_committee(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_nonce_generation_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
     received_committee_pubkey: &PublicKey,
-    watchtower_num: usize,
-    assert_commit_num: usize,
     pub_nonces: &CommitteePubNonces,
     nonce_sigs: &CommitteeNonceSignatures,
 ) -> Result<()> {
@@ -1186,21 +2017,6 @@ async fn handle_nonce_generation_operator(
     {
         return Ok(());
     }
-    // 1. check pub_nonces & nonce signatures
-    let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
-    if !verify_nonce_signatures(
-        &committee_xonly_pubkey,
-        pub_nonces,
-        nonce_sigs,
-        watchtower_num,
-        assert_commit_num,
-    )? {
-        tracing::warn!(
-            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
-            received_committee_pubkey.to_string()
-        );
-        return Ok(());
-    }
     let graph = match get_graph(ctx.local_db, instance_id, graph_id).await? {
         Some(g) => g,
         None => {
@@ -1211,9 +2027,24 @@ async fn handle_nonce_generation_operator(
             return Ok(());
         }
     };
+    let verifier_num = graph.parameters.gc_data.len();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-    let assert_commit_num = graph.assert_commit_num;
-    if let Err(e) = pub_nonces.validate_length(watchtower_num, assert_commit_num) {
+    // 1. check pub_nonces & nonce signatures
+    let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
+    if !verify_nonce_signatures(
+        &committee_xonly_pubkey,
+        pub_nonces,
+        nonce_sigs,
+        watchtower_num,
+        verifier_num,
+    )? {
+        tracing::warn!(
+            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
+            received_committee_pubkey.to_string()
+        );
+        return Ok(());
+    }
+    if let Err(e) = pub_nonces.validate_length(watchtower_num, verifier_num) {
         tracing::warn!(
             "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces length: {e}",
             received_committee_pubkey.to_string()
@@ -1301,7 +2132,7 @@ async fn handle_committee_presign_committee(
             Some(g) => g,
             None => return Ok(()),
         };
-        let graph = Bitvm2Graph::from_simplified(&graph)?;
+        let graph = BitvmGcGraph::from_simplified(&graph)?;
         let committee_sig_for_graph = endorse_graph(ctx.goat_client, &graph).await?;
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
@@ -1392,7 +2223,7 @@ async fn handle_endorse_graph_operator(
             return Ok(());
         }
     };
-    let full_graph = Bitvm2Graph::from_simplified(&graph)?;
+    let full_graph = BitvmGcGraph::from_simplified(&graph)?;
     if let Err(e) = verify_graph_endorsement(
         ctx.goat_client,
         committee_evm_address,
@@ -1438,7 +2269,7 @@ async fn handle_graph_finalize_committee(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: &SimplifiedBitvm2Graph,
+    graph: &SimplifiedBitvmGcGraph,
     endorse_sigs: &[(PublicKey, alloy::primitives::Address, Vec<u8>)],
 ) -> Result<()> {
     // received from Operator
@@ -1512,7 +2343,7 @@ async fn handle_graph_finalize_committee(
             // already posted
             return Ok(());
         }
-        let graph = Bitvm2Graph::from_simplified(graph)?;
+        let graph = BitvmGcGraph::from_simplified(graph)?;
         let graph_data = build_graph_data(&graph)?;
         let endorse_sigs = endorse_sigs.iter().map(|(_, _, sig)| sig.clone()).collect::<Vec<_>>();
         ctx.goat_client
@@ -1527,7 +2358,7 @@ async fn handle_graph_finalize_default(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: &SimplifiedBitvm2Graph,
+    graph: &SimplifiedBitvmGcGraph,
     endorse_sigs: &[(PublicKey, alloy::primitives::Address, Vec<u8>)],
 ) -> Result<()> {
     // received from Operator
@@ -1602,7 +2433,7 @@ async fn handle_pegin_confirm_nonce_committee(
             .await?
             .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
         let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
-        let context = instance_params.get_verifier_context(instance_keypair)?;
+        let context = instance_params.get_committee_context(instance_keypair)?;
         let partial_sig = pegin_confirm
             .sign_input_0_musig2(&context, &sec_nonce, &agg_nonce)
             .map_err(|e| anyhow!("Failed to sign pegin confirm for {instance_id}: {e}"))?;
@@ -1835,7 +2666,7 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
         let graph = get_graph(ctx.local_db, instance_id, *graph_id)
             .await?
             .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-        let graph = Bitvm2Graph::from_simplified(&graph)?;
+        let graph = BitvmGcGraph::from_simplified(&graph)?;
         let graph_data = build_graph_data(&graph)?;
         ctx.goat_client
             .gateway_post_graph_data(&instance_id, graph_id, &graph_data, &endorsement_sigs)
@@ -1866,7 +2697,7 @@ async fn handle_kickoff_ready_operator(
         Some(g) => g,
         None => return Ok(()),
     };
-    let mut graph = Bitvm2Graph::from_simplified(&graph)?;
+    let mut graph = BitvmGcGraph::from_simplified(&graph)?;
     let operator_pubkey = graph.parameters.operator_pubkey;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let node_pubkey: PublicKey = operator_master_key.master_keypair().public_key().into();
@@ -1917,14 +2748,14 @@ async fn handle_kickoff_ready_operator(
             Some(g) => g,
             None => return Ok(()),
         };
-        let mut current_graph = Bitvm2Graph::from_simplified(&current_graph)?;
+        let mut current_graph = BitvmGcGraph::from_simplified(&current_graph)?;
         let current_graph_start_status =
             get_graph_status(ctx.local_db, current_instance_id, current_graph_id)
                 .await?
                 .ok_or_else(|| {
                     anyhow!("Graph status not found for {current_instance_id}:{current_graph_id}")
                 })?;
-        let (current_graph_status, current_graph_sub_status) = refresh_graph(
+        let (current_graph_status, _current_graph_sub_status, current_graph_scan) = refresh_graph(
             ctx.local_db,
             ctx.btc_client,
             ctx.goat_client,
@@ -1941,10 +2772,10 @@ async fn handle_kickoff_ready_operator(
             current_instance_id,
             current_graph_id,
             Some(&current_graph),
+            current_graph_scan.as_ref(),
             Some(current_graph_start_status),
             current_graph_start_status,
             current_graph_status,
-            current_graph_sub_status,
         )
         .await?;
         if current_graph_status.is_closed() {
@@ -2089,7 +2920,7 @@ async fn handle_kickoff_sent_committee(
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_kickoff_sent_challenger(
+async fn handle_kickoff_sent_verifier(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
@@ -2187,7 +3018,7 @@ async fn handle_kickoff_sent_default(
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_prekickoff_sent_challenger(
+async fn handle_prekickoff_sent_verifier(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
@@ -2240,7 +3071,7 @@ async fn handle_prekickoff_sent_challenger(
         Some(g) => g,
         None => return Ok(()),
     };
-    let prev_graph = Bitvm2Graph::from_simplified(&prev_graph)?;
+    let prev_graph = BitvmGcGraph::from_simplified(&prev_graph)?;
     let prev_graph_start_status = get_graph_status(ctx.local_db, prev_instance_id, prev_graph_id)
         .await?
         .ok_or_else(|| anyhow!("Graph status not found for {prev_instance_id}:{prev_graph_id}"))?;
@@ -2255,10 +3086,10 @@ async fn handle_prekickoff_sent_challenger(
     .await?;
     if !tx_on_chain(ctx.btc_client, &prev_graph.kickoff.tx().compute_txid()).await? {
         // 2. if previous kickoff not started, broadcast force-skip-kickoff txn
-        challenger_force_skip_kickoff(ctx.btc_client, &prev_graph).await?;
+        verifier_force_skip_kickoff(ctx.btc_client, &prev_graph).await?;
     } else if !prev_graph_status.is_closed() {
         // 3. if previous kickoff is not closed, broadcast quick-challenge/challenge-incomplete-kickoff txn
-        challenger_quick_challenge(ctx.btc_client, &prev_graph).await?;
+        verifier_quick_challenge(ctx.btc_client, &prev_graph).await?;
     }
     Ok(())
 }
@@ -2305,9 +3136,12 @@ async fn handle_challenge_sent_operator(
         );
         return Ok(());
     }
-    let kickoff_txid = graph.kickoff.tx().compute_txid();
     if let Some(challenge_tx) = ctx.btc_client.get_tx(&challenge_txid).await? {
-        let challenge_outpoint = OutPoint { txid: kickoff_txid, vout: 0 };
+        let challenge_outpoint = graph
+            .kickoff
+            .connector_a_input()
+            .map_err(|e| anyhow!("failed to get connector-a input: {e}"))?
+            .outpoint;
         if challenge_tx.input[0].previous_output != challenge_outpoint {
             tracing::warn!(
                 "Ignore ChallengeSent for {instance_id}:{graph_id}: invalid challenge tx input"
@@ -2340,6 +3174,12 @@ async fn handle_challenge_sent_operator(
         }
         None => broadcast_tx(ctx.btc_client, &watchtower_challenge_init_tx).await?,
     };
+    let message_content =
+        GOATMessageContent::WatchtowerChallengeInitSent(WatchtowerChallengeInitSent {
+            instance_id,
+            graph_id,
+        });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Watchtower, message_content)).await?;
     Ok(())
 }
 
@@ -2404,77 +3244,78 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
         );
         return Ok(());
     }
-    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, 2 * node_index as u64)
-        .await?
-        .is_some()
+    let watchtower_challenge_vout =
+        output_topology::watchtower_challenge_init::watchtower_connector(node_index) as u64;
+    if outpoint_spent_txid(
+        ctx.btc_client,
+        &watchtower_challenge_init_txid,
+        watchtower_challenge_vout,
+    )
+    .await?
+    .is_some()
     {
         tracing::warn!(
             "Ignore WatchtowerChallengeInitSent for {instance_id}:{graph_id}: watchtower challenge already spent"
         );
         return Ok(());
     }
-    // 1. check the withdraw status on GoatChain, if the withdraw is invalid, sign & broadcast watchtower-challenge txn
-    let withdraw_status = ctx.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    if crate::env::should_always_challenge()
-        || [WithdrawStatus::None, WithdrawStatus::Canceled].contains(&withdraw_status)
+    // watchtower should always challenge
+    let watchtower_proof = match get_watchtower_commitment(
+        ctx.local_db,
+        ctx.btc_client,
+        ctx.http_client,
+        instance_id,
+        graph_id,
+    )
+    .await?
     {
-        let watchtower_proof = match get_watchtower_commitment(
-            ctx.local_db,
-            ctx.btc_client,
-            ctx.http_client,
-            instance_id,
-            graph_id,
-        )
-        .await?
-        {
-            (Some(p), _) => p,
-            (None, wait_secs) => {
-                tracing::warn!(
-                    "Retry WatchtowerChallengeInitSent for {instance_id}:{graph_id} later: watchtower proof not ready, retry after {wait_secs} seconds"
-                );
-                push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
-                return Ok(());
-            }
-        };
-        let watchtower_challenge_txid = match send_watchtower_challenge_tx(
-            ctx.btc_client,
-            &graph,
-            node_index,
-            watchtower_proof,
-        )
-        .await
-        {
-            Ok(txid) => txid,
-            Err(e) => {
-                tracing::warn!(
-                    "Ignore WatchtowerChallengeInitSent for {instance_id}:{graph_id}: failed to send watchtower challenge tx: {e}"
-                );
-                return Ok(());
-            }
-        };
-        let message_content =
-            GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
-                instance_id,
-                graph_id,
-                watchtower_challenge_txids: vec![(node_index, watchtower_challenge_txid)],
-            });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
-    }
+        (Some(p), _) => p,
+        (None, wait_secs) => {
+            tracing::warn!(
+                "Retry WatchtowerChallengeInitSent for {instance_id}:{graph_id} later: watchtower proof not ready, retry after {wait_secs} seconds"
+            );
+            push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
+            return Ok(());
+        }
+    };
+    let watchtower_challenge_txid = match send_watchtower_challenge_tx(
+        ctx.btc_client,
+        &graph,
+        node_index,
+        watchtower_proof,
+    )
+    .await
+    {
+        Ok(txid) => txid,
+        Err(e) => {
+            tracing::warn!(
+                "Ignore WatchtowerChallengeInitSent for {instance_id}:{graph_id}: failed to send watchtower challenge tx: {e}"
+            );
+            return Ok(());
+        }
+    };
+    tracing::info!(
+        "WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower_index={node_index}, txid={watchtower_challenge_txid}"
+    );
+    let message_content = GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
+        instance_id,
+        graph_id,
+        watchtower_index: node_index,
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
     Ok(())
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id, watchtower_index = watchtower_index))]
 async fn handle_watchtower_challenge_sent_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    watchtower_challenge_txids: &Vec<(usize, Txid)>,
+    watchtower_index: usize,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    // triggered by WatchtowerChallenge tx
     let message = make_message(ctx, content);
-    // 1. check the watchtower-challenge tx status on Bitcoin chain, if watchtower challenge tx is confirmed, sign & broadcast operator-ack txn
-    let (mut graph, graph_status, _graph_sub_status) = match refresh_graph_status(
+    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
         ctx,
         instance_id,
         graph_id,
@@ -2492,46 +3333,66 @@ async fn handle_watchtower_challenge_sent_operator(
         );
         return Ok(());
     }
-    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let operator_graph_keypair = operator_master_key.master_keypair();
-    let operator_master_keypair = operator_master_key.master_keypair();
-    for (watchtower_index, watchtower_challenge_txid) in watchtower_challenge_txids {
-        tracing::info!(
-            "Handle WatchtowerChallengeSent for {instance_id}:{graph_id}, watchtower index: {watchtower_index}, watchtower challenge txid: {watchtower_challenge_txid}"
-        );
-        let watchtower_challenge_tx = match ctx.btc_client.get_tx(watchtower_challenge_txid).await?
-        {
-            Some(tx) => tx,
-            None => {
-                tracing::warn!(
-                    "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower challenge tx not found on chain: {watchtower_challenge_txid}"
-                );
-                continue;
-            }
-        };
-        let watchtower_challenge_outpoint =
-            OutPoint { txid: watchtower_challenge_init_txid, vout: 2 * *watchtower_index as u32 };
-        if watchtower_challenge_tx.input[0].previous_output != watchtower_challenge_outpoint {
-            tracing::warn!(
-                "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: invalid watchtower challenge tx input"
-            );
-            continue;
-        }
-        let preimage =
-            todo_funcs::get_preimage(ctx.local_db, instance_id, graph_id, *watchtower_index)
-                .await?;
-        let (ack_txin, ack_txin_amount) =
-            operator_sign_ack(operator_graph_keypair, &mut graph, *watchtower_index, &preimage)?;
-        build_sign_and_broadcast_tx(
-            ctx.btc_client,
-            operator_master_keypair,
-            vec![ack_txin],
-            ack_txin_amount,
-            vec![],
-        )
-        .await?;
+    let watchtower_num = validate_watchtower_branches(&graph)?;
+    if watchtower_index >= watchtower_num {
+        bail!("watchtower index {watchtower_index} out of range for {watchtower_num} slots");
     }
+
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let watchtower_vout =
+        output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index) as u64;
+    let Some((watchtower_spent_txid, watchtower_vin, _txin)) =
+        outpoint_spent_txin(ctx.btc_client, &watchtower_challenge_init_txid, watchtower_vout)
+            .await?
+    else {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower connector {watchtower_index} is not spent yet"
+        );
+        return Ok(());
+    };
+    if watchtower_vin != 0 {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower connector {watchtower_index} was spent by tx {watchtower_spent_txid} at unexpected input index {watchtower_vin}"
+        );
+        return Ok(());
+    }
+    let timeout_txid = graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid();
+    if watchtower_spent_txid == timeout_txid {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower connector {watchtower_index} was spent by timeout tx {timeout_txid}"
+        );
+        return Ok(());
+    }
+
+    let ack_vout =
+        output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
+    if let Some(spent_txid) =
+        outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout).await?
+    {
+        tracing::warn!(
+            "Ignore WatchtowerChallengeSent for {instance_id}:{graph_id}: ack connector {watchtower_index} already spent by {spent_txid}"
+        );
+        return Ok(());
+    }
+
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let preimage = operator_master_key.preimage_for_graph(graph_id, watchtower_index);
+    let ack_connector_input = graph
+        .watchtower_challenge_init
+        .ack_connector_input(watchtower_index)
+        .map_err(|e| anyhow!("failed to get ack connector input: {e}"))?;
+    let ack_input = operator_sign_challenge_ack(&graph, watchtower_index, &preimage)?;
+    let ack_txid = build_sign_and_broadcast_tx(
+        ctx.btc_client,
+        operator_master_key.master_keypair(),
+        vec![ack_input],
+        ack_connector_input.amount,
+        vec![goat::scripts::p2a_output()],
+    )
+    .await?;
+    tracing::info!(
+        "Operator challenge ACK sent for {instance_id}:{graph_id}: watchtower_index={watchtower_index}, txid={ack_txid}"
+    );
     Ok(())
 }
 
@@ -2540,10 +3401,8 @@ async fn handle_watchtower_challenge_timeout_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    watchtower_indexes: &Vec<usize>,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    // triggered by timeout task
     let message = make_message(ctx, content);
     let (mut graph, graph_status, _graph_sub_status) = match refresh_graph_status(
         ctx,
@@ -2563,91 +3422,55 @@ async fn handle_watchtower_challenge_timeout_operator(
         );
         return Ok(());
     }
+
+    let watchtower_num = validate_watchtower_branches(&graph)?;
     let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let watchtower_challenge_init_height = match ctx
-        .btc_client
-        .get_tx_status(&watchtower_challenge_init_txid)
-        .await?
-        .block_height
-    {
-        Some(height) => height,
-        None => {
-            tracing::warn!(
-                "Ignore WatchtowerChallengeTimeout for {instance_id}:{graph_id}: watchtower challenge init tx not confirmed yet"
-            );
-            return Ok(());
-        }
-    };
-    let current_height = ctx.btc_client.get_height().await?;
-    if current_height
-        < watchtower_challenge_init_height + watchtower_challenge_timeout_timelock(get_network())
-    {
-        tracing::warn!(
-            "Ignore WatchtowerChallengeTimeout for {instance_id}:{graph_id}: watchtower challenge timelock not expired yet"
-        );
-        return Ok(());
-    }
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let operator_master_keypair = operator_master_key.master_keypair();
-    // 1. sign & broadcast watchtower-challenge-timeout txn
-    for watchtower_index in watchtower_indexes {
-        tracing::info!(
-            "Handle WatchtowerChallengeTimeout for {instance_id}:{graph_id}, watchtower index: {watchtower_index}"
-        );
-        let watchtower_challenge_vout = 2 * *watchtower_index as u64;
-        if outpoint_spent_txid(
-            ctx.btc_client,
-            &watchtower_challenge_init_txid,
-            watchtower_challenge_vout,
-        )
-        .await?
-        .is_some()
+    for watchtower_index in 0..watchtower_num {
+        let watchtower_vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                as u64;
+        let ack_vout =
+            output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
+        if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, watchtower_vout)
+            .await?
+            .is_some()
+            || outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout)
+                .await?
+                .is_some()
         {
-            tracing::warn!(
-                "Ignore WatchtowerChallengeTimeout for {instance_id}:{graph_id}: watchtower challenge already spent"
-            );
             continue;
         }
-        let watchtower_challenge_timeout_tx = operator_sign_watchtower_challenge_timeout(
-            operator_master_keypair,
+
+        let timeout_tx = operator_sign_watchtower_challenge_timeout(
+            operator_master_key.master_keypair(),
             &mut graph,
-            *watchtower_index,
+            watchtower_index,
         )?;
-        let anchor_vout = watchtower_challenge_timeout_tx.output.len() as u64 - 1;
-        let watchtower_challenge_timeout_tx_total_input_amount = graph
-            .watchtower_challenge_timeout_txns
-            .get(*watchtower_index)
-            .ok_or_else(|| anyhow!("WatchtowerChallengeTimeout txn not found for {instance_id}:{graph_id}:{watchtower_index}"))?
+        if tx_on_chain(ctx.btc_client, &timeout_tx.compute_txid()).await? {
+            continue;
+        }
+        let timeout_txid = timeout_tx.compute_txid();
+        let timeout_tx_total_input_amount = graph.watchtower_challenge_timeouts[watchtower_index]
             .prev_outs()
             .iter()
             .map(|o| o.value)
-            .sum();
-        let child_tx = build_cpfp_txns(
-            ctx.btc_client,
-            &watchtower_challenge_timeout_tx,
-            anchor_vout,
-            watchtower_challenge_timeout_tx_total_input_amount,
-        )
-        .await?;
-        match child_tx {
-            Some(tx) => {
-                broadcast_package(ctx.btc_client, &[watchtower_challenge_timeout_tx, tx], true)
-                    .await?
-            }
-            None => broadcast_tx(ctx.btc_client, &watchtower_challenge_timeout_tx).await?,
-        };
+            .sum::<Amount>();
+        broadcast_tx_with_cpfp(ctx.btc_client, timeout_tx, timeout_tx_total_input_amount).await?;
+        tracing::info!(
+            "Watchtower challenge timeout sent for {instance_id}:{graph_id}: watchtower_index={watchtower_index}, txid={timeout_txid}"
+        );
     }
     Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_operator_ack_timeout_challenger(
+async fn handle_nack_ready_verifier(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    // triggered by timeout task
     let message = make_message(ctx, content);
     let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
         ctx,
@@ -2663,90 +3486,103 @@ async fn handle_operator_ack_timeout_challenger(
     };
     if graph_status != GraphStatus::Challenge {
         tracing::warn!(
-            "Ignore AckTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+            "Ignore NackReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
         );
         return Ok(());
     }
+    let watchtower_num = validate_watchtower_branches(&graph)?;
+
     let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let connector_f_vout = 1 + 2 * graph.parameters.watchtower_pubkeys.len() as u64;
+    let connector_f_vout =
+        output_topology::watchtower_challenge_init::connector_f(watchtower_num) as u64;
     if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_f_vout)
         .await?
         .is_some()
     {
-        tracing::warn!(
-            "Ignore OperatorAckTimeout for {instance_id}:{graph_id}: connector_F already spent"
-        );
+        tracing::warn!("Ignore NackReady for {instance_id}:{graph_id}: connector-F already spent");
         return Ok(());
     }
-    let current_height = ctx.btc_client.get_height().await?;
-    let watchtower_challenge_init_height = match ctx
-        .btc_client
-        .get_tx_status(&watchtower_challenge_init_txid)
-        .await?
-        .block_height
-    {
-        Some(height) => height,
-        None => {
-            tracing::warn!(
-                "Ignore OperatorAckTimeout for {instance_id}:{graph_id}: watchtower challenge init tx not confirmed yet"
-            );
-            return Ok(());
+
+    for watchtower_index in 0..watchtower_num {
+        let watchtower_vout =
+            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
+                as u64;
+        let Some(watchtower_spent_txid) =
+            outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, watchtower_vout)
+                .await?
+        else {
+            continue;
+        };
+
+        let timeout_txid =
+            graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid();
+        if watchtower_spent_txid == timeout_txid {
+            continue;
         }
-    };
-    if current_height < watchtower_challenge_init_height + nack_timelock(get_network()) {
-        tracing::warn!(
-            "Ignore OperatorAckTimeout for {instance_id}:{graph_id}: nack timelock not expired yet"
-        );
-        return Ok(());
-    }
-    let mut nack_index = None;
-    for watchtower_index in 0..graph.parameters.watchtower_pubkeys.len() {
-        let ack_vout = 1 + 2 * watchtower_index as u64;
+
+        let ack_vout =
+            output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
         if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout)
             .await?
-            .is_none()
+            .is_some()
         {
-            nack_index = Some(watchtower_index);
-            break;
+            continue;
         }
-    }
-    let nack_index = match nack_index {
-        Some(index) => index,
-        None => {
-            tracing::warn!(
-                "Ignore OperatorAckTimeout for {instance_id}:{graph_id}: all ack connectors already spent"
-            );
+
+        let nack = graph
+            .operator_challenge_nacks
+            .get(watchtower_index)
+            .ok_or_else(|| anyhow!("invalid watchtower index {watchtower_index}"))?;
+        let nack_tx = nack.tx().clone();
+        let nack_txid = nack_tx.compute_txid();
+        if tx_on_chain(ctx.btc_client, &nack_txid).await? {
             return Ok(());
         }
-    };
-    // 1. broadcast Nack txn
-    let nack_tx = graph
-        .nack_txns
-        .get(nack_index)
-        .ok_or_else(|| anyhow!("Nack txn not found for {instance_id}:{graph_id}:{nack_index}"))?
-        .finalize();
-    let anchor_vout = nack_tx.output.len() as u64 - 1;
-    let nack_tx_total_input_amount =
-        graph.nack_txns[nack_index].prev_outs().iter().map(|o| o.value).sum();
-    let child_tx =
-        build_cpfp_txns(ctx.btc_client, &nack_tx, anchor_vout, nack_tx_total_input_amount).await?;
-    match child_tx {
-        Some(tx) => broadcast_package(ctx.btc_client, &[nack_tx, tx], true).await?,
-        None => broadcast_package(ctx.btc_client, &[nack_tx], true).await?,
-    };
+        let nack_tx_total_input_amount = nack.prev_outs().iter().map(|o| o.value).sum::<Amount>();
+        broadcast_tx_with_cpfp(ctx.btc_client, nack_tx, nack_tx_total_input_amount).await?;
+        tracing::info!(
+            "Operator challenge NACK sent for {instance_id}:{graph_id}: watchtower_index={watchtower_index}, txid={nack_txid}"
+        );
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "Ignore NackReady for {instance_id}:{graph_id}: no watchtower branch is ready for NACK"
+    );
     Ok(())
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_operator_commit_blockhash_ready_operator(
+async fn handle_operator_commit_pubin_ready_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    // triggered by timeout task
     let message = make_message(ctx, content);
-    let (mut graph, graph_status, _graph_sub_status) = match refresh_graph_status(
+    let Some((_graph, graph_status, _graph_sub_status)) =
+        refresh_graph_status(ctx, instance_id, graph_id, Some(&message), GraphStatus::Challenge)
+            .await?
+    else {
+        return Ok(());
+    };
+    // TODO(gc-v2): build operator-commit-pubin after pubin commitment data is wired.
+    // It is not pre-signed, so add a funding input for fees and broadcast it normally.
+    tracing::warn!(
+        "OperatorCommitPubinReady for {instance_id}:{graph_id} is not implemented yet; graph status is {graph_status:?}"
+    );
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_operator_commit_pubin_timeout_verifier(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let message = make_message(ctx, content);
+    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
         ctx,
         instance_id,
         graph_id,
@@ -2760,558 +3596,434 @@ async fn handle_operator_commit_blockhash_ready_operator(
     };
     if graph_status != GraphStatus::Challenge {
         tracing::warn!(
-            "Ignore CommitBlockHashReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+            "Ignore OperatorCommitPubinTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
         );
         return Ok(());
     }
-    // 1. check that all WatchtowerChallenge Connectors are spent
-    let largest_watchtower_challenge_block_hash = match get_largest_watchtower_challenge_block(
+
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    let connector_e_vout =
+        output_topology::watchtower_challenge_init::connector_e(watchtower_num) as u64;
+    let connector_f_vout =
+        output_topology::watchtower_challenge_init::connector_f(watchtower_num) as u64;
+    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_e_vout)
+        .await?
+        .is_some()
+        || outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_f_vout)
+            .await?
+            .is_some()
+    {
+        tracing::warn!(
+            "Ignore OperatorCommitPubinTimeout for {instance_id}:{graph_id}: timeout input already spent"
+        );
+        return Ok(());
+    }
+
+    let timeout_tx = graph.operator_commit_timeout.tx().clone();
+    let timeout_txid = timeout_tx.compute_txid();
+    if tx_on_chain(ctx.btc_client, &timeout_txid).await? {
+        return Ok(());
+    }
+    let timeout_tx_total_input_amount =
+        graph.operator_commit_timeout.prev_outs().iter().map(|o| o.value).sum::<Amount>();
+    broadcast_tx_with_cpfp(ctx.btc_client, timeout_tx, timeout_tx_total_input_amount).await?;
+    tracing::info!(
+        "Operator commit pubin timeout sent for {instance_id}:{graph_id}: txid={timeout_txid}"
+    );
+    Ok(())
+}
+
+// after the watchtower challenge flow is complete, build proof and broadcast Assert transaction.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_assert_ready_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<()> {
+    let message = GOATMessage::new(
+        Actor::Operator,
+        GOATMessageContent::AssertReady(AssertReady { instance_id, graph_id }),
+    );
+    let (mut graph, _graph_status, _graph_sub_status) =
+        match refresh_graph_status(ctx, instance_id, graph_id, None, GraphStatus::Challenge).await?
+        {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+    let (operator_wrapper_proof, wait_secs) = get_operator_wrapper_proof(
+        ctx.local_db,
+        ctx.http_client,
         &graph,
         ctx.btc_client,
-    )
-    .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                "Retry OperatorCommitBlockHashReady later for {instance_id}:{graph_id}: failed to get
-                            largest watchtower challenge block, error: {e:?}"
-            );
-            push_local_unhandled_messages(
-                ctx.local_db,
-                graph_id,
-                &message,
-                todo_funcs::avg_block_time_secs(ctx.btc_client.network()) as usize,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    // 2. sign & broadcast commit-blockhash txn
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let operator_graph_keypair = operator_master_key.master_keypair();
-    let operator_master_keypair = operator_master_key.master_keypair();
-    let wots_secret_keys = operator_master_key.wots_keypair_for_graph(graph.parameters.graph_id).0;
-    let blockhash_wots_secret_key = &wots_secret_keys[0];
-    let (operator_commit_blockhash_txin, operator_commit_blockhash_txin_amount) =
-        operator_sign_blockhash_commit(
-            operator_graph_keypair,
-            &mut graph,
-            &largest_watchtower_challenge_block_hash.to_byte_array(),
-            blockhash_wots_secret_key,
-        )?;
-    build_sign_and_broadcast_tx(
-        ctx.btc_client,
-        operator_master_keypair,
-        vec![operator_commit_blockhash_txin],
-        operator_commit_blockhash_txin_amount,
-        vec![],
+        instance_id,
+        graph_id,
     )
     .await?;
+
+    if wait_secs > 0 {
+        tracing::info!(
+            "Retry AssertReady later for {instance_id}:{graph_id}: operator proof is not ready"
+        );
+        push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
+        return Ok(());
+    }
+
+    let Some(operator_wrapper_proof) = operator_wrapper_proof else {
+        return Ok(());
+    };
+    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
+    let assert_secret_key = operator_master_key.assert_wots_keypair_for_graph(graph_id).0;
+    let assert_witness = build_assert_witness(&operator_wrapper_proof.proof, &assert_secret_key)?;
+    let assert_message = assert_wots_message(&assert_witness)?;
+    let mut asserted_wrapper_proof = Vec::new();
+    operator_wrapper_proof.proof.serialize_compressed(&mut asserted_wrapper_proof)?;
+    let mut setup_state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    let operator_state = setup_state
+        .operator
+        .as_mut()
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    if let Some(existing) = &operator_state.asserted_wrapper_proof
+        && existing != &asserted_wrapper_proof
+    {
+        bail!("operator assertion wrapper proof conflicts with persisted proof");
+    }
+    operator_state.asserted_wrapper_proof = Some(asserted_wrapper_proof);
+    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &setup_state)?;
+
+    let assert_tx = operator_sign_assert(&mut graph, &assert_secret_key, &assert_message)?;
+    broadcast_nonstandard_tx(ctx.btc_client, &assert_tx).await?;
+
+    let message_content = GOATMessageContent::AssertSent(AssertSent {
+        instance_id,
+        graph_id,
+        assert_txid: assert_tx.compute_txid(),
+        assert_witness: Some(assert_witness),
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+
     Ok(())
 }
 
+// verify Operator DynamicPublicInput and Proof; broadcast PubinDisprove or ChallengeAssert as needed.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_operator_commit_blockhash_timeout_challenger(
+async fn handle_assert_sent_verifier(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    content: &GOATMessageContent,
+    assert_txid: Txid,
+    assert_witness: &Option<BabeAssertWitness>,
 ) -> Result<()> {
-    // triggered by timeout task
-    let message = make_message(ctx, content);
-    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    if graph_status != GraphStatus::Challenge {
-        tracing::warn!(
-            "Ignore CommitBlockHashTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
-        );
-        return Ok(());
-    }
-    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let connector_f_vout = 1 + 2 * graph.parameters.watchtower_pubkeys.len() as u64;
-    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_f_vout)
-        .await?
-        .is_some()
-    {
-        tracing::warn!(
-            "Ignore OperatorCommitBlockHashTimeout for {instance_id}:{graph_id}: connector_F already spent"
-        );
-        return Ok(());
-    }
-    let watchtower_challenge_init_height = match ctx
-        .btc_client
-        .get_tx_status(&watchtower_challenge_init_txid)
-        .await?
-        .block_height
-    {
-        Some(height) => height,
-        None => {
-            tracing::warn!(
-                "Ignore OperatorCommitBlockHashTimeout for {instance_id}:{graph_id}: watchtower challenge init tx not confirmed yet"
-            );
-            return Ok(());
-        }
-    };
-    let current_height = ctx.btc_client.get_height().await?;
-    if current_height
-        < watchtower_challenge_init_height + commit_blockhash_timeout_timelock(get_network())
-    {
-        tracing::warn!(
-            "Ignore OperatorCommitBlockHashTimeout for {instance_id}:{graph_id}: commit-blockhash timelock not expired yet"
-        );
-        return Ok(());
-    }
-    let connector_g_vout = 2 * graph.parameters.watchtower_pubkeys.len() as u64;
-    if outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_g_vout)
-        .await?
-        .is_some()
-    {
-        tracing::warn!(
-            "Ignore OperatorCommitBlockHashTimeout for {instance_id}:{graph_id}: connector_G already spent"
-        );
-        return Ok(());
-    }
-    // 1. broadcast OperatorCommitBlockHashTimeout txn
-    let blockhash_commit_timeout_tx = graph.blockhash_commit_timeout.finalize();
-    let anchor_vout = blockhash_commit_timeout_tx.output.len() as u64 - 1;
-    let blockhash_commit_timeout_tx_total_input_amount =
-        graph.blockhash_commit_timeout.prev_outs().iter().map(|o| o.value).sum();
-    let child_tx = build_cpfp_txns(
-        ctx.btc_client,
-        &blockhash_commit_timeout_tx,
-        anchor_vout,
-        blockhash_commit_timeout_tx_total_input_amount,
-    )
-    .await?;
-    match child_tx {
-        Some(tx) => {
-            broadcast_package(ctx.btc_client, &[blockhash_commit_timeout_tx, tx], true).await?
-        }
-        None => broadcast_tx(ctx.btc_client, &blockhash_commit_timeout_tx).await?,
-    };
-    Ok(())
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_assert_init_ready_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    // triggered by timeout task
-    let message = make_message(ctx, content);
-    let (mut graph, graph_status, graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    if graph_status != GraphStatus::Challenge {
-        tracing::warn!(
-            "Ignore AssertInitReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
-        );
-        return Ok(());
-    }
-    match graph_sub_status {
-        Some(sub_status) => {
-            if !sub_status.is_watchtower_challenge_success() {
-                tracing::warn!(
-                    "Ignore AssertInitReady for {instance_id}:{graph_id}: watchtower challenge not finished yet, sub-status {sub_status:?}"
-                );
-                return Ok(());
-            }
-        }
-        None => {
-            tracing::warn!(
-                "Ignore AssertInitReady for {instance_id}:{graph_id}: graph sub-status is None"
-            );
-            return Ok(());
-        }
-    }
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let operator_graph_keypair = operator_master_key.master_keypair();
-    let assert_init_txid = graph.assert_init.tx().compute_txid();
-    // uncomment the following lines to check operator proof before sending assert-init txn
-    // let (proof_opt, wait_secs) =
-    //     get_operator_proof(local_db, http_client, instance_id, graph_id).await?;
-    // if proof_opt.is_none() {
-    //     tracing::warn!(
-    //         "Retry AssertInitReady for {instance_id}:{graph_id} later: operator proof not ready, retry after {wait_secs} seconds"
-    //     );
-    //     push_local_unhandled_messages(local_db, graph_id, &message, wait_secs).await?;
-    //     return Ok(());
-    // }
-    // 1. sign & broadcast assert-init txn
-    if !tx_on_chain(ctx.btc_client, &assert_init_txid).await? {
-        let assert_init_tx = operator_sign_assert_init(operator_graph_keypair, &mut graph)?;
-        let anchor_vout = assert_init_tx.output.len() as u64 - 1;
-        let assert_init_tx_total_input_amount =
-            graph.assert_init.prev_outs().iter().map(|o| o.value).sum();
-        let child_tx = build_cpfp_txns(
-            ctx.btc_client,
-            &assert_init_tx,
-            anchor_vout,
-            assert_init_tx_total_input_amount,
-        )
-        .await?;
-        match child_tx {
-            Some(tx) => broadcast_package(ctx.btc_client, &[assert_init_tx, tx], true).await?,
-            None => broadcast_tx(ctx.btc_client, &assert_init_tx).await?,
+    // TODO: check pubin first, if invalid, directly send PubinDisprove without building ChallengeAssert transaction
+    let (graph, _graph_status, _graph_sub_status) =
+        match refresh_graph_status(ctx, instance_id, graph_id, None, GraphStatus::Challenge).await?
+        {
+            Some(v) => v,
+            None => return Ok(()),
         };
-        // assert-commit should be broadcasted after assert-init is confirmed (wait for 1 block)
-        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
-        push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-            .await?;
-        return Ok(());
-    }
-    let connector_d_vout = graph.assert_commit_timeout_txns.len() as u64;
-    if outpoint_spent_txid(ctx.btc_client, &assert_init_txid, connector_d_vout).await?.is_some() {
-        tracing::warn!(
-            "Ignore AssertInitReady for {instance_id}:{graph_id}: connector_D already spent"
-        );
-        return Ok(());
-    }
-    // 2. sign & broadcast assert-commit txns
-    if !tx_confirmed(ctx.btc_client, &assert_init_txid).await? {
-        // assert-commit should be broadcasted after assert-init is confirmed (wait for 1 block)
-        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
-        push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-            .await?;
-        return Ok(());
-    } else {
-        let (split_txid_opt, has_pending_fee_input, proof_wait_secs_opt) =
-            operator_send_assert_commit(ctx.local_db, ctx.btc_client, ctx.http_client, &mut graph)
-                .await?;
-        if let Some(wait_secs) = proof_wait_secs_opt {
-            tracing::warn!(
-                "Retry AssertInitReady for {instance_id}:{graph_id} later: operator proof not ready, retry after {wait_secs} seconds"
-            );
-            push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
-            return Ok(());
-        } else if let Some(split_txid) = split_txid_opt {
-            let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network()) * 2;
-            tracing::warn!(
-                "Retry AssertInitReady for {instance_id}:{graph_id} later: fee_inputs_split_tx {split_txid} broadcasted, retry after {delay_secs} seconds"
-            );
-            push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-                .await?;
-        } else if has_pending_fee_input {
-            let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network()) * 2;
-            tracing::warn!(
-                "Retry AssertInitReady for {instance_id}:{graph_id} later: some fee inputs are pending, retry after {delay_secs} seconds",
-            );
-            push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
-                .await?;
-        }
-    }
-    Ok(())
-}
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_assert_commit_timeout_challenger(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    // triggered by timeout task
-    let message = make_message(ctx, content);
-    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-    if graph_status != GraphStatus::Challenge {
+    let Some(assert_tx) = ctx.btc_client.get_tx(&assert_txid).await? else {
         tracing::warn!(
-            "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+            "Ignore AssertSent for {instance_id}:{graph_id}: assert tx {assert_txid} not found on chain"
         );
         return Ok(());
-    }
-    let assert_init_txid = graph.assert_init.tx().compute_txid();
-    let connector_d_vout = graph.assert_commit_timeout_txns.len() as u64;
-    if outpoint_spent_txid(ctx.btc_client, &assert_init_txid, connector_d_vout).await?.is_some() {
+    };
+    let Some(assert_witness) = assert_witness else {
+        // TODO(gc-v2): recover BabeAssertWitness from the assert tx witness and graph.
         tracing::warn!(
-            "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: connector_D already spent"
+            "Ignore AssertSent for {instance_id}:{graph_id}: assert witness is not available in message"
         );
         return Ok(());
-    }
-    let assert_init_height = match ctx
-        .btc_client
-        .get_tx_status(&assert_init_txid)
-        .await?
-        .block_height
-    {
-        Some(height) => height,
-        None => {
-            tracing::warn!(
-                "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: assert init tx not confirmed yet"
-            );
-            return Ok(());
-        }
     };
-    let current_height = ctx.btc_client.get_height().await?;
-    if current_height < assert_init_height + assert_commit_timeout_timelock(get_network()) {
-        tracing::warn!(
-            "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: assert init tx timelock not expired yet"
-        );
-        return Ok(());
-    }
-    let mut commit_index = None;
-    for i in 0..graph.assert_commit_timeout_txns.len() {
-        let assert_commit_vout = i as u64;
-        if outpoint_spent_txid(ctx.btc_client, &assert_init_txid, assert_commit_vout)
-            .await?
-            .is_none()
-        {
-            commit_index = Some(i);
-            break;
-        }
-    }
-    let commit_index = match commit_index {
-        Some(index) => index,
-        None => {
-            tracing::warn!(
-                "Ignore AssertCommitTimeout for {instance_id}:{graph_id}: all assert commit connectors already spent"
-            );
-            return Ok(());
-        }
-    };
-    // 1. broadcast AssertCommitTimeout txn
-    let assert_commit_timeout_tx = graph
-        .assert_commit_timeout_txns
-        .get(commit_index)
-        .ok_or_else(|| {
-            anyhow!("AssertCommitTimeout txn not found for {instance_id}:{graph_id}:{commit_index}")
-        })?
-        .finalize();
-    let anchor_vout = assert_commit_timeout_tx.output.len() as u64 - 1;
-    let assert_commit_timeout_tx_total_input_amount =
-        graph.assert_commit_timeout_txns[commit_index].prev_outs().iter().map(|o| o.value).sum();
-    let child_tx = build_cpfp_txns(
-        ctx.btc_client,
-        &assert_commit_timeout_tx,
-        anchor_vout,
-        assert_commit_timeout_tx_total_input_amount,
-    )
-    .await?;
-    match child_tx {
-        Some(tx) => {
-            broadcast_package(ctx.btc_client, &[assert_commit_timeout_tx, tx], true).await?
-        }
-        None => broadcast_tx(ctx.btc_client, &assert_commit_timeout_tx).await?,
-    };
-    Ok(())
-}
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_disprove_ready_challenger(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    // triggered by AssertCommit tx or OperatorCommitBlockHash tx
-    let message = make_message(ctx, content);
-    let (graph, graph_status, _graph_sub_status) = match refresh_graph_status(
-        ctx,
-        instance_id,
-        graph_id,
-        Some(&message),
-        GraphStatus::Challenge,
-    )
-    .await?
-    {
-        Some(v) => v,
-        None => return Ok(()),
+    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
+    let verifier_pubkey = verifier_master_key.master_keypair().public_key().into();
+    let Some(verifier_index) =
+        find_verifier_index_by_pubkey(&graph.parameters.gc_data, &verifier_pubkey)?
+    else {
+        tracing::debug!(
+            "Ignore AssertSent for {instance_id}:{graph_id}: local verifier has no graph slot"
+        );
+        return Ok(());
     };
-    if graph_status != GraphStatus::Challenge {
+    validate_verifier_slot(&graph, verifier_index)?;
+
+    let Some(saved_verifier_state) = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .and_then(|state| state.verifier)
+    else {
         tracing::warn!(
-            "Ignore DisproveReady for {instance_id}:{graph_id}: graph status is {graph_status:?}"
+            "Ignore AssertSent for {instance_id}:{graph_id}: missing BABE verifier setup state"
+        );
+        return Ok(());
+    };
+    if saved_verifier_state.verifier_index != Some(verifier_index) {
+        tracing::warn!(
+            "Ignore AssertSent for {instance_id}:{graph_id}: local setup slot does not match graph owner slot"
         );
         return Ok(());
     }
-    // 1. get assertions committed by Operator from Bitcoin chain
-    let operator_commit_blockhash_txin = {
-        let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-        let connector_g_vout = 2 * graph.parameters.watchtower_pubkeys.len() as u64;
-        let commit_blockhash_timeout_txid = graph.blockhash_commit_timeout.tx().compute_txid();
-        match outpoint_spent_txin(ctx.btc_client, &watchtower_challenge_init_txid, connector_g_vout)
-            .await?
-        {
-            Some((spent_txid, _, txin)) => {
-                if spent_txid == commit_blockhash_timeout_txid {
-                    tracing::warn!(
-                        "Ignore DisproveReady for {instance_id}:{graph_id}: graph already challenged by CommitBlockHashTimeout: {spent_txid}"
-                    );
-                    return Ok(());
-                }
-                txin
-            }
-            None => {
-                tracing::warn!(
-                    "Ignore DisproveReady for {instance_id}:{graph_id}: operator-commit-blockhash not sent yet"
-                );
-                return Ok(());
-            }
-        }
-    };
-    let operator_assert_commit_txins = {
-        let assert_init_txid = graph.assert_init.tx().compute_txid();
-        let mut txins = vec![];
-        for i in 0..graph.assert_commit_timeout_txns.len() {
-            let assert_commit_vout = i as u64;
-            match outpoint_spent_txin(ctx.btc_client, &assert_init_txid, assert_commit_vout).await?
-            {
-                Some((spent_txid, _, txin)) => {
-                    let assert_commit_timeout_txid =
-                        graph.assert_commit_timeout_txns[i].tx().compute_txid();
-                    if spent_txid == assert_commit_timeout_txid {
-                        tracing::warn!(
-                            "Ignore DisproveReady for {instance_id}:{graph_id}: graph already challenged by AssertCommitTimeout[{i}]: {spent_txid}"
-                        );
-                        return Ok(());
-                    }
-                    txins.push(txin);
-                }
-                None => {
-                    tracing::warn!(
-                        "Ignore DisproveReady for {instance_id}:{graph_id}: assert-commit {i} not sent yet"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        txins
-    };
-    let operator_ack_txins = {
-        let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-        let mut txins = vec![];
-        for watchtower_index in 0..graph.parameters.watchtower_pubkeys.len() {
-            let ack_vout = 1 + 2 * watchtower_index as u64;
-            if let Some((spent_txid, _, txin)) =
-                outpoint_spent_txin(ctx.btc_client, &watchtower_challenge_init_txid, ack_vout)
-                    .await?
-            {
-                let nack_txid = graph.nack_txns[watchtower_index].tx().compute_txid();
-                if spent_txid != nack_txid {
-                    txins.push(txin);
-                }
-            }
-        }
-        txins
-    };
-    // 2. check assertions committed by Operator, if any assertion is invalid, sign & broadcast disprove txn
-    let vk = crate::vk::get_vk().await?;
-    let disprove_scripts = get_disprove_scripts(&graph.parameters).await?;
-    let disprove_scripts =
-        disprove_scripts.try_into().map_err(|_| anyhow!("Mismatch disprove scripts num"))?;
-    if let Some(disprove_witness) = verify_operator_commits(
-        operator_commit_blockhash_txin,
-        operator_assert_commit_txins,
-        operator_ack_txins,
-        graph.parameters.watchtower_pubkeys.len(),
+    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE challenge")?;
+    let public_inputs = derive_operator_wrapper_statement(graph_id)?.public_inputs;
+    let challenge_witness = build_real_challenge_assert_witness(
+        &saved_verifier_state.private_state,
+        &saved_verifier_state.setup_package,
+        &saved_verifier_state.finalized_indices,
         &vk,
-        &disprove_scripts,
-    )? {
-        let disprover_evm_address = get_node_goat_address()
-            .ok_or_else(|| anyhow::anyhow!("failed to get node goat address".to_string()))?;
-        let connector_e_input = Input {
-            outpoint: OutPoint { txid: graph.kickoff.tx().compute_txid(), vout: 3 },
-            amount: graph.kickoff.tx().output[3].value,
-        };
-        let disprove_tx = sign_disprove(
-            &graph,
-            &connector_e_input,
-            disprove_witness,
-            disprove_scripts.to_vec(),
-            Some(*disprover_evm_address.as_ref()),
-        )?;
-        let challenger_master_key = ChallengerMasterKey::new(get_bitvm_key()?);
-        let challenger_disprove_keypair = challenger_master_key.keypair_for_nst_disprove();
-        if let Err(e) = build_sign_and_broadcast_non_standard_tx(
-            ctx.btc_client,
-            challenger_disprove_keypair,
-            disprove_tx.clone(),
-            connector_e_input.amount,
-        )
-        .await
-        {
-            if e.downcast_ref::<SpecialError>()
-                .is_some_and(|se| matches!(se, SpecialError::InsufficientBalance(_)))
-            {
-                let disprove_address = node_p2wsh_address(
-                    get_network(),
-                    &challenger_disprove_keypair.public_key().into(),
-                );
-                let disprove_balance = ctx
-                    .btc_client
-                    .get_address_utxo(disprove_address.clone())
-                    .await?
-                    .iter()
-                    .map(|u| u.value)
-                    .sum::<bitcoin::Amount>();
-                let fee_rate = get_fee_rate(ctx.btc_client).await?;
-                let est_fee_sat =
-                    ((disprove_tx.weight().to_vbytes_ceil() + 200) as f64 * fee_rate).ceil() as u64;
-                let target_balance_sat = est_fee_sat + 20_000;
-                let shortfall_sat = target_balance_sat.saturating_sub(disprove_balance.to_sat());
-                if shortfall_sat > 0 {
-                    tracing::info!(
-                        "Top up nst-disprove p2wsh address for {instance_id}:{graph_id}: shortfall={} sats",
-                        shortfall_sat
-                    );
-                    fund_address(
-                        ctx.btc_client,
-                        challenger_master_key.master_keypair(),
-                        disprove_address,
-                        bitcoin::Amount::from_sat(shortfall_sat),
-                    )
-                    .await?;
-                }
-                build_sign_and_broadcast_non_standard_tx(
-                    ctx.btc_client,
-                    challenger_disprove_keypair,
-                    disprove_tx,
-                    connector_e_input.amount,
-                )
-                .await?;
-            } else {
-                return Err(e);
-            }
-        }
-    } else {
-        tracing::info!("All assertions valid for {instance_id}:{graph_id}, no need to disprove");
-        return Ok(());
-    }
+        &public_inputs,
+        &graph.parameters.operator_assert_wots_pubkey,
+        assert_witness,
+        verifier_index,
+    )?;
+    let labels: [Vec<u8>; goat::assert_scripts::INPUT_WIRE_NUM] = challenge_witness
+        .input_labels
+        .iter()
+        .map(|label| label.to_vec())
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|labels: Vec<Vec<u8>>| {
+            anyhow!(
+                "BABE challenge witness exposes {} labels; expected {}",
+                labels.len(),
+                goat::assert_scripts::INPUT_WIRE_NUM
+            )
+        })?;
+    let operator_assert_txin = assert_tx
+        .input
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
+    let challenge_assert_tx =
+        build_verifier_assert_tx(&graph, operator_assert_txin, verifier_index, labels)?;
+    broadcast_nonstandard_tx(ctx.btc_client, &challenge_assert_tx).await?;
+    let message_content = GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
+        instance_id,
+        graph_id,
+        challenge_assert_txid: challenge_assert_tx.compute_txid(),
+        verifier_index,
+        challenge_witness: Some(challenge_witness),
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
+
     Ok(())
 }
 
+// compute msg after ChallengeAssert is broadcast and broadcast WronglyChallenge transaction.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_challenge_assert_sent_operator(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    challenge_assert_txid: Txid,
+    verifier_index: usize,
+    challenge_witness: &Option<BabeChallengeAssertWitness>,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let (graph, _graph_status, _graph_sub_status) =
+        match refresh_graph_status(ctx, instance_id, graph_id, None, GraphStatus::Challenge).await?
+        {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+    let Some(challenge_witness) = challenge_witness else {
+        // TODO(gc-v2): recover BabeChallengeAssertWitness from the challenge tx witness and graph.
+        tracing::warn!(
+            "Ignore ChallengeAssertSent for {instance_id}:{graph_id}: challenge witness is not available in message"
+        );
+        return Ok(());
+    };
+
+    validate_verifier_slot(&graph, verifier_index)?;
+    validate_challenge_witness_index(verifier_index, challenge_witness)?;
+    validate_expected_challenge_assert_txid(&graph, verifier_index, challenge_assert_txid)?;
+
+    let Some(challenge_assert_tx) = ctx.btc_client.get_tx(&challenge_assert_txid).await? else {
+        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+        let message = make_message(ctx, content);
+        push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
+            .await?;
+        tracing::info!(
+            "Retry ChallengeAssertSent later for {instance_id}:{graph_id}: challenge assert tx {challenge_assert_txid} not found on chain"
+        );
+        return Ok(());
+    };
+
+    let labels: [Vec<u8>; goat::assert_scripts::INPUT_WIRE_NUM] = challenge_witness
+        .input_labels
+        .iter()
+        .map(|label| label.to_vec())
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|labels: Vec<Vec<u8>>| {
+            anyhow!(
+                "BABE challenge witness exposes {} labels; expected {}",
+                labels.len(),
+                goat::assert_scripts::INPUT_WIRE_NUM
+            )
+        })?;
+    let operator_assert_txid = challenge_assert_tx
+        .input
+        .first()
+        .ok_or_else(|| anyhow!("published verifier assert transaction has no input"))?
+        .previous_output
+        .txid;
+    let operator_assert_tx =
+        ctx.btc_client.get_tx(&operator_assert_txid).await?.ok_or_else(|| {
+            anyhow!("published operator assert transaction {operator_assert_txid} is unavailable")
+        })?;
+    let operator_assert_txin = operator_assert_tx
+        .input
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("published operator assert transaction has no input"))?;
+    let expected_challenge_assert =
+        build_verifier_assert_tx(&graph, operator_assert_txin, verifier_index, labels)?;
+    if expected_challenge_assert.input.first().map(|input| &input.witness)
+        != challenge_assert_tx.input.first().map(|input| &input.witness)
+    {
+        bail!("published verifier assert witness does not match BABE challenge labels");
+    }
+
+    let setup_state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    let operator_state = setup_state
+        .operator
+        .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
+    let candidate = operator_state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_index == Some(verifier_index))
+        .ok_or_else(|| anyhow!("missing BABE prover state for verifier slot {verifier_index}"))?;
+    let prover_state = candidate
+        .prover_state
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing BABE prover state for verifier slot {verifier_index}"))?;
+    let proof_bytes = operator_state
+        .asserted_wrapper_proof
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing asserted wrapper proof for graph {graph_id}"))?;
+    let proof = Groth16Proof::deserialize_compressed(proof_bytes.as_slice())
+        .context("deserialize asserted wrapper proof")?;
+    let wrongly_challenged_witness =
+        recover_real_wrongly_challenged_witness(prover_state, challenge_witness, &proof)?;
+    // TODO: The wrongly-challenged script accepts any one finalized-message preimage.
+    let final_msg = wrongly_challenged_witness
+        .final_msgs
+        .first()
+        .ok_or_else(|| anyhow!("wrongly challenged witness has no final message preimage"))?;
+    let (wrongly_challenged_input, _amount) =
+        operator_sign_wrongly_challenged(&graph, verifier_index, final_msg)?;
+    let wrongly_challenged_tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![wrongly_challenged_input],
+        output: vec![goat::scripts::p2a_output()],
+    };
+    broadcast_nonstandard_tx(ctx.btc_client, &wrongly_challenged_tx).await?;
+
+    Ok(())
+}
+
+// broadcast NoWithdraw after the ChallengeAssert timelock expires.
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_wrongly_challenge_timeout_verifier(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    challenge_assert_txid: Txid,
+    verifier_index: usize,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    let (graph, _graph_status, _graph_sub_status) = match refresh_graph_status(
+        ctx,
+        instance_id,
+        graph_id,
+        None,
+        GraphStatus::Disprove,
+    )
+    .await?
+    {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    validate_verifier_slot(&graph, verifier_index)?;
+    validate_expected_challenge_assert_txid(&graph, verifier_index, challenge_assert_txid)?;
+    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
+    let local_verifier_pubkey: PublicKey = verifier_master_key.master_keypair().public_key().into();
+    if graph.parameters.gc_data[verifier_index].verifier_pubkey != local_verifier_pubkey {
+        tracing::debug!(
+            "Ignore WronglyChallengeTimeout for {instance_id}:{graph_id}: local verifier does not own slot {verifier_index}"
+        );
+        return Ok(());
+    }
+
+    let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+    let message = make_message(ctx, content);
+    if ctx.btc_client.get_tx(&challenge_assert_txid).await?.is_none() {
+        push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
+            .await?;
+        tracing::info!(
+            "Retry WronglyChallengeTimeout later for {instance_id}:{graph_id}: challenge assert tx {challenge_assert_txid} not found on chain"
+        );
+        return Ok(());
+    }
+
+    let challenge_assert_height = match ctx
+        .btc_client
+        .get_tx_status(&challenge_assert_txid)
+        .await?
+        .block_height
+    {
+        Some(height) => height as u64,
+        None => {
+            push_local_unhandled_messages(ctx.local_db, graph_id, &message, delay_secs as usize)
+                .await?;
+            tracing::info!(
+                "Retry WronglyChallengeTimeout later for {instance_id}:{graph_id}: challenge assert tx {challenge_assert_txid} is not confirmed"
+            );
+            return Ok(());
+        }
+    };
+
+    let disprove_height = challenge_assert_height
+        + disprove_timelock(graph.parameters.instance_parameters.network) as u64;
+    let goat_confirmed_height = ctx.goat_client.btc_spv_latest_height().await?;
+    if goat_confirmed_height < disprove_height {
+        let retry_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network())
+            * (disprove_height - goat_confirmed_height);
+        push_local_unhandled_messages(ctx.local_db, graph_id, &message, retry_secs as usize)
+            .await?;
+        tracing::info!(
+            "Retry WronglyChallengeTimeout later for {instance_id}:{graph_id}: disprove timelock has not expired"
+        );
+        return Ok(());
+    }
+    if let Some(spent_txid) = outpoint_spent_txid(ctx.btc_client, &challenge_assert_txid, 0).await?
+    {
+        tracing::info!(
+            "Skip Disprove for {instance_id}:{graph_id} slot {verifier_index}: verifier assertion output already spent by {spent_txid}"
+        );
+        return Ok(());
+    }
+
+    let disprove_tx = build_disprove_tx(&graph, verifier_index, None)?;
+    broadcast_nonstandard_tx(ctx.btc_client, &disprove_tx).await?;
+
+    let message_content = GOATMessageContent::DisproveSent(DisproveSent {
+        instance_id,
+        graph_id,
+        disprove_type: DisproveTxType::Disprove,
+        index: verifier_index,
+        challenge_start_txid: Some(challenge_assert_txid),
+        challenge_finish_txid: disprove_tx.compute_txid(),
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
+
+    Ok(())
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id
+))]
 async fn handle_disprove_sent_committee(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
@@ -3349,7 +4061,7 @@ async fn handle_disprove_sent_committee(
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let take1_txid = graph.take1.tx().compute_txid();
-    let connector_a_vout = 0;
+    let connector_a_vout = output_topology::kickoff::connector_a() as u64;
     let challenge_start_tx = if let Some(spent_txid) =
         outpoint_spent_txid(ctx.btc_client, &kickoff_txid, connector_a_vout).await?
     {
@@ -3372,79 +4084,6 @@ async fn handle_disprove_sent_committee(
             return Ok(());
         }
     };
-    match disprove_type {
-        DisproveTxType::AssertTimeout => {
-            if challenge_finish_txid
-                != graph
-                    .assert_commit_timeout_txns
-                    .get(index)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "AssertCommitTimeout txn not found for {instance_id}:{graph_id}:{index}"
-                        )
-                    })?
-                    .tx()
-                    .compute_txid()
-            {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish txid does not match assert commit timeout txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::OperatorCommitTimeout => {
-            if challenge_finish_txid != graph.blockhash_commit_timeout.tx().compute_txid() {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish txid does not match operator commit timeout txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::OperatorNack => {
-            if challenge_finish_txid
-                != graph
-                    .nack_txns
-                    .get(index)
-                    .ok_or_else(|| {
-                        anyhow!("Nack txn not found for {instance_id}:{graph_id}:{index}")
-                    })?
-                    .tx()
-                    .compute_txid()
-            {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish txid does not match nack txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::Disprove => {
-            let connector_e_input = OutPoint { txid: kickoff_txid, vout: 3 };
-            if challenge_finish_tx.input[0].previous_output != connector_e_input {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish tx is not a disprove txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::QuickChallenge => {
-            let guardian_connector_input = OutPoint { txid: kickoff_txid, vout: 4 };
-            if challenge_finish_tx.input[0].previous_output != guardian_connector_input {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish tx is not a quick challenge txn"
-                );
-                return Ok(());
-            }
-        }
-        DisproveTxType::ChallengeIncompleteKickoff => {
-            let guardian_connector_input = OutPoint { txid: kickoff_txid, vout: 4 };
-            if challenge_finish_tx.input[0].previous_output != guardian_connector_input {
-                tracing::warn!(
-                    "Ignore DisproveSent for {instance_id}:{graph_id}: challenge finish tx is not a challenge incomplete kickoff txn"
-                );
-                return Ok(());
-            }
-        }
-    }
     let challenge_finish_height = match ctx
         .btc_client
         .get_tx_status(&challenge_finish_txid)
@@ -3526,8 +4165,8 @@ async fn handle_take1_ready_operator(
         return Ok(());
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let connector_a_vout = 0;
-    let guardian_connector_vout = 4;
+    let connector_a_vout = output_topology::kickoff::connector_a() as u64;
+    let guardian_connector_vout = output_topology::kickoff::guardian_connector() as u64;
     if outpoint_spent_txid(ctx.btc_client, &kickoff_txid, connector_a_vout).await?.is_some()
         || outpoint_spent_txid(ctx.btc_client, &kickoff_txid, guardian_connector_vout)
             .await?
@@ -3684,30 +4323,28 @@ async fn handle_take2_ready_operator(
         );
         return Ok(());
     }
-    let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let assert_init_txid = graph.assert_init.tx().compute_txid();
-    let connector_d_vout = graph.assert_commit_timeout_txns.len() as u64;
-    let connector_e_vout = 3;
-    let connector_f_vout = 1 + 2 * graph.parameters.watchtower_pubkeys.len() as u64;
-    let guardian_connector_vout = 4;
-    // check if connector_E, connector_F, connector_D, guardian_connector are all unspent
-    if outpoint_spent_txid(ctx.btc_client, &kickoff_txid, connector_e_vout).await?.is_some()
-        || outpoint_spent_txid(ctx.btc_client, &watchtower_challenge_init_txid, connector_f_vout)
-            .await?
-            .is_some()
-        || outpoint_spent_txid(ctx.btc_client, &assert_init_txid, connector_d_vout).await?.is_some()
-        || outpoint_spent_txid(ctx.btc_client, &kickoff_txid, guardian_connector_vout)
-            .await?
-            .is_some()
-    {
-        tracing::warn!("Ignore Take2Ready for {instance_id}:{graph_id}: connectors already spent");
-        return Ok(());
+    let operator_assert_txid = graph.operator_assert.tx().compute_txid();
+    // Take2 spends Connector-0, Connector-D, and Guardian Connector. Recheck every input before
+    // signing so a stale Take2Ready cannot race an already-spent connector.
+    let take2_inputs =
+        graph.take2.tx().input.iter().map(|txin| txin.previous_output).collect::<Vec<OutPoint>>();
+    for previous_output in take2_inputs {
+        if let Some(spent_txid) =
+            outpoint_spent_txid(ctx.btc_client, &previous_output.txid, previous_output.vout as u64)
+                .await?
+        {
+            tracing::warn!(
+                "Ignore Take2Ready for {instance_id}:{graph_id}: take2 input {}:{} already spent by {}",
+                previous_output.txid,
+                previous_output.vout,
+                spent_txid
+            );
+            return Ok(());
+        }
     }
-    // check if assert-init tx and watchtower-challenge-init tx are both confirmed and timelock expired
-    let assert_init_height = match ctx
+    let operator_assert_height = match ctx
         .btc_client
-        .get_tx_status(&assert_init_txid)
+        .get_tx_status(&operator_assert_txid)
         .await?
         .block_height
     {
@@ -3719,27 +4356,7 @@ async fn handle_take2_ready_operator(
             return Ok(());
         }
     };
-    let watchtower_challenge_init_height = match ctx
-        .btc_client
-        .get_tx_status(&watchtower_challenge_init_txid)
-        .await?
-        .block_height
-    {
-        Some(height) => height,
-        None => {
-            tracing::warn!(
-                "Ignore Take2Ready for {instance_id}:{graph_id}: watchtower challenge init tx not confirmed yet"
-            );
-            return Ok(());
-        }
-    };
-    if !is_take2_timelock_expired(
-        ctx.btc_client,
-        watchtower_challenge_init_height,
-        assert_init_height,
-    )
-    .await?
-    {
+    if !is_take2_timelock_expired(ctx.btc_client, operator_assert_height).await? {
         tracing::warn!(
             "Ignore Take2Ready for {instance_id}:{graph_id}: take2 timelock not expired yet"
         );
@@ -3880,7 +4497,7 @@ async fn handle_sync_graph(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     graph_id: Uuid,
-    graph: &SimplifiedBitvm2Graph,
+    graph: &SimplifiedBitvmGcGraph,
 ) -> Result<()> {
     // sent by relayer nodes in response to SyncGraphRequest
     if graph_exists(ctx.local_db, instance_id, graph_id).await? {
@@ -3895,7 +4512,7 @@ async fn handle_sync_graph(
         )
     })?;
     store_graph(ctx.local_db, graph).await?;
-    let graph = Bitvm2Graph::from_simplified(graph)?;
+    let graph = BitvmGcGraph::from_simplified(graph)?;
     refresh_and_compensate(
         ctx,
         instance_id,
@@ -3924,4 +4541,128 @@ async fn handle_response_node_info(
 ) -> Result<()> {
     save_node_info(ctx.local_db, node_info).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use bitvm_lib::babe_adapter::{
+        BABE_M_CC, BabeProverState, build_setup_package, open_and_solder,
+    };
+
+    use super::*;
+
+    fn verifier_pubkey() -> PublicKey {
+        PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap()
+    }
+
+    fn gc_submission() -> (CACSetupPackage, BitvmGcCircuitData, BabeProverState) {
+        let package = build_setup_package(BABE_M_CC + 1).unwrap();
+        let selected = (0..BABE_M_CC).collect::<Vec<_>>();
+        let (_, finalized, soldering) = open_and_solder(&package, &selected).unwrap();
+        let gc_data = extract_gc_circuit_data(&finalized, &soldering, verifier_pubkey()).unwrap();
+        let prover_state = BabeProverState {
+            package: package.clone(),
+            finalized,
+            soldering,
+            h_msgs: gc_data.final_msg_hashlocks.clone(),
+        };
+        (package, gc_data, prover_state)
+    }
+
+    fn operator_state(package: CACSetupPackage) -> OperatorBabeSetupState {
+        OperatorBabeSetupState {
+            frozen_verifier_pubkeys: Some(vec![verifier_pubkey()]),
+            candidates: vec![OperatorVerifierCandidate {
+                verifier_pubkey: verifier_pubkey(),
+                setup_package: package,
+                verifier_index: Some(0),
+                selected_circuit_indexes: (0..BABE_M_CC).collect(),
+                gc_data: None,
+                prover_state: None,
+            }],
+            asserted_wrapper_proof: None,
+        }
+    }
+
+    #[test]
+    fn freeze_operator_candidate_selects_protocol_finalized_count() {
+        let package = build_setup_package(BABE_M_CC + 1).unwrap();
+        let mut state = OperatorBabeSetupState {
+            frozen_verifier_pubkeys: None,
+            candidates: vec![OperatorVerifierCandidate {
+                verifier_pubkey: verifier_pubkey(),
+                setup_package: package,
+                verifier_index: None,
+                selected_circuit_indexes: vec![],
+                gc_data: None,
+                prover_state: None,
+            }],
+            asserted_wrapper_proof: None,
+        };
+
+        freeze_operator_candidates(&mut state).unwrap();
+
+        assert_eq!(state.candidates[0].selected_circuit_indexes.len(), BABE_M_CC);
+    }
+
+    #[test]
+    fn candidate_records_one_slot_and_full_prover_state_idempotently() {
+        let (package, gc_data, prover_state) = gc_submission();
+        let mut state = operator_state(package.clone());
+
+        let graph_data = record_candidate_gc_data(
+            &mut state,
+            verifier_pubkey(),
+            0,
+            &package,
+            gc_data.clone(),
+            prover_state.clone(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(graph_data.len(), 1);
+        assert_eq!(graph_data[0].final_msg_hashlocks.len(), BABE_M_CC);
+        assert_eq!(state.candidates[0].prover_state.as_ref().unwrap().finalized.len(), BABE_M_CC);
+
+        let duplicate = record_candidate_gc_data(
+            &mut state,
+            verifier_pubkey(),
+            0,
+            &package,
+            gc_data.clone(),
+            prover_state.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(duplicate.len(), 1);
+
+        let mut conflict = prover_state;
+        conflict.h_msgs[0][0] ^= 1;
+        assert!(
+            record_candidate_gc_data(
+                &mut state,
+                verifier_pubkey(),
+                0,
+                &package,
+                gc_data,
+                conflict,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_operator_candidate_without_prover_state_deserializes() {
+        let (package, _, _) = gc_submission();
+        let mut value = serde_json::to_value(operator_state(package)).unwrap();
+        value["candidates"][0].as_object_mut().unwrap().remove("prover_state");
+
+        let restored: OperatorBabeSetupState = serde_json::from_value(value).unwrap();
+
+        assert!(restored.candidates[0].prover_state.is_none());
+    }
 }

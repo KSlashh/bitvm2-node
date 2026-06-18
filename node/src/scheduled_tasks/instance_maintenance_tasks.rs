@@ -13,10 +13,10 @@ use crate::utils::{
     upsert_message,
 };
 use alloy::sol_types::SolType;
-use bitvm2_lib::actors::Actor;
-use bitvm2_lib::constants::CONNECTOR_Z_TIMELOCK;
-use bitvm2_lib::keys::CommitteeMasterKey;
-use bitvm2_lib::transactions::base::BaseTransaction;
+use bitvm_lib::actors::Actor;
+use bitvm_lib::constants::CONNECTOR_Z_TIMELOCK;
+use bitvm_lib::keys::CommitteeMasterKey;
+use bitvm_lib::transactions::base::BaseTransaction;
 use client::Utxo;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;

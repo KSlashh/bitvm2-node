@@ -2,11 +2,7 @@ use crate::committee::{
     CommitteeNonceSignatures, CommitteePubNonces, CommitteeSecNonces, generate_nonce,
     generate_nonce_from_seed,
 };
-
-use super::{
-    operator::generate_wots_keys,
-    types::{OperatorWotsPublicKeys, OperatorWotsSecretKeys},
-};
+use crate::operator::{generate_assert_wots_key, generate_commit_pubin_wots_key};
 use anyhow::{Context, bail};
 use bitcoin::{
     Network, PublicKey,
@@ -17,6 +13,10 @@ use bitcoin::{
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, Payload},
+};
+use goat::assert_scripts::{
+    OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
+    OperatorCommitPubinSecretKey,
 };
 use hex::{decode as hex_decode, encode as hex_encode};
 use hkdf::Hkdf;
@@ -30,17 +30,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write, path::Path};
 use uuid::Uuid;
 
-const HKDF_SALT: &[u8] = b"bitvm2/keys/v1";
+pub type OperatorAssertWotsSecretKey = OperatorAssertSecretKey;
+pub type OperatorAssertWotsPublicKey = OperatorAssertPublicKey;
+pub type OperatorAssertWotsKeypair = (OperatorAssertWotsSecretKey, OperatorAssertWotsPublicKey);
+pub type OperatorCommitPubinWotsSecretKey = OperatorCommitPubinSecretKey;
+pub type OperatorCommitPubinWotsPublicKey = OperatorCommitPubinPublicKey;
+pub type OperatorCommitPubinWotsKeypair =
+    (OperatorCommitPubinWotsSecretKey, OperatorCommitPubinWotsPublicKey);
+
+const HKDF_SALT: &[u8] = b"bitvm-gc/keys/v1";
 const BITVM_BIP32_ROOT_DOMAIN: &[u8] = b"bitvm_bip32_root";
-const PURPOSE_BITVM2_DERIVATION: u32 = 2345;
+const PURPOSE_BITVM_GC_DERIVATION: u32 = 2345;
 
 const ROLE_COMMITTEE: u32 = 0;
 const ROLE_OPERATOR: u32 = 1;
-const ROLE_CHALLENGER: u32 = 2;
+// const ROLE_VERIFIER: u32 = 2;
 
 const KEY_KIND_COMMITTEE_ENVELOPE: u32 = 0;
 const KEY_KIND_OPERATOR_NONCE: u32 = 1;
-const KEY_KIND_CHALLENGER_DISPROVE: u32 = 2;
 
 const COMMITTEE_ENVELOPE_VERSION: u8 = 1;
 
@@ -95,7 +102,8 @@ fn operator_nonce_derivation_path(nonce: u64) -> DerivationPath {
     ];
 
     let mut path = vec![
-        ChildNumber::from_hardened_idx(PURPOSE_BITVM2_DERIVATION).expect("constant index is valid"),
+        ChildNumber::from_hardened_idx(PURPOSE_BITVM_GC_DERIVATION)
+            .expect("constant index is valid"),
         ChildNumber::from_hardened_idx(ROLE_OPERATOR).expect("constant index is valid"),
         ChildNumber::from_hardened_idx(KEY_KIND_OPERATOR_NONCE).expect("constant index is valid"),
     ];
@@ -105,16 +113,6 @@ fn operator_nonce_derivation_path(nonce: u64) -> DerivationPath {
             .map(|seg| ChildNumber::from_hardened_idx(seg).expect("16-bit index is always valid")),
     );
     DerivationPath::from(path)
-}
-
-// Path layout: m / purpose' / role' / key_kind'
-fn challenger_disprove_derivation_path() -> DerivationPath {
-    DerivationPath::from(vec![
-        ChildNumber::from_hardened_idx(PURPOSE_BITVM2_DERIVATION).expect("constant index is valid"),
-        ChildNumber::from_hardened_idx(ROLE_CHALLENGER).expect("constant index is valid"),
-        ChildNumber::from_hardened_idx(KEY_KIND_CHALLENGER_DISPROVE)
-            .expect("constant index is valid"),
-    ])
 }
 
 // Path layout: m / purpose' / role_committee' / key_kind' / iid_0' / ... / iid_7'
@@ -132,7 +130,8 @@ fn committee_kek_derivation_path(instance_id: Uuid) -> DerivationPath {
     ];
 
     let mut path = vec![
-        ChildNumber::from_hardened_idx(PURPOSE_BITVM2_DERIVATION).expect("constant index is valid"),
+        ChildNumber::from_hardened_idx(PURPOSE_BITVM_GC_DERIVATION)
+            .expect("constant index is valid"),
         ChildNumber::from_hardened_idx(ROLE_COMMITTEE).expect("constant index is valid"),
         ChildNumber::from_hardened_idx(KEY_KIND_COMMITTEE_ENVELOPE)
             .expect("constant index is valid"),
@@ -344,7 +343,7 @@ impl CommitteeMasterKey {
         instance_id: Uuid,
         graph_id: Uuid,
         watchtower_num: usize,
-        assert_commit_num: usize,
+        verifier_num: usize,
         signer_keypair: Keypair,
     ) -> (CommitteePubNonces, CommitteeSecNonces, CommitteeNonceSignatures) {
         let domain = [
@@ -359,7 +358,7 @@ impl CommitteeMasterKey {
             graph_id.as_u128() as usize,
             signer_keypair,
             watchtower_num,
-            assert_commit_num,
+            verifier_num,
         )
     }
 
@@ -391,13 +390,19 @@ impl OperatorMasterKey {
             .expect("valid derivation path should derive child key");
         Keypair::from_secret_key(SECP256K1, &child.private_key)
     }
-    pub fn wots_keypair_for_graph(
+    pub fn assert_wots_keypair_for_graph(&self, graph_id: Uuid) -> OperatorAssertWotsKeypair {
+        let domain = [b"operator_bitvm_wots_key".to_vec(), graph_id.as_bytes().to_vec()].concat();
+        let key_seed = derive_secret(&self.0, &domain);
+        generate_assert_wots_key(&key_seed)
+    }
+    pub fn commit_pubin_wots_keypair_for_graph(
         &self,
         graph_id: Uuid,
-    ) -> (OperatorWotsSecretKeys, OperatorWotsPublicKeys) {
-        let domain = [b"operator_bitvm_wots_key".to_vec(), graph_id.as_bytes().to_vec()].concat();
-        let wot_seed = derive_secret(&self.0, &domain);
-        generate_wots_keys(&wot_seed)
+    ) -> OperatorCommitPubinWotsKeypair {
+        let domain =
+            [b"operator_bitvm_pubin_wots_key".to_vec(), graph_id.as_bytes().to_vec()].concat();
+        let key_seed = derive_secret(&self.0, &domain);
+        generate_commit_pubin_wots_key(&key_seed)
     }
     pub fn preimage_for_graph(&self, graph_id: Uuid, index: usize) -> Vec<u8> {
         let domain = [
@@ -410,21 +415,13 @@ impl OperatorMasterKey {
     }
 }
 
-pub struct ChallengerMasterKey(Keypair);
-impl ChallengerMasterKey {
+pub struct VerifierMasterKey(Keypair);
+impl VerifierMasterKey {
     pub fn new(inner: Keypair) -> Self {
-        ChallengerMasterKey(inner)
+        VerifierMasterKey(inner)
     }
     pub fn master_keypair(&self) -> Keypair {
         NodeMasterKey(self.0).master_keypair()
-    }
-    pub fn keypair_for_nst_disprove(&self) -> Keypair {
-        let root = derive_bip32_root(&self.0);
-        let path = challenger_disprove_derivation_path();
-        let child = root
-            .derive_priv(SECP256K1, &path)
-            .expect("valid derivation path should derive child key");
-        Keypair::from_secret_key(SECP256K1, &child.private_key)
     }
 }
 
@@ -452,7 +449,7 @@ mod tests {
 
     fn test_envelope_path(instance_id: Uuid) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("bitvm2-committee-key-{instance_id}.json"));
+        path.push(format!("bitvm-gc-committee-key-{instance_id}.json"));
         path
     }
 
@@ -583,13 +580,33 @@ mod tests {
     }
 
     #[test]
+    fn operator_assert_wots_keypair_for_graph_is_deterministic_and_graph_scoped() {
+        let master = OperatorMasterKey::new(test_master_keypair("seed:test-operator-master"));
+        let graph_a = Uuid::new_v4();
+        let graph_b = Uuid::new_v4();
+
+        let keypair_a1 = master.assert_wots_keypair_for_graph(graph_a);
+        let keypair_a2 = master.assert_wots_keypair_for_graph(graph_a);
+        let keypair_b = master.assert_wots_keypair_for_graph(graph_b);
+
+        assert_eq!(keypair_a1.1, keypair_a2.1, "same graph should derive same WOTS pubkey");
+        assert_ne!(
+            keypair_a1.1, keypair_b.1,
+            "different graphs should derive different WOTS pubkeys"
+        );
+    }
+
+    #[test]
     fn operator_nonce_derivation_path_has_expected_bip32_layout() {
         let nonce: u64 = 0x1122_3344_5566_7788;
         let path = operator_nonce_derivation_path(nonce);
         let children: Vec<ChildNumber> = path.into_iter().cloned().collect();
 
         assert_eq!(children.len(), 7, "path should be purpose/role/key_kind + 4 segments");
-        assert_eq!(children[0], ChildNumber::from_hardened_idx(PURPOSE_BITVM2_DERIVATION).unwrap());
+        assert_eq!(
+            children[0],
+            ChildNumber::from_hardened_idx(PURPOSE_BITVM_GC_DERIVATION).unwrap()
+        );
         assert_eq!(children[1], ChildNumber::from_hardened_idx(ROLE_OPERATOR).unwrap());
         assert_eq!(children[2], ChildNumber::from_hardened_idx(KEY_KIND_OPERATOR_NONCE).unwrap());
         assert_eq!(children[3], ChildNumber::from_hardened_idx(0x1122).unwrap());
@@ -612,17 +629,5 @@ mod tests {
         assert_eq!(path_a1, path_a2, "same instance should derive same path");
         assert_ne!(kek_a1, kek_b, "different instances should derive different kek");
         assert_ne!(path_a1, path_b, "different instances should derive different path");
-    }
-
-    #[test]
-    fn challenger_nst_disprove_keypair_is_deterministic() {
-        let master = ChallengerMasterKey::new(test_master_keypair("seed:test-challenger-master"));
-
-        let keypair_1 = master.keypair_for_nst_disprove();
-        let keypair_2 = master.keypair_for_nst_disprove();
-
-        let pub_1: PublicKey = keypair_1.public_key().into();
-        let pub_2: PublicKey = keypair_2.public_key().into();
-        assert_eq!(pub_1, pub_2, "challenger disprove keypair should be stable");
     }
 }

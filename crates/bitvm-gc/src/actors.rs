@@ -5,7 +5,7 @@ use strum::{Display, EnumString};
 pub enum Actor {
     Committee,
     Operator,
-    Challenger,
+    Verifier,
     Watchtower,
     Publisher,
     All,

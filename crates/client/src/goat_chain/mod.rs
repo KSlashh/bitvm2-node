@@ -252,8 +252,13 @@ impl GOATClient {
         self.chain_service.gateway_init_withdraw(instance_id, graph_id).await
     }
 
-    pub async fn gateway_cancel_withdraw(&self, graph_id: &Uuid) -> anyhow::Result<String> {
-        self.chain_service.gateway_cancel_withdraw(graph_id).await
+    pub async fn gateway_cancel_withdraw(
+        &self,
+        graph_id: &Uuid,
+        nonce: U256,
+        committee_signs: &[Vec<u8>],
+    ) -> anyhow::Result<String> {
+        self.chain_service.gateway_cancel_withdraw(graph_id, nonce, committee_signs).await
     }
 
     pub async fn gateway_process_withdraw(
@@ -365,10 +370,14 @@ impl GOATClient {
                 (raw_challenge_start_tx, challenge_start_proof)
             }
             None => {
-                // if no challengeStartTx happens (for QuickChallenge & ChallengeIncompleteKickoff), set rawChallengeStartTx.inputVector to empty
+                // if no challengeStartTx happens, set rawChallengeStartTx.inputVector to empty
                 if !matches!(
                     disprove_type,
-                    DisproveTxType::QuickChallenge | DisproveTxType::ChallengeIncompleteKickoff
+                    DisproveTxType::QuickChallenge
+                        | DisproveTxType::ChallengeIncompleteKickoff
+                        | DisproveTxType::PubinDisprove
+                        | DisproveTxType::OperatorChallengeNack
+                        | DisproveTxType::OperatorCommitTimeout
                 ) {
                     bail!("challenge_start_tx is required for disprove type {disprove_type:?}");
                 }
@@ -741,6 +750,15 @@ impl GOATClient {
             .filter_map(|v| XOnlyPublicKey::from_slice(v).ok())
             .collect::<Vec<XOnlyPublicKey>>())
     }
+
+    pub async fn committee_mana_get_verifiers(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.chain_service.committee_mana_get_verifiers().await
+    }
+
+    pub async fn committee_mana_is_verifier(&self, peer_id: &[u8]) -> anyhow::Result<bool> {
+        self.chain_service.committee_mana_is_verifier(peer_id).await
+    }
+
     pub async fn committee_mana_add_watchtower(
         &self,
         watchtower: &[u8; 32],

@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 
 [workspace]
@@ -8,7 +8,7 @@ members = [
     "node",
     "proof-builder-rpc",
     "crates/cbft-rpc",
-    "crates/bitvm2-ga",
+    "crates/bitvm-gc",
     "crates/store",
     "crates/client",
     "crates/util",
@@ -17,18 +17,20 @@ members = [
     "crates/state-chain",
     #"crates/mara-slipstream-client",
     "crates/bitcoin-light-client-circuit",
+    "crates/verifier",
     "circuits/header-chain-proof/host",
     "circuits/commit-chain-proof/host",
     "circuits/state-chain-proof/host",
     "circuits/watchtower-proof/host",
     "circuits/operator-proof/host",
+    "circuits/operator-wrapper-proof/host",
     "circuits/proof-builder",
 ]
 default-members = ["node"]
 
 [workspace.dependencies]
-bitvm = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "GA" }
-goat = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "GA" }
+bitvm = { git = "https://github.com/KSlashh/BitVM.git", branch = "gc-v2" }
+goat = { git = "https://github.com/KSlashh/BitVM.git", branch = "gc-v2" }
 
 libp2p = { version = "0.55.0", features = ["tokio", "dns", "kad", "noise", "tcp", "yamux", "rsa", "ping", "mdns"] }
 libp2p-swarm-derive = "0.35.0"
@@ -46,6 +48,8 @@ hex = "0.4.3"
 indexmap = { version = "2.11.0", features = ["serde"] }
 ark-bn254 = { version = "0.5.0", features = ["curve", "scalar_field"], default-features = false }
 ark-groth16 = "0.5.0"
+ark-ff = "0.5.0"
+ark-crypto-primitives = "0.5.0"
 base64 = "0.21"
 ark-serialize = "0.5.0"
 sha2 = "0.10.9"
@@ -55,8 +59,10 @@ chacha20poly1305 = "0.10.1"
 tokio-util = "0.7.15"
 esplora-client = { git = "https://github.com/BitVM/rust-esplora-client" }
 serde_json = "1.0.116"
+serde-big-array = "0.5.1"
 toml = "0.8"
 rand = "0.8.5"
+rand_chacha = { version = "0.3", default-features = false }
 dotenv = "0.15.0"
 blake3 = "=1.5.1"
 musig2 = { version = "0.1.0", features = ["serde", "rand"] }
@@ -89,6 +95,10 @@ zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }
+zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-stark = { git = "https://github.com/ProjectZKM/Ziren" }
+p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3" }
+p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 
 #zkm-build = { path = "../Ziren/crates/build" }
 #zkm-core-executor = { path = "../Ziren/crates/core/executor" }
@@ -96,7 +106,10 @@ zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] 
 #zkm-sdk = { path = "../Ziren/crates/sdk" }
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
-bitvm2-lib = { path = "crates/bitvm2-ga" }
+bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
+soldering-host = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
 store = { path = "crates/store" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }
@@ -107,8 +120,10 @@ commit-chain = { path = "crates/commit-chain" }
 commit-chain-proof = { path = "circuits/commit-chain-proof/host" }
 cbft-rpc = { path = "crates/cbft-rpc" }
 state-chain = { path = "crates/state-chain" }
+verifier = { path = "crates/verifier" }
 state-chain-proof = { path = "circuits/state-chain-proof/host" }
 operator-proof = { path = "circuits/operator-proof/host" }
+operator-wrapper-proof = { path = "circuits/operator-wrapper-proof/host" }
 watchtower-proof = { path = "circuits/watchtower-proof/host" }
 proof-builder = { path = "circuits/proof-builder" }
 

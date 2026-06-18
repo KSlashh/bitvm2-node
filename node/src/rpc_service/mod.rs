@@ -1,5 +1,5 @@
 pub mod auth;
-mod bitvm2;
+mod bitvm;
 mod cors_config;
 pub mod handler;
 mod node;
@@ -27,7 +27,7 @@ use axum::{
     Router, middleware,
     routing::{get, post},
 };
-use bitvm2_lib::actors::Actor;
+use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use client::http_client::async_client::HttpAsyncClient;
@@ -93,6 +93,30 @@ impl AppState {
             http_client,
         }))
     }
+
+    pub async fn create_arc_mock_app_state(
+        local_db: LocalDB,
+        actor: Actor,
+        peer_id: String,
+        registry: Arc<Mutex<Registry>>,
+    ) -> anyhow::Result<Arc<AppState>> {
+        let (btc_client, btc_mock_adaptor) = BTCClient::new_mock_client();
+        btc_mock_adaptor.set_height(900_000);
+
+        let (goat_client, goat_mock_adaptor) = GOATClient::new_mock_client();
+        goat_mock_adaptor.set_latest_block_number(1_000_000);
+        goat_mock_adaptor.set_finalized_block_number(999_990);
+
+        Ok(Arc::new(AppState {
+            local_db,
+            btc_client,
+            goat_client,
+            metrics_state: MetricsState::new(registry),
+            actor,
+            peer_id,
+            http_client: HttpAsyncClient::new(None),
+        }))
+    }
 }
 
 /// Root path handler
@@ -115,15 +139,11 @@ async fn root() -> &'static str {
     "Hello, World!"
 }
 
-pub async fn serve(
+pub async fn serve_with_app_state(
     addr: String,
-    local_db: LocalDB,
-    actor: Actor,
-    peer_id: String,
-    registry: Arc<Mutex<Registry>>,
+    app_state: Arc<AppState>,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
-    let app_state = AppState::create_arc_app_state(local_db, actor, peer_id, registry).await?;
     let server = Router::new()
         .route(routes::ROOT, get(root))
         .route(routes::v1::NODES_BASE, get(get_nodes))
@@ -201,6 +221,18 @@ pub async fn serve(
     }
 }
 
+pub async fn serve(
+    addr: String,
+    local_db: LocalDB,
+    actor: Actor,
+    peer_id: String,
+    registry: Arc<Mutex<Registry>>,
+    cancellation_token: CancellationToken,
+) -> anyhow::Result<String> {
+    let app_state = AppState::create_arc_app_state(local_db, actor, peer_id, registry).await?;
+    serve_with_app_state(addr, app_state, cancellation_token).await
+}
+
 /// This method introduces performance overhead and is temporarily used for debugging with the frontend.
 /// It will be removed afterwards.
 async fn print_req_and_resp_detail(
@@ -239,7 +271,7 @@ mod tests {
     use crate::env::{
         ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_PROOF_SEVER_URL, get_network,
     };
-    use crate::rpc_service::bitvm2::{
+    use crate::rpc_service::bitvm::{
         BRIDGE_IN_AMOUNTS, GraphGetResponse, GraphListResponse, InstanceGetResponse,
         InstanceListResponse, InstanceOverviewResponse, InstanceSettingResponse,
     };
@@ -389,7 +421,7 @@ mod tests {
         let mut nodes = Vec::<Node>::new();
         let (_, public_key) = Secp256k1::new().generate_keypair(&mut rand::thread_rng());
         let pub_key = public_key.to_string();
-        let actor = Actor::Challenger;
+        let actor = Actor::Verifier;
         nodes.push(Node {
             peer_id: generate_local_key().public().to_peer_id().to_string(),
             actor: actor.to_string(),
@@ -427,7 +459,7 @@ mod tests {
         tokio::spawn(rpc_service::serve(
             addr.clone(),
             local_db,
-            Actor::Challenger,
+            Actor::Verifier,
             generate_local_key().public().to_peer_id().to_string(),
             Arc::new(Mutex::new(Registry::default())),
             CancellationToken::new(),
@@ -456,7 +488,7 @@ mod tests {
                 resp_validation: Some(Box::new(|text| -> bool {
                     matches!(
                         serde_json::from_str::<NodeOverViewResponse>(&text),
-                        Ok(node_overview) if node_overview.nodes_overview.online_challengers == 1 &&
+                        Ok(node_overview) if node_overview.nodes_overview.online_verifiers == 1 &&
                         node_overview.nodes_overview.online_committees == 1
                     )
                 })),
@@ -467,10 +499,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_bitvm2_api() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_bitvm_api() -> Result<(), Box<dyn std::error::Error>> {
         init(None);
         let addr = available_addr();
-        let actor = Actor::Challenger;
+        let actor = Actor::Verifier;
         let local_key = generate_local_key();
         let peer_id = local_key.public().to_peer_id().to_string();
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
@@ -572,13 +604,13 @@ mod tests {
             take1_txid: None,
             challenge_txid: None,
             take2_txid: None,
-            disprove_txid: None,
-            watchtower_challenge_init_txid: None,
+            operator_assert_txid: None,
+            verifier_assert_txids: vec![],
+            disprove_txids: vec![],
             watchtower_challenge_timeout_txids: vec![],
-            nack_txids: vec![],
-            blockhash_commit_timeout_txid: None,
-            assert_init_txid: None,
-            assert_commit_timeout_txids: vec![],
+            operator_challenge_nack_txids: vec![],
+            operator_commit_timeout_txid: None,
+            watchtower_challenge_init_txid: None,
             init_withdraw_tx_hash: Some(format!("0x{}", hex::encode(generate_random_bytes(32)))),
             bridge_out_start_at: current_time_secs() + 100,
             status_updated_at: current_time_secs(),
@@ -607,13 +639,13 @@ mod tests {
             take1_txid: None,
             challenge_txid: None,
             take2_txid: None,
-            disprove_txid: None,
-            watchtower_challenge_init_txid: None,
+            operator_assert_txid: None,
+            verifier_assert_txids: vec![],
+            disprove_txids: vec![],
             watchtower_challenge_timeout_txids: vec![],
-            nack_txids: vec![],
-            blockhash_commit_timeout_txid: None,
-            assert_init_txid: None,
-            assert_commit_timeout_txids: vec![],
+            operator_challenge_nack_txids: vec![],
+            operator_commit_timeout_txid: None,
+            watchtower_challenge_init_txid: None,
             init_withdraw_tx_hash: None,
             bridge_out_start_at: 0,
             status_updated_at: current_time_secs(),
@@ -765,7 +797,7 @@ mod tests {
                 })),
             },
         ];
-        do_batch_tests("bitvm2 apis", &Client::new(), &api_test_items).await?;
+        do_batch_tests("bitvm apis", &Client::new(), &api_test_items).await?;
         Ok(())
     }
 

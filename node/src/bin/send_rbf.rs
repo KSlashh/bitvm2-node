@@ -10,7 +10,7 @@
 //! - BITCOIN_NETWORK: bitcoin | testnet | testnet4 | signet | regtest (optional)
 //!
 //! Example:
-//! - cargo run -p bitvm2-noded --bin send-rbf -- \
+//! - cargo run -p bitvm-noded --bin send-rbf -- \
 //!   --vin <txid>:0 \
 //!   --vin <txid>:1 \
 //!   --fee-amount 10000 \
@@ -31,8 +31,8 @@ use dotenv::dotenv;
 use goat::transactions::base::Input;
 use tracing_subscriber::EnvFilter;
 
-use bitvm2_noded::env::{DUST_AMOUNT, get_bitvm_key, get_network};
-use bitvm2_noded::utils::{broadcast_tx, node_p2wsh_address, node_sign};
+use bitvm_noded::env::{DUST_AMOUNT, get_bitvm_key, get_network};
+use bitvm_noded::utils::{broadcast_tx, node_p2wsh_address, node_sign};
 
 const DEFAULT_RBF_SEQUENCE: u32 = 0xFFFF_FFFD;
 

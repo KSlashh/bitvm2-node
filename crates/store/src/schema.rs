@@ -176,8 +176,8 @@ pub struct NodesOverview {
     pub total: i64,
     pub online_operators: i64,
     pub offline_operators: i64,
-    pub online_challengers: i64,
-    pub offline_challengers: i64,
+    pub online_verifiers: i64,
+    pub offline_verifiers: i64,
     pub online_committees: i64,
     pub offline_committees: i64,
     pub online_watchtowers: i64,
@@ -396,16 +396,17 @@ pub struct Graph {
     pub take1_txid: Option<SerializableTxid>,
     pub challenge_txid: Option<SerializableTxid>,
     pub take2_txid: Option<SerializableTxid>,
-    pub disprove_txid: Option<SerializableTxid>,
     pub watchtower_challenge_init_txid: Option<SerializableTxid>,
+    pub operator_assert_txid: Option<SerializableTxid>,
+    #[sqlx(json)]
+    pub verifier_assert_txids: Vec<SerializableTxid>,
+    #[sqlx(json)]
+    pub disprove_txids: Vec<SerializableTxid>,
     #[sqlx(json)]
     pub watchtower_challenge_timeout_txids: Vec<SerializableTxid>,
     #[sqlx(json)]
-    pub nack_txids: Vec<SerializableTxid>,
-    pub blockhash_commit_timeout_txid: Option<SerializableTxid>,
-    pub assert_init_txid: Option<SerializableTxid>,
-    #[sqlx(json)]
-    pub assert_commit_timeout_txids: Vec<SerializableTxid>,
+    pub operator_challenge_nack_txids: Vec<SerializableTxid>,
+    pub operator_commit_timeout_txid: Option<SerializableTxid>,
     pub init_withdraw_tx_hash: Option<String>,
     pub bridge_out_start_at: i64,
     pub status_updated_at: i64,
@@ -467,12 +468,25 @@ pub struct PeginGraphProcessData {
     pub created_at: i64,
 }
 
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct PendingGraphInit {
+    pub instance_id: Uuid,
+    pub operator_pubkey: String,
+    pub graph_id: Uuid,
+    pub updated_at: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Display, EnumString)]
 pub enum MessageType {
     None,
     PeginRequest,
     CreateGraph,
     ConfirmInstance,
+    InitGraph,
+    GenCircuits,
+    CutCircuits,
+    SolderingProof,
     NonceGeneration,
     CommitteePresign,
     GraphFinalize,
@@ -487,13 +501,13 @@ pub enum MessageType {
     WatchtowerChallengeInitSent,
     WatchtowerChallengeSent,
     WatchtowerChallengeTimeout,
-    OperatorAckTimeout,
-    OperatorCommitBlockHashReady,
-    OperatorCommitBlockHashSent,
-    OperatorCommitBlockHashTimeout,
-    AssertInitReady,
-    AssertCommitTimeout,
-    DisproveReady,
+    NackReady,
+    OperatorCommitPubinReady,
+    OperatorCommitPubinTimeout,
+    AssertReady,
+    AssertSent,
+    ChallengeAssertSent,
+    WronglyChallengeTimeout,
     DisproveSent,
     Take1Ready,
     Take1Sent,
@@ -699,6 +713,30 @@ pub struct OperatorProof {
     pub execution_layer_block_number: i64,
     pub path_to_proof: Option<String>,
     pub public_value_hex: Option<String>,
+    pub proof_size: i64,
+    pub cycles: i64,
+    pub proof_state: i64,
+    pub total_time_to_proof: i64,
+    pub proving_time: i64,
+    pub zkm_version: String,
+    pub extra: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct WrapperProof {
+    pub id: i64,
+    pub operator_proof_id: i64,
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub execution_layer_block_number: i64,
+    pub operator_path_to_proof: String,
+    pub path_to_proof: Option<String>,
+    pub public_value_hex: Option<String>,
+    pub operator_vk_hash: String,
+    pub genesis_sequencer_commit_txid: String,
+    pub operator_public_value_hex: Option<String>,
     pub proof_size: i64,
     pub cycles: i64,
     pub proof_state: i64,

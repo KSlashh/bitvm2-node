@@ -11,12 +11,12 @@
 //! - --rpc-url: node API base URL (default: http://localhost:8080)
 //!
 //! Example:
-//! - cargo run -p bitvm2-noded --bin pegout -- \
+//! - cargo run -p bitvm-noded --bin pegout -- \
 //!   --rpc-url http://localhost:8080 once --graph-id <uuid>
 
 use anyhow::{Context, Result, bail};
-use bitvm2_noded::env::get_bitvm_key;
-use bitvm2_noded::rpc_service::auth::{
+use bitvm_noded::env::get_bitvm_key;
+use bitvm_noded::rpc_service::auth::{
     AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER, sign_request_auth,
 };
 use clap::{Parser, Subcommand};

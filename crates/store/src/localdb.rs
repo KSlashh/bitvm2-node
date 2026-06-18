@@ -2,8 +2,8 @@ use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
     BridgeOutGlobalStats, GoatTxRecord, Graph, GraphBtcTxVoutMonitor, GraphRawData, Instance,
     LongRunningTaskProof, Message, Node, NodesOverview, OperatorProof, PeginGraphProcessData,
-    PeginInstanceProcessData, SequencerSetHashChange, SequencerSetScanState, SerializableTxid,
-    WatchContract, WatchtowerProof,
+    PeginInstanceProcessData, PendingGraphInit, ProofState, SequencerSetHashChange,
+    SequencerSetScanState, SerializableTxid, WatchContract, WatchtowerProof, WrapperProof,
 };
 
 use indexmap::IndexMap;
@@ -503,7 +503,10 @@ pub struct GraphUpdate {
     pub status: Option<String>,
     pub sub_status: Option<String>,
     pub challenge_txid: Option<SerializableTxid>,
-    pub disprove_txid: Option<SerializableTxid>,
+    pub disprove_txids: Option<Vec<SerializableTxid>>,
+    pub watchtower_challenge_timeout_txids: Option<Vec<SerializableTxid>>,
+    pub operator_challenge_nack_txids: Option<Vec<SerializableTxid>>,
+    pub operator_commit_timeout_txid: Option<Option<SerializableTxid>>,
     pub bridge_out_start_at: Option<i64>,
     pub init_withdraw_tx_hash: Option<String>,
     pub proceed_withdraw_height: Option<i64>,
@@ -517,7 +520,10 @@ impl GraphUpdate {
             status: None,
             sub_status: None,
             challenge_txid: None,
-            disprove_txid: None,
+            disprove_txids: None,
+            watchtower_challenge_timeout_txids: None,
+            operator_challenge_nack_txids: None,
+            operator_commit_timeout_txid: None,
             bridge_out_start_at: None,
             init_withdraw_tx_hash: None,
             proceed_withdraw_height: None,
@@ -541,9 +547,36 @@ impl GraphUpdate {
         self
     }
 
-    /// Set disprove transaction ID
-    pub fn with_disprove_txid(mut self, disprove_txid: SerializableTxid) -> Self {
-        self.disprove_txid = Some(disprove_txid);
+    /// Set disprove transaction IDs
+    pub fn with_disprove_txids(mut self, disprove_txids: Vec<SerializableTxid>) -> Self {
+        self.disprove_txids = Some(disprove_txids);
+        self
+    }
+
+    /// Set watchtower challenge timeout transaction IDs
+    pub fn with_watchtower_challenge_timeout_txids(
+        mut self,
+        watchtower_challenge_timeout_txids: Vec<SerializableTxid>,
+    ) -> Self {
+        self.watchtower_challenge_timeout_txids = Some(watchtower_challenge_timeout_txids);
+        self
+    }
+
+    /// Set operator challenge NACK transaction IDs
+    pub fn with_operator_challenge_nack_txids(
+        mut self,
+        operator_challenge_nack_txids: Vec<SerializableTxid>,
+    ) -> Self {
+        self.operator_challenge_nack_txids = Some(operator_challenge_nack_txids);
+        self
+    }
+
+    /// Set operator commit timeout transaction ID
+    pub fn with_operator_commit_timeout_txid(
+        mut self,
+        operator_commit_timeout_txid: Option<SerializableTxid>,
+    ) -> Self {
+        self.operator_commit_timeout_txid = Some(operator_commit_timeout_txid);
         self
     }
 
@@ -570,7 +603,10 @@ impl GraphUpdate {
         self.status.is_some()
             || self.sub_status.is_some()
             || self.challenge_txid.is_some()
-            || self.disprove_txid.is_some()
+            || self.disprove_txids.is_some()
+            || self.watchtower_challenge_timeout_txids.is_some()
+            || self.operator_challenge_nack_txids.is_some()
+            || self.operator_commit_timeout_txid.is_some()
             || self.bridge_out_start_at.is_some()
             || self.init_withdraw_tx_hash.is_some()
             || self.proceed_withdraw_height.is_some()
@@ -590,8 +626,39 @@ impl GraphUpdate {
         if let Some(ref challenge_txid) = self.challenge_txid {
             query_builder.set_field("challenge_txid", QueryParam::BTCTxid(challenge_txid.clone()));
         }
-        if let Some(ref disprove_txid) = self.disprove_txid {
-            query_builder.set_field("disprove_txid", QueryParam::BTCTxid(disprove_txid.clone()));
+        if let Some(ref disprove_txids) = self.disprove_txids {
+            let disprove_txids_json =
+                serde_json::to_string(disprove_txids).unwrap_or_else(|_| "[]".into());
+            query_builder.set_field("disprove_txids", QueryParam::Text(disprove_txids_json));
+        }
+        if let Some(ref watchtower_challenge_timeout_txids) =
+            self.watchtower_challenge_timeout_txids
+        {
+            let watchtower_challenge_timeout_txids_json =
+                serde_json::to_string(watchtower_challenge_timeout_txids)
+                    .unwrap_or_else(|_| "[]".into());
+            query_builder.set_field(
+                "watchtower_challenge_timeout_txids",
+                QueryParam::Text(watchtower_challenge_timeout_txids_json),
+            );
+        }
+        if let Some(ref operator_challenge_nack_txids) = self.operator_challenge_nack_txids {
+            let operator_challenge_nack_txids_json =
+                serde_json::to_string(operator_challenge_nack_txids)
+                    .unwrap_or_else(|_| "[]".into());
+            query_builder.set_field(
+                "operator_challenge_nack_txids",
+                QueryParam::Text(operator_challenge_nack_txids_json),
+            );
+        }
+        if let Some(ref operator_commit_timeout_txid) = self.operator_commit_timeout_txid {
+            match operator_commit_timeout_txid {
+                Some(operator_commit_timeout_txid) => query_builder.set_field(
+                    "operator_commit_timeout_txid",
+                    QueryParam::BTCTxid(operator_commit_timeout_txid.clone()),
+                ),
+                None => query_builder.set_field_null("operator_commit_timeout_txid"),
+            }
         }
         if let Some(bridge_out_start_at) = self.bridge_out_start_at {
             query_builder.set_field("bridge_out_start_at", QueryParam::Int(bridge_out_start_at));
@@ -1082,6 +1149,76 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.and_then(|record| record.parameters))
     }
 
+    pub async fn upsert_pending_graph_init(
+        &mut self,
+        instance_id: &Uuid,
+        operator_pubkey: &str,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<u64> {
+        let current_time = get_current_timestamp_secs();
+        let result = sqlx::query(
+            "INSERT INTO pending_graph_init
+             (instance_id, operator_pubkey, graph_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(instance_id, operator_pubkey) DO UPDATE SET
+                 graph_id = excluded.graph_id,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(instance_id)
+        .bind(operator_pubkey)
+        .bind(graph_id)
+        .bind(current_time)
+        .bind(current_time)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn find_pending_graph_init_by_instance_and_operator_pubkey(
+        &mut self,
+        instance_id: &Uuid,
+        operator_pubkey: &str,
+    ) -> anyhow::Result<Option<PendingGraphInit>> {
+        Ok(sqlx::query_as::<_, PendingGraphInit>(
+            "SELECT instance_id, operator_pubkey, graph_id, created_at, updated_at
+             FROM pending_graph_init
+             WHERE instance_id = ? AND operator_pubkey = ?",
+        )
+        .bind(instance_id)
+        .bind(operator_pubkey)
+        .fetch_optional(self.conn())
+        .await?)
+    }
+
+    pub async fn find_pending_graph_init_by_graph_id(
+        &mut self,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<Option<PendingGraphInit>> {
+        Ok(sqlx::query_as::<_, PendingGraphInit>(
+            "SELECT instance_id, operator_pubkey, graph_id, created_at, updated_at
+             FROM pending_graph_init
+             WHERE graph_id = ?",
+        )
+        .bind(graph_id)
+        .fetch_optional(self.conn())
+        .await?)
+    }
+
+    pub async fn delete_pending_graph_init(
+        &mut self,
+        instance_id: &Uuid,
+        operator_pubkey: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM pending_graph_init WHERE instance_id = ? AND operator_pubkey = ?",
+        )
+        .bind(instance_id)
+        .bind(operator_pubkey)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Insert or update a graph
     ///
     /// Performs an INSERT OR REPLACE operation on the graph table.
@@ -1095,18 +1232,20 @@ impl<'a> StorageProcessor<'a> {
     /// - Ok(affected_rows) number of rows affected by the operation
     /// - Err if the operation failed
     pub async fn upsert_graph(&mut self, graph: &Graph) -> anyhow::Result<u64> {
-        let nack_txids_json = serde_json::to_string(&graph.nack_txids)?;
+        let verifier_assert_txids_json = serde_json::to_string(&graph.verifier_assert_txids)?;
+        let disprove_txids_json = serde_json::to_string(&graph.disprove_txids)?;
         let watchtower_challenge_timeout_txids_json =
             serde_json::to_string(&graph.watchtower_challenge_timeout_txids)?;
-        let assert_commit_timeout_txids_json =
-            serde_json::to_string(&graph.assert_commit_timeout_txids)?;
+        let operator_challenge_nack_txids_json =
+            serde_json::to_string(&graph.operator_challenge_nack_txids)?;
         let res = sqlx::query!(
             "INSERT OR
              REPLACE INTO graph (graph_id, instance_id, kickoff_index, from_addr, to_addr, amount, challenge_amount,
                     status, sub_status, operator_pubkey, cur_prekickoff_txid, next_prekickoff, force_skip_kickoff_txid,
                     quick_challenge_txid, challenge_incomplete_kickoff_txid, pegin_txid, kickoff_txid, take1_txid,
-                    challenge_txid, take2_txid, disprove_txid,  watchtower_challenge_init_txid, watchtower_challenge_timeout_txids, nack_txids,
-                    blockhash_commit_timeout_txid, assert_init_txid, assert_commit_timeout_txids, init_withdraw_tx_hash,
+                    challenge_txid, take2_txid, watchtower_challenge_init_txid, operator_assert_txid, verifier_assert_txids, disprove_txids,
+                    watchtower_challenge_timeout_txids, operator_challenge_nack_txids, operator_commit_timeout_txid,
+                    init_withdraw_tx_hash,
                     bridge_out_start_at, status_updated_at, proceed_withdraw_height,  created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             graph.graph_id,
@@ -1129,21 +1268,22 @@ impl<'a> StorageProcessor<'a> {
             graph.take1_txid,
             graph.challenge_txid,
             graph.take2_txid,
-            graph.disprove_txid,
             graph.watchtower_challenge_init_txid,
+            graph.operator_assert_txid,
+            verifier_assert_txids_json,
+            disprove_txids_json,
             watchtower_challenge_timeout_txids_json,
-            nack_txids_json,
-            graph.blockhash_commit_timeout_txid,
-            graph.assert_init_txid,
-            assert_commit_timeout_txids_json,
+            operator_challenge_nack_txids_json,
+            graph.operator_commit_timeout_txid,
             graph.init_withdraw_tx_hash,
             graph.bridge_out_start_at,
             graph.status_updated_at,
             graph.proceed_withdraw_height,
             graph.created_at,
             graph.updated_at,
-        ).execute(self.conn())
-            .await?;
+        )
+        .execute(self.conn())
+        .await?;
         Ok(res.rows_affected())
     }
 
@@ -1212,13 +1352,13 @@ impl<'a> StorageProcessor<'a> {
                     take1_txid,
                     challenge_txid,
                     take2_txid,
-                    disprove_txid,
                     watchtower_challenge_init_txid,
+                    operator_assert_txid,
+                    verifier_assert_txids,
+                    disprove_txids,
                     watchtower_challenge_timeout_txids,
-                    nack_txids,
-                    blockhash_commit_timeout_txid,
-                    assert_init_txid,
-                    assert_commit_timeout_txids,
+                    operator_challenge_nack_txids,
+                    operator_commit_timeout_txid,
                     init_withdraw_tx_hash,
                     bridge_out_start_at,
                     status_updated_at,
@@ -1555,9 +1695,9 @@ impl<'a> StorageProcessor<'a> {
         for record in records {
             res.total += record.total;
             match record.actor.as_str() {
-                "Challenger" => {
-                    (res.offline_challengers, res.online_challengers) =
-                        (record.offline, record.online);
+                "Verifier" => {
+                    res.offline_verifiers += record.offline;
+                    res.online_verifiers += record.online;
                 }
                 "Operator" => {
                     (res.offline_operators, res.online_operators) = (record.offline, record.online);
@@ -2678,6 +2818,223 @@ impl<'a> StorageProcessor<'a> {
         Ok(res)
     }
 
+    pub async fn create_wrapper_proof(
+        &mut self,
+        wrapper_proof: &WrapperProof,
+    ) -> anyhow::Result<u64> {
+        let res = sqlx::query(
+            "INSERT INTO wrapper_proof (
+                operator_proof_id,
+                instance_id,
+                graph_id,
+                execution_layer_block_number,
+                operator_path_to_proof,
+                path_to_proof,
+                public_value_hex,
+                operator_vk_hash,
+                genesis_sequencer_commit_txid,
+                operator_public_value_hex,
+                proof_size,
+                cycles,
+                proof_state,
+                total_time_to_proof,
+                proving_time,
+                zkm_version,
+                extra,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(wrapper_proof.operator_proof_id)
+        .bind(wrapper_proof.instance_id)
+        .bind(wrapper_proof.graph_id)
+        .bind(wrapper_proof.execution_layer_block_number)
+        .bind(&wrapper_proof.operator_path_to_proof)
+        .bind(&wrapper_proof.path_to_proof)
+        .bind(&wrapper_proof.public_value_hex)
+        .bind(&wrapper_proof.operator_vk_hash)
+        .bind(&wrapper_proof.genesis_sequencer_commit_txid)
+        .bind(&wrapper_proof.operator_public_value_hex)
+        .bind(wrapper_proof.proof_size)
+        .bind(wrapper_proof.cycles)
+        .bind(wrapper_proof.proof_state)
+        .bind(wrapper_proof.total_time_to_proof)
+        .bind(wrapper_proof.proving_time)
+        .bind(&wrapper_proof.zkm_version)
+        .bind(&wrapper_proof.extra)
+        .bind(wrapper_proof.created_at)
+        .bind(wrapper_proof.updated_at)
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn find_wrapper_proof_by_operator_proof_id(
+        &mut self,
+        operator_proof_id: i64,
+    ) -> anyhow::Result<Option<WrapperProof>> {
+        let res = sqlx::query_as::<_, WrapperProof>(
+            "SELECT * FROM wrapper_proof
+                 WHERE operator_proof_id = ?
+                 LIMIT 1",
+        )
+        .bind(operator_proof_id)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
+    }
+
+    pub async fn find_wrapper_proof_by_instance_and_graph(
+        &mut self,
+        instance_id: &Uuid,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<Option<WrapperProof>> {
+        let res = sqlx::query_as::<_, WrapperProof>(
+            "SELECT * FROM wrapper_proof
+                 WHERE instance_id = ?
+                   AND graph_id = ?
+                 ORDER BY id DESC
+                 LIMIT 1",
+        )
+        .bind(instance_id)
+        .bind(graph_id)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
+    }
+
+    pub async fn find_next_wrapper_proof(&mut self) -> anyhow::Result<Option<WrapperProof>> {
+        let res = sqlx::query_as::<_, WrapperProof>(
+            "SELECT * FROM wrapper_proof
+                 WHERE proof_state = ?
+                 ORDER BY id ASC
+                 LIMIT 1",
+        )
+        .bind(ProofState::New.to_i64())
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
+    }
+
+    pub async fn claim_next_wrapper_proof(&mut self) -> anyhow::Result<Option<WrapperProof>> {
+        let Some(candidate) = self.find_next_wrapper_proof().await? else {
+            return Ok(None);
+        };
+
+        let current_time = get_current_timestamp_secs();
+        let updated = sqlx::query(
+            "UPDATE wrapper_proof
+             SET proof_state = ?,
+                 updated_at = ?
+             WHERE id = ?
+               AND proof_state = ?",
+        )
+        .bind(ProofState::Proving.to_i64())
+        .bind(current_time)
+        .bind(candidate.id)
+        .bind(ProofState::New.to_i64())
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if updated == 0 {
+            return Ok(None);
+        }
+
+        let res = sqlx::query_as::<_, WrapperProof>(
+            "SELECT * FROM wrapper_proof
+                 WHERE id = ?
+                 LIMIT 1",
+        )
+        .bind(candidate.id)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
+    }
+
+    pub async fn find_proven_operator_proofs_without_wrapper(
+        &mut self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<OperatorProof>> {
+        let res = sqlx::query_as::<_, OperatorProof>(
+            "SELECT operator_proof.*
+               FROM operator_proof
+              WHERE operator_proof.proof_state = ?
+                AND operator_proof.path_to_proof IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM wrapper_proof
+                     WHERE wrapper_proof.operator_proof_id = operator_proof.id
+                )
+              ORDER BY operator_proof.id ASC
+              LIMIT ?",
+        )
+        .bind(ProofState::Proven.to_i64())
+        .bind(limit)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_wrapper_proof_success(
+        &mut self,
+        id: i64,
+        path_to_proof: String,
+        public_value_hex: String,
+        proof_size: i64,
+        cycles: i64,
+        proving_time: i64,
+        zkm_version: &str,
+    ) -> anyhow::Result<u64> {
+        let current_time = get_current_timestamp_secs();
+        let res = sqlx::query(
+            "UPDATE wrapper_proof
+             SET path_to_proof = ?,
+                 public_value_hex = ?,
+                 proof_size = ?,
+                 cycles = ?,
+                 proof_state = ?,
+                 total_time_to_proof = CASE
+                     WHEN created_at > 0 THEN (? - created_at) * 1000
+                     ELSE total_time_to_proof
+                 END,
+                 proving_time = ?,
+                 zkm_version = ?,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(path_to_proof)
+        .bind(public_value_hex)
+        .bind(proof_size)
+        .bind(cycles)
+        .bind(ProofState::Proven.to_i64())
+        .bind(current_time)
+        .bind(proving_time)
+        .bind(zkm_version)
+        .bind(current_time)
+        .bind(id)
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn update_wrapper_proof_failure(&mut self, id: i64) -> anyhow::Result<u64> {
+        let current_time = get_current_timestamp_secs();
+        let res = sqlx::query(
+            "UPDATE wrapper_proof
+             SET proof_state = ?,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(ProofState::Failed.to_i64())
+        .bind(current_time)
+        .bind(id)
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn update_watchtower_proof(
         &mut self,
@@ -2785,7 +3142,8 @@ impl<'a> StorageProcessor<'a> {
             "SELECT *
                   FROM watchtower_proof
                   WHERE instance_id = ?
-                    AND graph_id = ?",
+                    AND graph_id = ?
+                  ORDER BY node_index ASC",
         )
         .bind(instance_id)
         .bind(graph_id)
@@ -2944,27 +3302,14 @@ impl<'a> StorageProcessor<'a> {
         Ok(res)
     }
 
-    pub async fn find_first_sequencer_set_hash_change_by_goat_block_at_or_after(
+    pub async fn find_first_sequencer_set_hash_change_by_goat_block_at_or_before(
         &mut self,
         goat_block_height: i64,
     ) -> anyhow::Result<Option<SequencerSetHashChange>> {
         let res = sqlx::query_as::<_, SequencerSetHashChange>(
-            "SELECT * FROM sequencer_set_hash_changes WHERE goat_block_height >= ? ORDER BY goat_block_height ASC LIMIT 1",
+            "SELECT * FROM sequencer_set_hash_changes WHERE goat_block_height <= ? ORDER BY goat_block_height DESC LIMIT 1",
         )
         .bind(goat_block_height)
-        .fetch_optional(self.conn())
-        .await?;
-        Ok(res)
-    }
-
-    pub async fn find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(
-        &mut self,
-        cosmos_block_height: i64,
-    ) -> anyhow::Result<Option<SequencerSetHashChange>> {
-        let res = sqlx::query_as::<_, SequencerSetHashChange>(
-            "SELECT * FROM sequencer_set_hash_changes WHERE cosmos_block_height >= ? ORDER BY cosmos_block_height ASC LIMIT 1",
-        )
-        .bind(cosmos_block_height)
         .fetch_optional(self.conn())
         .await?;
         Ok(res)
@@ -3057,7 +3402,7 @@ mod sequencer_set_tests {
     }
 
     #[tokio::test]
-    async fn test_find_by_goat_block_at_or_after() {
+    async fn test_find_by_goat_block_at_or_before() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
 
@@ -3067,43 +3412,25 @@ mod sequencer_set_tests {
 
         // Exact match
         let r = s
-            .find_first_sequencer_set_hash_change_by_goat_block_at_or_after(2000)
+            .find_first_sequencer_set_hash_change_by_goat_block_at_or_before(2000)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(r.goat_block_height, 2000);
+        assert_eq!(r.validators_hash, "bb");
 
-        // Between records — should return next one
+        // Between records — should return previous one
         let r = s
-            .find_first_sequencer_set_hash_change_by_goat_block_at_or_after(1500)
+            .find_first_sequencer_set_hash_change_by_goat_block_at_or_before(2500)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(r.goat_block_height, 2000);
+        assert_eq!(r.validators_hash, "bb");
 
-        // Beyond all records — should return None
+        // Before all records — should return None
         let r =
-            s.find_first_sequencer_set_hash_change_by_goat_block_at_or_after(4000).await.unwrap();
-        assert!(r.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_find_by_cosmos_block_at_or_after() {
-        let db = setup_db().await;
-        let mut s = db.acquire().await.unwrap();
-
-        s.upsert_sequencer_set_hash_change(100, 1000, "aa").await.unwrap();
-        s.upsert_sequencer_set_hash_change(200, 2000, "bb").await.unwrap();
-
-        let r = s
-            .find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(150)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(r.cosmos_block_height, 200);
-
-        let r =
-            s.find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(300).await.unwrap();
+            s.find_first_sequencer_set_hash_change_by_goat_block_at_or_before(500).await.unwrap();
         assert!(r.is_none());
     }
 
@@ -3128,23 +3455,77 @@ mod sequencer_set_tests {
     }
 
     #[tokio::test]
-    async fn test_find_returns_none_when_empty() {
+    async fn test_wrapper_proof_lifecycle() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
+        let instance_id = Uuid::parse_str("00112233445566778899aabbccddeeff").unwrap();
+        let graph_id = Uuid::parse_str("ffeeddccbbaa99887766554433221100").unwrap();
+        let now = get_current_timestamp_secs();
 
-        assert!(s.find_latest_sequencer_set_hash_change().await.unwrap().is_none());
-        assert!(
-            s.find_first_sequencer_set_hash_change_by_goat_block_at_or_after(0)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            s.find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(0)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(s.get_sequencer_set_scan_state().await.unwrap().is_none());
+        let task = WrapperProof {
+            operator_proof_id: 42,
+            instance_id,
+            graph_id,
+            execution_layer_block_number: 9511055,
+            operator_path_to_proof: "operator.bin".to_string(),
+            operator_vk_hash: "operator-vk-hash".to_string(),
+            genesis_sequencer_commit_txid:
+                "7f7b4344adb1b8937ddb7124e4f8bba80ee9adf5e8119de76ca8736816bda246".to_string(),
+            operator_public_value_hex: Some("abcd".to_string()),
+            proof_state: ProofState::New.to_i64(),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+
+        s.create_wrapper_proof(&task).await.unwrap();
+        let duplicate = s.create_wrapper_proof(&task).await;
+        assert!(duplicate.is_err(), "operator_proof_id must be unique");
+
+        let found = s
+            .find_wrapper_proof_by_operator_proof_id(42)
+            .await
+            .unwrap()
+            .expect("wrapper proof should be found");
+        assert_eq!(found.instance_id, instance_id);
+        assert_eq!(found.graph_id, graph_id);
+        assert_eq!(found.proof_state, ProofState::New.to_i64());
+
+        let claimed = s
+            .claim_next_wrapper_proof()
+            .await
+            .unwrap()
+            .expect("new wrapper proof should be claimable");
+        assert_eq!(claimed.id, found.id);
+        assert_eq!(claimed.proof_state, ProofState::Proving.to_i64());
+
+        s.update_wrapper_proof_success(
+            claimed.id,
+            "wrapper.bin".to_string(),
+            "wrapper-public-value-hex".to_string(),
+            1234,
+            5678,
+            90,
+            "v1.2.5",
+        )
+        .await
+        .unwrap();
+        let proven = s
+            .find_wrapper_proof_by_instance_and_graph(&instance_id, &graph_id)
+            .await
+            .unwrap()
+            .expect("wrapper proof should be found by instance and graph");
+        assert_eq!(proven.proof_state, ProofState::Proven.to_i64());
+        assert_eq!(proven.path_to_proof.as_deref(), Some("wrapper.bin"));
+        assert_eq!(proven.public_value_hex.as_deref(), Some("wrapper-public-value-hex"));
+
+        s.update_wrapper_proof_failure(proven.id).await.unwrap();
+        let failed = s
+            .find_wrapper_proof_by_operator_proof_id(42)
+            .await
+            .unwrap()
+            .expect("wrapper proof should still exist");
+        assert_eq!(failed.proof_state, ProofState::Failed.to_i64());
+        assert!(s.claim_next_wrapper_proof().await.unwrap().is_none());
     }
 }

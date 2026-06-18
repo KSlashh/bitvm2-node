@@ -19,8 +19,8 @@ use alloy::sol_types::{SolType, SolValue};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, OutPoint, Txid};
-use bitvm2_lib::actors::Actor;
-use bitvm2_lib::types::UserInfo;
+use bitvm_lib::actors::Actor;
+use bitvm_lib::types::UserInfo;
 use client::btc_chain::BTCClient;
 use client::goat_chain::{GOATClient, GoatInitConfig};
 use client::graphs::GraphQueryClient;
@@ -454,10 +454,10 @@ async fn handle_withdraw_disproved_events<'a>(
 ) -> anyhow::Result<()> {
     for event in withdraw_disproved_events {
         let graph_id = Uuid::from_str(&strip_hex_prefix_owned(&event.graph_id))?;
-        let (flag, challenger_addr) = reflect_goat_address(Some(event.challenger_addr.clone()));
+        let (flag, verifier_addr) = reflect_goat_address(Some(event.challenger_addr.clone()));
         if !flag {
             warn!(
-                "handle_withdraw_disproved_events failed as cast challenger address failed, detail: {}, {}",
+                "handle_withdraw_disproved_events failed as cast verifier address failed, detail: {}, {}",
                 event.transaction_hash, event.challenger_addr
             );
             continue;
@@ -473,7 +473,7 @@ async fn handle_withdraw_disproved_events<'a>(
 
         add_node_reward(
             storage_processor,
-            &challenger_addr.unwrap(),
+            &verifier_addr.unwrap(),
             U256::from_str(&event.challenger_amount_sats).unwrap_or_default(),
         )
         .await?;
@@ -1230,7 +1230,25 @@ pub async fn run_watch_event_task(
             })],
         ),
         (
-            Actor::Challenger,
+            Actor::Verifier,
+            vec![WatchEventConfig::Gateway(TheGraphConfig {
+                address: gateway_contract,
+                the_graph_url: get_goat_gateway_the_graph_urls_from_env(),
+                event_entities: vec![
+                    GatewayEventEntity::InitWithdraws,
+                    GatewayEventEntity::CancelWithdraws,
+                    GatewayEventEntity::ProceedWithdraws,
+                    GatewayEventEntity::WithdrawHappyPaths,
+                    GatewayEventEntity::WithdrawUnhappyPaths,
+                    GatewayEventEntity::WithdrawDisproveds,
+                    GatewayEventEntity::BridgeInRequests,
+                    GatewayEventEntity::BridgeIns,
+                    GatewayEventEntity::PostGraphDatas,
+                ],
+            })],
+        ),
+        (
+            Actor::Verifier,
             vec![WatchEventConfig::Gateway(TheGraphConfig {
                 address: gateway_contract,
                 the_graph_url: get_goat_gateway_the_graph_urls_from_env(),

@@ -1,7 +1,7 @@
 use super::utils::{deserialize_u256, serialize_u256};
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
-    AssertCommitStatus, ChallengeSubStatus, WatchtowerChallengeStatus,
+    ChallengeSubStatus, VerifierChallengeStatus,
 };
 use crate::utils::{check_bridge_in_uxto_available_or_self_spent, reflect_goat_address};
 use alloy::hex::ToHexExt;
@@ -22,14 +22,22 @@ use strum::{Display, EnumString};
 use tracing::warn;
 use uuid::Uuid;
 
+#[allow(dead_code)]
 pub const WATCHTOWER_CHALLENGE_STEP_INIT: &str = "Watchtower Challenge init";
+#[allow(dead_code)]
 pub const WATCHTOWER_CHALLENGE_STEP_CHALLENGE: &str = "Watchtower Challenge";
+#[allow(dead_code)]
 pub const WATCHTOWER_CHALLENGE_STEP_CHALLENGE_TIMEOUT: &str = "Watchtower Challenge Timeout";
+#[allow(dead_code)]
 pub const WATCHTOWER_CHALLENGE_STEP_ACK: &str = "Operator Challenge ACK";
+#[allow(dead_code)]
 pub const WATCHTOWER_CHALLENGE_STEP_COMMIT_BLOCKHASH: &str = "Operator Commit BlockHash";
+#[allow(dead_code)]
 pub const WATCHTOWER_CHALLENGE_STEP_COMMIT_BLOCKHASH_TIMEOUT: &str =
     "Operator Commit BlockHash Timeout";
+#[allow(dead_code)]
 pub const ASSERT_STEP_INIT: &str = "Assert init";
+#[allow(dead_code)]
 pub const ASSERT_STEP_COMMIT: &str = "Assert Commit";
 
 const BRIDGE_IN_FAIL_AS_UTXO_BEEN_SPENT: &str = "Your UTXO has already been spent.";
@@ -112,6 +120,7 @@ pub struct PegoutResponse {
 #[derive(Debug, Deserialize)]
 pub struct GraphTxGetParams {
     pub tx_name: String,
+    pub index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -486,14 +495,19 @@ pub type GraphGetResponse = GraphExtended;
 
 #[derive(Deserialize, Serialize, Default)]
 pub struct GraphTxnGetResponse {
-    pub assert_init: BtcTxData,
-    pub watchtower_challenge_init: BtcTxData,
-    pub pre_kickoff: BtcTxData,
-    pub challenge: BtcTxData,
-    pub disprove: BtcTxData,
-    pub kickoff: BtcTxData,
+    pub cur_prekickoff: BtcTxData,
+    pub next_prekickoff: BtcTxData,
+    pub force_skip_kickoff: BtcTxData,
+    pub quick_challenge: BtcTxData,
+    pub challenge_incomplete_kickoff: BtcTxData,
     pub pegin: BtcTxData,
+    pub kickoff: BtcTxData,
     pub take1: BtcTxData,
+    pub challenge: BtcTxData,
+    pub watchtower_challenge_init: BtcTxData,
+    pub operator_assert: BtcTxData,
+    pub verifier_asserts: Vec<BtcTxData>,
+    pub disproves: Vec<BtcTxData>,
     pub take2: BtcTxData,
 }
 #[derive(Deserialize, Serialize, Default)]
@@ -658,9 +672,12 @@ impl GraphExtended {
         let challenge_sub_status =
             match serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status) {
                 Ok(v) => {
-                    if v.assert_commit_status != AssertCommitStatus::None {
+                    if v.verifier_challenge_status
+                        .iter()
+                        .any(|status| *status != VerifierChallengeStatus::None)
+                    {
                         SimpleChallengeSubStatus::Assert
-                    } else if v.watchtower_challenge_status != WatchtowerChallengeStatus::None {
+                    } else if v.watchtower_challenge_status.iter().any(|status| *status) {
                         SimpleChallengeSubStatus::WatchtowerChallenge
                     } else {
                         SimpleChallengeSubStatus::None

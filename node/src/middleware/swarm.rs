@@ -3,7 +3,7 @@ use crate::middleware::{AllBehaviours, split_topic_name};
 use crate::{env, middleware};
 use anyhow::bail;
 use base64::Engine;
-use bitvm2_lib::actors::Actor;
+use bitvm_lib::actors::Actor;
 use futures::StreamExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::multiaddr::Protocol;
@@ -92,7 +92,7 @@ pub trait P2pMessageHandler {
 }
 
 #[derive(Clone, Debug)]
-pub struct Bitvm2SwarmConfig {
+pub struct BitvmSwarmConfig {
     pub local_key: String,
     pub p2p_port: u16,
     pub bootnodes: Vec<String>,
@@ -102,13 +102,13 @@ pub struct Bitvm2SwarmConfig {
 }
 
 pub struct BitvmNetworkManager {
-    config: Bitvm2SwarmConfig,
+    config: BitvmSwarmConfig,
     peer_id: PeerId,
     swarm: BitvmSwarmWrapper,
 }
 impl BitvmNetworkManager {
     pub fn new(
-        config: Bitvm2SwarmConfig,
+        config: BitvmSwarmConfig,
         metric_registry: &mut Registry,
     ) -> anyhow::Result<BitvmNetworkManager> {
         let key_pair = libp2p::identity::Keypair::from_protobuf_encoding(&Zeroizing::new(
@@ -204,13 +204,27 @@ impl BitvmNetworkManager {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => tracing::debug!("Listening on {address:?}"),
                         SwarmEvent::Behaviour(AllBehavioursEvent::Gossipsub(gossipsub::Event::Message {
-                                                                      propagation_source: _peer_id,
+                                                                      propagation_source,
                                                                       message_id: id,
                                                                       message,
                                                                   })) => {
+                            let source = message.source.unwrap_or(propagation_source);
+                            let data_prefix = hex::encode(&message.data[..message.data.len().min(16)]);
+                            let data_starts_with_goatbin = message.data.starts_with(b"GOATBIN1");
                             match msg_handler.recv_and_dispatch(&mut self.swarm, actor.clone(),
-                                message.source.expect("empty message source"), id, &message.data).await {
-                                Ok(_) => {},Err(e) => { tracing::error!("Fail to handle p2p message, error: {e:?}") }
+                                source, id.clone(), &message.data).await {
+                                Ok(_) => {},Err(e) => {
+                                    tracing::error!(
+                                        error = ?e,
+                                        from_peer_id = %source,
+                                        message_id = ?id,
+                                        topic = %message.topic,
+                                        data_len = message.data.len(),
+                                        data_prefix,
+                                        data_starts_with_goatbin,
+                                        "Fail to handle p2p message"
+                                    )
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(AllBehavioursEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic})) => {

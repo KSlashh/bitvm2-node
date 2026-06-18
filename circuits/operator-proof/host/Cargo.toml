@@ -50,7 +50,7 @@ zkm-prover.workspace = true
 zkm-verifier = { workspace = true, features = ["ark"] }
 
 [dev-dependencies]
-bitvm2-lib.workspace = true
+bitvm-lib.workspace = true
 
 [build-dependencies]
 zkm-build.workspace = true

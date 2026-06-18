@@ -266,7 +266,12 @@ impl ChainAdaptor for MockAdaptor {
         Ok(hex::encode(generate_random_bytes(32)))
     }
 
-    async fn gateway_cancel_withdraw(&self, _graph_id: &[u8; 16]) -> anyhow::Result<String> {
+    async fn gateway_cancel_withdraw(
+        &self,
+        _graph_id: &[u8; 16],
+        _nonce: U256,
+        _committee_signs: &[Vec<u8>],
+    ) -> anyhow::Result<String> {
         info!("call cancel_withdraw");
         Ok(hex::encode(generate_random_bytes(32)))
     }
@@ -459,6 +464,14 @@ impl ChainAdaptor for MockAdaptor {
 
     async fn committee_mana_get_watchtowers(&self) -> anyhow::Result<Vec<[u8; 32]>> {
         Ok(vec![])
+    }
+
+    async fn committee_mana_get_verifiers(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+        Ok(vec![])
+    }
+
+    async fn committee_mana_is_verifier(&self, _peer_id: &[u8]) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     async fn committee_mana_add_watchtower(

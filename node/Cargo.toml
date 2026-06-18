@@ -1,10 +1,10 @@
 [package]
-name = "bitvm2-noded"
+name = "bitvm-noded"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "bitvm2-noded"
+name = "bitvm-noded"
 path = "src/main.rs"
 
 [[bin]]
@@ -36,8 +36,12 @@ name = "update-db"
 path = "src/bin/db_inject.rs"
 
 [[bin]]
-name = "part-stark-vk-attest"
-path = "src/bin/part_stark_vk_attest.rs"
+name = "fetch-watchtower-xonly-pubkeys"
+path = "src/bin/fetch_watchtower_xonly_pubkeys.rs"
+
+[[bin]]
+name = "mock-rpc"
+path = "src/bin/mock_rpc.rs"
 
 [dependencies]
 libp2p = { workspace = true, features = [
@@ -84,6 +88,8 @@ tokio-util.workspace = true
 http-body-util.workspace = true
 axum = { workspace = true, features = ["macros", "json"] }
 reqwest = { workspace = true, features = ["json"] }
+aws-config = { version = "1.1.9", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.21.0"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 http = { workspace = true }
 stun-client = "0.1.4"
@@ -111,14 +117,17 @@ dirs = "5.0.1"
 
 zkm-sdk = { workspace = true }
 zkm-verifier = { workspace = true, features = ["ark"] }
-borsh = {version = "1.5.3", features = ["derive"] }
-semver = "1.0"
+zkm-recursion-core = { workspace = true }
+zkm-stark = { workspace = true }
+p3-bn254-fr = { workspace = true }
+p3-field = { workspace = true }
+borsh = { version = "1.5.3", features = ["derive"] }
 
 proof-builder = { workspace = true }
 util = { workspace = true }
 bitvm = { workspace = true }
 goat = { workspace = true }
-bitvm2-lib = { workspace = true }
+bitvm-lib = { workspace = true }
 store = { workspace = true }
 client = { workspace = true }
 bitcoin-light-client-circuit = { workspace = true }

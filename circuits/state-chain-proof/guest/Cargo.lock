@@ -2225,7 +2225,6 @@ dependencies = [
  "sha2 0.10.9",
  "state-chain",
  "tracing",
- "zkm-verifier",
  "zkm-zkvm",
 ]
 
@@ -2376,14 +2375,14 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "header-chain"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bitcoin",
  "borsh",
  "crypto-bigint",
  "serde",
  "sha2 0.10.9",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -5114,7 +5113,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "state-chain"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5135,7 +5134,7 @@ dependencies = [
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -5702,6 +5701,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "verifier"
+version = "0.4.0"
+dependencies = [
+ "zkm-verifier",
 ]
 
 [[package]]
