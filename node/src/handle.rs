@@ -15,7 +15,14 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use bitcoin::{Amount, OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
-use bitvm_lib::babe_adapter::{BABE_M_CC, BABE_N_CC, BabeBundleBuilder, BabeChallengeAssertWitness, BabeProverState, ChallengeAssertWitnessRaw, CompactSolderingProofPayload, TxAssertWitness, assert_wots_message, build_assert_witness, build_real_challenge_assert_witness, build_real_setup_package, derive_finalized_indices, expand_compact_soldering_proof_payload, extract_gc_circuit_data, open_real_setup_and_solder, recover_real_wrongly_challenged_witness, verify_real_setup, CACSetupPackage, WOTS_SIG_COUNT};
+use bitvm_lib::babe_adapter::{
+    BABE_M_CC, BABE_N_CC, BabeBundleBuilder, BabeChallengeAssertWitness, BabeProverState,
+    CACSetupPackage, ChallengeAssertWitnessRaw, CompactSolderingProofPayload, TxAssertWitness,
+    WOTS_SIG_COUNT, assert_wots_message, build_assert_witness, build_real_challenge_assert_witness,
+    build_real_setup_package, derive_finalized_indices, expand_compact_soldering_proof_payload,
+    extract_gc_circuit_data, open_real_setup_and_solder, recover_real_wrongly_challenged_witness,
+    verify_real_setup,
+};
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::*;
 use bitvm_lib::operator::*;
@@ -24,7 +31,6 @@ use bitvm_lib::verifier::*;
 use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
-use goat::connectors::connector_z::ConnectorZ;
 use goat::transactions::base::output_topology;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
@@ -32,8 +38,8 @@ use goat::wots::{Wots, Wots96};
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm};
 use std::sync::Arc;
-use store::{GraphStatus, SerializableTxid};
 use store::localdb::LocalDB;
+use store::{GraphStatus, SerializableTxid};
 use uuid::Uuid;
 
 pub struct HandlerContext<'a> {
@@ -310,6 +316,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 received_committee_pubkey,
                 committee_partial_sigs,
                 agg_nonces,
+                content,
             )
             .await
         }
@@ -388,6 +395,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 received_committee_pubkey,
                 partial_sig,
                 endorse_sig,
+                content,
             )
             .await
         }
@@ -494,24 +502,15 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             Actor::Operator,
         ) => handle_assert_ready_operator(ctx, *instance_id, *graph_id).await,
         (
-            GOATMessageContent::AssertSent(AssertSent {
-                instance_id,
-                graph_id,
-                assert_txid,
-                assert_witness,
-            }),
+            GOATMessageContent::AssertSent(AssertSent { instance_id, graph_id, assert_txid }),
             Actor::Verifier,
-        ) => {
-            handle_assert_sent_verifier(ctx, *instance_id, *graph_id, *assert_txid, assert_witness)
-                .await
-        }
+        ) => handle_assert_sent_verifier(ctx, *instance_id, *graph_id, *assert_txid, content).await,
         (
             GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
                 instance_id,
                 graph_id,
                 challenge_assert_txid,
                 verifier_index,
-                challenge_witness,
                 ..
             }),
             Actor::Operator,
@@ -522,7 +521,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *graph_id,
                 *challenge_assert_txid,
                 *verifier_index,
-                challenge_witness,
                 content,
             )
             .await
@@ -1653,9 +1651,8 @@ async fn handle_compact_soldering_proof_operator(
         bail!("selected verifier candidate index does not match SolderingProof slot");
     }
     let setup_package = candidate.setup_package.clone();
-    let (opened, finalized, soldering) =
-        expand_compact_soldering_proof_payload(payload)
-            .context("expand compact soldering proof payload")?;
+    let (opened, finalized, soldering) = expand_compact_soldering_proof_payload(payload)
+        .context("expand compact soldering proof payload")?;
 
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE validation")?;
     let static_input = derive_operator_static_input()?;
@@ -1687,7 +1684,8 @@ async fn handle_compact_soldering_proof_operator(
         bail!("each verifier must contribute exactly {BABE_M_CC} finalized BABE instances");
     }
     let epk = &setup_package.commits[finalized[0].index].epk;
-    let h_msgs: Vec<[u8; 20]> = finalized.iter().map(|f| setup_package.commits[f.index].h_msg).collect();
+    let h_msgs: Vec<[u8; 20]> =
+        finalized.iter().map(|f| setup_package.commits[f.index].h_msg).collect();
     let gc_data = extract_gc_circuit_data(verifier_pubkey, epk, &h_msgs)?;
     let prover_state = BabeProverState {
         package: setup_package.clone(),
@@ -1800,14 +1798,30 @@ async fn handle_create_graph_committee(
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
     let verifier_num = graph.parameters.gc_data.len();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-    let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph_with_keypair(
+    let graph_parameters_hash = graph.parameters_hash()?;
+    let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph_job_with_keypair(
         instance_id,
         graph_id,
+        graph_parameters_hash,
         watchtower_num,
         verifier_num,
         instance_keypair,
     );
     let local_committee_pubkey = instance_keypair.public_key().into();
+    if get_committee_partial_sigs_for_graph_member(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        &local_committee_pubkey,
+    )
+    .await?
+    .is_some()
+    {
+        tracing::warn!(
+            "Ignore CreateGraph for {instance_id}:{graph_id}: local committee partial signatures already exist"
+        );
+        return Ok(());
+    }
     let message_content = GOATMessageContent::NonceGeneration(NonceGeneration {
         instance_id,
         graph_id,
@@ -1832,26 +1846,55 @@ async fn handle_create_graph_committee(
         let mut graph = BitvmGcGraph::from_simplified(graph)?;
         let verifier_num = graph.verifier_asserts.len();
         let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-        let mut pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
-        for (pk, pn) in pub_nonces_unchecked.into_iter() {
+        let mut checked_pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
+        for (pk, pn) in pub_nonces_unchecked.iter() {
             if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
                 tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
                 return Ok(());
             }
-            pub_nonces.push(pn);
+            checked_pub_nonces.push((*pk, pn.clone()));
         }
+        let pub_nonces = order_committee_values(
+            &committee_pubkeys,
+            checked_pub_nonces,
+            "graph committee pub nonces",
+        )?;
         let agg_nonces = nonces_aggregation(&pub_nonces)?;
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_with_keypair(
+        let local_committee_pubkey = instance_keypair.public_key().into();
+        if get_committee_partial_sigs_for_graph_member(
+            ctx.local_db,
             instance_id,
             graph_id,
+            &local_committee_pubkey,
+        )
+        .await?
+        .is_some()
+        {
+            tracing::warn!(
+                "Skip committee pre-sign for {instance_id}:{graph_id}: local committee partial signatures already exist"
+            );
+            return Ok(());
+        }
+        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_job_with_keypair(
+            instance_id,
+            graph_id,
+            graph_parameters_hash,
             watchtower_num,
             verifier_num,
             instance_keypair,
         );
         let committee_partial_sigs =
             committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut graph)?;
+        store_committee_partial_sigs_for_graph(
+            ctx.local_db,
+            instance_id,
+            graph_id,
+            local_committee_pubkey,
+            committee_partial_sigs.clone(),
+        )
+        .await?;
         let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
             instance_id,
             graph_id,
@@ -1935,21 +1978,42 @@ async fn handle_nonce_generation_committee(
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
         let local_committee_pubkey = instance_keypair.public_key().into();
+        if get_committee_partial_sigs_for_graph_member(
+            ctx.local_db,
+            instance_id,
+            graph_id,
+            &local_committee_pubkey,
+        )
+        .await?
+        .is_some()
+        {
+            tracing::warn!(
+                "Skip committee pre-sign for {instance_id}:{graph_id}: local committee partial signatures already exist"
+            );
+            return Ok(());
+        }
         let mut graph = BitvmGcGraph::from_simplified(&graph)?;
         let verifier_num = graph.verifier_asserts.len();
         let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-        let mut pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
-        for (pk, pn) in pub_nonces_unchecked.into_iter() {
+        let mut checked_pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
+        for (pk, pn) in pub_nonces_unchecked.iter() {
             if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
                 tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
                 return Ok(());
             }
-            pub_nonces.push(pn);
+            checked_pub_nonces.push((*pk, pn.clone()));
         }
+        let pub_nonces = order_committee_values(
+            &committee_pubkeys,
+            checked_pub_nonces,
+            "graph committee pub nonces",
+        )?;
         let agg_nonces = nonces_aggregation(&pub_nonces)?;
-        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_with_keypair(
+        let graph_parameters_hash = graph.parameters.parameters_hash()?;
+        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_job_with_keypair(
             instance_id,
             graph_id,
+            graph_parameters_hash,
             watchtower_num,
             verifier_num,
             instance_keypair,
@@ -1957,6 +2021,14 @@ async fn handle_nonce_generation_committee(
         // 4. if received enough valid committee partial sigs, endorse the graph
         let committee_partial_sigs =
             committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut graph)?;
+        store_committee_partial_sigs_for_graph(
+            ctx.local_db,
+            instance_id,
+            graph_id,
+            local_committee_pubkey,
+            committee_partial_sigs.clone(),
+        )
+        .await?;
         let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
             instance_id,
             graph_id,
@@ -1965,14 +2037,6 @@ async fn handle_nonce_generation_committee(
             agg_nonces,
         });
         send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
-        store_committee_partial_sigs_for_graph(
-            ctx.local_db,
-            instance_id,
-            graph_id,
-            local_committee_pubkey,
-            committee_partial_sigs,
-        )
-        .await?;
         let committee_partial_sigs =
             get_committee_partial_sigs_for_graph(ctx.local_db, instance_id, graph_id)
                 .await?
@@ -2077,6 +2141,93 @@ async fn handle_nonce_generation_operator(
     Ok(())
 }
 
+async fn validate_committee_presign_for_graph(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    received_committee_pubkey: &PublicKey,
+    committee_partial_sigs: &CommitteePartialSignatures,
+    received_agg_nonces: &CommitteeAggNonces,
+    content: &GOATMessageContent,
+) -> Result<Option<BitvmGcGraph>> {
+    let message = make_message(ctx, content);
+    let graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(g) => g,
+        None => return Ok(None),
+    };
+    let graph = BitvmGcGraph::from_simplified(&graph)?;
+    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
+    let pub_nonces_unchecked =
+        get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
+    if pub_nonces_unchecked.len() != committee_pubkeys.len() {
+        push_local_unhandled_messages(ctx.local_db, graph_id, &message, 30).await?;
+        tracing::info!(
+            "Defer CommitteePresign for {instance_id}:{graph_id}: waiting for committee pub nonces"
+        );
+        return Ok(None);
+    }
+    let received_pub_nonces = match pub_nonces_unchecked
+        .iter()
+        .find(|(pubkey, _)| pubkey == received_committee_pubkey)
+        .map(|(_, pub_nonces)| pub_nonces.clone())
+    {
+        Some(pub_nonces) => pub_nonces,
+        None => {
+            tracing::warn!(
+                "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: missing signer pub nonces",
+                received_committee_pubkey
+            );
+            return Ok(None);
+        }
+    };
+    let pub_nonces = match order_committee_values(
+        &committee_pubkeys,
+        pub_nonces_unchecked,
+        "graph committee pub nonces",
+    ) {
+        Ok(pub_nonces) => pub_nonces,
+        Err(e) => {
+            tracing::warn!(
+                "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: invalid pub nonce set: {e}",
+                received_committee_pubkey
+            );
+            return Ok(None);
+        }
+    };
+    let agg_nonces = nonces_aggregation(&pub_nonces)?;
+    if &agg_nonces != received_agg_nonces {
+        tracing::warn!(
+            "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: agg_nonces mismatch",
+            received_committee_pubkey
+        );
+        return Ok(None);
+    }
+    if let Err(e) = verify_graph_committee_partial_sigs(
+        &graph,
+        &committee_pubkeys,
+        received_committee_pubkey,
+        &received_pub_nonces,
+        &agg_nonces,
+        committee_partial_sigs,
+    ) {
+        tracing::warn!(
+            "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: invalid partial signatures: {e}",
+            received_committee_pubkey
+        );
+        return Ok(None);
+    }
+    Ok(Some(graph))
+}
+
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_committee_presign_committee(
     ctx: &mut HandlerContext<'_>,
@@ -2099,8 +2250,21 @@ async fn handle_committee_presign_committee(
     {
         return Ok(());
     }
-    // 1. save the committee partial sigs to local db
-    // TODO: validate the partial sigs
+    let graph = match validate_committee_presign_for_graph(
+        ctx,
+        instance_id,
+        graph_id,
+        received_committee_pubkey,
+        committee_partial_sigs,
+        _agg_nonces,
+        content,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    // 1. save the validated committee partial sigs to local db
     store_committee_partial_sigs_for_graph(
         ctx.local_db,
         instance_id,
@@ -2118,21 +2282,6 @@ async fn handle_committee_presign_committee(
             .map(|(_, ps)| ps)
             .collect::<Vec<_>>();
     if committee_partial_sigs.len() == committee_pubkeys.len() {
-        let message = make_message(ctx, content);
-        let graph = match get_graph_or_defer(
-            ctx.swarm,
-            ctx.local_db,
-            ctx.goat_client,
-            instance_id,
-            graph_id,
-            &message,
-        )
-        .await?
-        {
-            Some(g) => g,
-            None => return Ok(()),
-        };
-        let graph = BitvmGcGraph::from_simplified(&graph)?;
         let committee_sig_for_graph = endorse_graph(ctx.goat_client, &graph).await?;
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
@@ -2159,6 +2308,7 @@ async fn handle_committee_presign_operator(
     received_committee_pubkey: &PublicKey,
     committee_partial_sigs: &CommitteePartialSignatures,
     _agg_nonces: &CommitteeAggNonces,
+    content: &GOATMessageContent,
 ) -> Result<()> {
     // received from Committee members
     if !ensure_self_or_valid_committee(
@@ -2172,8 +2322,21 @@ async fn handle_committee_presign_operator(
     {
         return Ok(());
     }
-    // 1. save the committee partial sigs to local db
-    // TODO: validate the partial sigs
+    if validate_committee_presign_for_graph(
+        ctx,
+        instance_id,
+        graph_id,
+        received_committee_pubkey,
+        committee_partial_sigs,
+        _agg_nonces,
+        content,
+    )
+    .await?
+    .is_none()
+    {
+        return Ok(());
+    }
+    // 1. save the validated committee partial sigs to local db
     store_committee_partial_sigs_for_graph(
         ctx.local_db,
         instance_id,
@@ -2312,8 +2475,27 @@ async fn handle_graph_finalize_committee(
         )
         .await?;
         if stored_pub_nonce.is_none() {
-            let (_, pub_nonce, nonce_sig) =
-                committee_master_key.nonce_for_instance_with_keypair(instance_id, instance_keypair);
+            if get_committee_partial_sig_for_instance(
+                ctx.local_db,
+                instance_id,
+                &local_committee_pubkey,
+            )
+            .await?
+            .is_some()
+            {
+                tracing::warn!(
+                    "Skip PeginConfirm nonce for {instance_id}: local committee partial signature already exists"
+                );
+                return Ok(());
+            }
+            let instance_parameters_hash =
+                graph.parameters.instance_parameters.parameters_hash()?;
+            let (_, pub_nonce, nonce_sig) = committee_master_key
+                .nonce_for_instance_job_with_keypair(
+                    instance_id,
+                    instance_parameters_hash,
+                    instance_keypair,
+                );
             let message_content = GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
                 instance_id,
                 committee_pubkey: local_committee_pubkey,
@@ -2425,13 +2607,31 @@ async fn handle_pegin_confirm_nonce_committee(
         let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
         let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
         let local_committee_pubkey = instance_keypair.public_key().into();
-        let (sec_nonce, _, _) =
-            committee_master_key.nonce_for_instance_with_keypair(instance_id, instance_keypair);
-        let agg_nonce =
-            nonce_aggregation(&pub_nonces.iter().map(|(_, pn)| pn.clone()).collect::<Vec<_>>());
+        if get_committee_partial_sig_for_instance(
+            ctx.local_db,
+            instance_id,
+            &local_committee_pubkey,
+        )
+        .await?
+        .is_some()
+        {
+            tracing::warn!(
+                "Skip PeginConfirm partial signature for {instance_id}: local committee partial signature already exists"
+            );
+            return Ok(());
+        }
+        let pub_nonces =
+            order_committee_values(&committee_pubkeys, pub_nonces, "pegin committee pub nonces")?;
+        let agg_nonce = nonce_aggregation(&pub_nonces);
         let instance_params = get_instance_parameters(ctx.local_db, instance_id)
             .await?
             .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
+        let instance_parameters_hash = instance_params.parameters_hash()?;
+        let (sec_nonce, _, _) = committee_master_key.nonce_for_instance_job_with_keypair(
+            instance_id,
+            instance_parameters_hash,
+            instance_keypair,
+        );
         let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
         let context = instance_params.get_committee_context(instance_keypair)?;
         let partial_sig = pegin_confirm
@@ -2439,13 +2639,6 @@ async fn handle_pegin_confirm_nonce_committee(
             .map_err(|e| anyhow!("Failed to sign pegin confirm for {instance_id}: {e}"))?;
         let endorse_sig =
             endorse_pegin(ctx.goat_client, instance_id, &pegin_confirm.tx().compute_txid()).await?;
-        let message_content = GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
-            instance_id,
-            committee_pubkey: local_committee_pubkey,
-            partial_sig,
-            endorse_sig: endorse_sig.as_bytes().to_vec(),
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
         store_committee_partial_sig_for_instance(
             ctx.local_db,
             instance_id,
@@ -2460,15 +2653,24 @@ async fn handle_pegin_confirm_nonce_committee(
             endorse_sig.as_bytes().to_vec(),
         )
         .await?;
+        let message_content = GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
+            instance_id,
+            committee_pubkey: local_committee_pubkey,
+            partial_sig,
+            endorse_sig: endorse_sig.as_bytes().to_vec(),
+        });
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
         // 4. (Relayer) if received enough partial signatures, aggregate the sigs
         if is_relayer() {
-            let partial_sigs = get_committee_partial_sigs_for_instance(ctx.local_db, instance_id)
-                .await?
-                .into_iter()
-                .map(|(_, ps)| ps)
-                .collect::<Vec<_>>();
+            let partial_sigs =
+                get_committee_partial_sigs_for_instance(ctx.local_db, instance_id).await?;
             let context = instance_params.get_base_context();
             if partial_sigs.len() == committee_pubkeys.len() {
+                let partial_sigs = order_committee_values(
+                    &committee_pubkeys,
+                    partial_sigs,
+                    "pegin committee partial sigs",
+                )?;
                 let full_sig = pegin_confirm
                     .aggregate_input_0_musig2_signatures(&context, partial_sigs, &agg_nonce)
                     .map_err(|e| {
@@ -2476,11 +2678,7 @@ async fn handle_pegin_confirm_nonce_committee(
                             "Failed to aggregate Pegin-Confirm's signatures for {instance_id}: {e}"
                         )
                     })?;
-                let connector_z = ConnectorZ::new(
-                    context.network,
-                    &context.n_of_n_taproot_public_key,
-                    &instance_params.user_info.user_xonly_pubkey,
-                );
+                let connector_z = instance_params.connector_z();
                 pegin_confirm.push_input_0_signature(&connector_z, full_sig);
                 broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await?;
             }
@@ -2496,6 +2694,7 @@ async fn handle_pegin_confirm_partial_sig_committee(
     received_committee_pubkey: &PublicKey,
     partial_sig: &musig2::PartialSignature,
     endorse_sig: &[u8],
+    content: &GOATMessageContent,
 ) -> Result<()> {
     // received from Committee members
     if !ensure_self_or_valid_committee(
@@ -2509,8 +2708,91 @@ async fn handle_pegin_confirm_partial_sig_committee(
     {
         return Ok(());
     }
-    // 1. save the partial signature & endorsement signature to local db
-    // partial sigs will be validated when aggregating
+    let message = make_message(ctx, content);
+    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
+    let pub_nonces_unchecked =
+        get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
+    if pub_nonces_unchecked.len() != committee_pubkeys.len() {
+        push_local_unhandled_messages(ctx.local_db, instance_id, &message, 30).await?;
+        tracing::info!(
+            "Defer PeginConfirmPartialSig for {instance_id}: waiting for committee pub nonces"
+        );
+        return Ok(());
+    }
+    let received_pub_nonce = match pub_nonces_unchecked
+        .iter()
+        .find(|(pubkey, _)| pubkey == received_committee_pubkey)
+        .map(|(_, pub_nonce)| pub_nonce.clone())
+    {
+        Some(pub_nonce) => pub_nonce,
+        None => {
+            tracing::warn!(
+                "Ignore PeginConfirmPartialSig for {instance_id} from {}: missing signer pub nonce",
+                received_committee_pubkey
+            );
+            return Ok(());
+        }
+    };
+    let pub_nonces = match order_committee_values(
+        &committee_pubkeys,
+        pub_nonces_unchecked,
+        "pegin committee pub nonces",
+    ) {
+        Ok(pub_nonces) => pub_nonces,
+        Err(e) => {
+            tracing::warn!(
+                "Ignore PeginConfirmPartialSig for {instance_id} from {}: invalid pub nonce set: {e}",
+                received_committee_pubkey
+            );
+            return Ok(());
+        }
+    };
+    let agg_nonce = nonce_aggregation(&pub_nonces);
+    let instance_params = get_instance_parameters(ctx.local_db, instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
+    if let Err(e) = verify_pegin_confirm_partial_sig(
+        &instance_params,
+        &committee_pubkeys,
+        received_committee_pubkey,
+        &received_pub_nonce,
+        &agg_nonce,
+        *partial_sig,
+    ) {
+        tracing::warn!(
+            "Ignore PeginConfirmPartialSig for {instance_id} from {}: invalid partial signature: {e}",
+            received_committee_pubkey
+        );
+        return Ok(());
+    }
+    let pegin_confirm = instance_params.build_pegin_tx()?.1;
+    let pegin_txid = pegin_confirm.tx().compute_txid();
+    match verify_pegin_endorsement(
+        ctx.goat_client,
+        instance_id,
+        received_committee_pubkey,
+        &pegin_txid,
+        endorse_sig,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "Ignore PeginConfirmPartialSig for {instance_id} from {}: invalid endorsement signature",
+                received_committee_pubkey
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Ignore PeginConfirmPartialSig for {instance_id} from {}: failed to verify endorsement signature: {e}",
+                received_committee_pubkey
+            );
+            return Ok(());
+        }
+    }
+    // 1. save the validated partial signature & endorsement signature to local db
     store_committee_partial_sig_for_instance(
         ctx.local_db,
         instance_id,
@@ -2527,33 +2809,31 @@ async fn handle_pegin_confirm_partial_sig_committee(
     .await?;
     // 3. (Relayer) if received enough partial signatures, aggregate the sigs
     if is_relayer() {
-        let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
         let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
-        let partial_sigs = get_committee_partial_sigs_for_instance(ctx.local_db, instance_id)
-            .await?
-            .into_iter()
-            .map(|(_, ps)| ps)
-            .collect::<Vec<_>>();
+        let partial_sigs =
+            get_committee_partial_sigs_for_instance(ctx.local_db, instance_id).await?;
         if pub_nonces.len() == committee_pubkeys.len()
             && partial_sigs.len() == committee_pubkeys.len()
         {
-            let instance_params = get_instance_parameters(ctx.local_db, instance_id)
-                .await?
-                .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
             let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
-            let agg_nonce =
-                nonce_aggregation(&pub_nonces.iter().map(|(_, pn)| pn.clone()).collect::<Vec<_>>());
+            let pub_nonces = order_committee_values(
+                &committee_pubkeys,
+                pub_nonces,
+                "pegin committee pub nonces",
+            )?;
+            let partial_sigs = order_committee_values(
+                &committee_pubkeys,
+                partial_sigs,
+                "pegin committee partial sigs",
+            )?;
+            let agg_nonce = nonce_aggregation(&pub_nonces);
             let context = instance_params.get_base_context();
             let full_sig = pegin_confirm
                 .aggregate_input_0_musig2_signatures(&context, partial_sigs, &agg_nonce)
                 .map_err(|e| {
                     anyhow!("Failed to aggregate Pegin-Confirm's signatures for {instance_id}: {e}")
                 })?;
-            let connector_z = ConnectorZ::new(
-                context.network,
-                &context.n_of_n_taproot_public_key,
-                &instance_params.user_info.user_xonly_pubkey,
-            );
+            let connector_z = instance_params.connector_z();
             pegin_confirm.push_input_0_signature(&connector_z, full_sig);
             broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await?;
         }
@@ -2786,7 +3066,10 @@ async fn handle_kickoff_ready_operator(
             );
             let nonce_interval =
                 graph.parameters.graph_nonce - current_graph.parameters.graph_nonce;
-            let min_pegout_time_secs = take1_timelock(ctx.btc_client.network()) as u64
+            let min_pegout_time_secs = take1_timelock_with_config(
+                ctx.btc_client.network(),
+                &current_graph.parameters.timelock_config,
+            ) as u64
                 * todo_funcs::avg_block_time_secs(ctx.btc_client.network());
             let delay_secs = min_pegout_time_secs * nonce_interval;
             push_local_unhandled_messages(
@@ -2820,7 +3103,10 @@ async fn handle_kickoff_ready_operator(
                 );
                 let nonce_interval =
                     graph.parameters.graph_nonce - current_graph.parameters.graph_nonce;
-                let min_pegout_time_secs = take1_timelock(ctx.btc_client.network()) as u64
+                let min_pegout_time_secs = take1_timelock_with_config(
+                    ctx.btc_client.network(),
+                    &current_graph.parameters.timelock_config,
+                ) as u64
                     * todo_funcs::avg_block_time_secs(ctx.btc_client.network());
                 let delay_secs = min_pegout_time_secs * nonce_interval;
                 push_local_unhandled_messages(
@@ -2980,13 +3266,7 @@ async fn handle_kickoff_sent_verifier(
             let (challenge_tx, _) = export_challenge_tx(&graph).unwrap();
             let challenge_txid = challenge_tx.compute_txid();
             if ctx.btc_client.get_tx(&challenge_txid).await?.is_none() {
-                let challenge_txid = send_challenge_tx(ctx.btc_client, &graph).await?;
-                let message_content = GOATMessageContent::ChallengeSent(ChallengeSent {
-                    instance_id,
-                    graph_id,
-                    challenge_txid,
-                });
-                send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+                send_challenge_tx(ctx.btc_client, &graph).await?;
             }
         }
     } else {
@@ -3174,12 +3454,6 @@ async fn handle_challenge_sent_operator(
         }
         None => broadcast_tx(ctx.btc_client, &watchtower_challenge_init_tx).await?,
     };
-    let message_content =
-        GOATMessageContent::WatchtowerChallengeInitSent(WatchtowerChallengeInitSent {
-            instance_id,
-            graph_id,
-        });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Watchtower, message_content)).await?;
     Ok(())
 }
 
@@ -3297,12 +3571,6 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
     tracing::info!(
         "WatchtowerChallengeSent for {instance_id}:{graph_id}: watchtower_index={node_index}, txid={watchtower_challenge_txid}"
     );
-    let message_content = GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
-        instance_id,
-        graph_id,
-        watchtower_index: node_index,
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
     Ok(())
 }
 
@@ -3571,16 +3839,43 @@ async fn handle_operator_commit_pubin_ready_operator(
     let watchtower_challenge_init_txid =
         SerializableTxid::from(graph.watchtower_challenge_init.tx().compute_txid());
     let num_watchtowers = graph.parameters.watchtower_pubkeys.len();
-    let (challenge_txids, included_watchtowers_bits) =
-        get_watchtower_challenge_info(ctx.btc_client, &watchtower_challenge_init_txid, num_watchtowers)
-            .await?;
+    let watchtower_timeout_txids: Vec<Txid> =
+        graph.watchtower_challenge_timeouts.iter().map(|tx| tx.tx().compute_txid()).collect();
+    let wait_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network()) as usize;
+    let (challenge_txids, included_watchtowers_bits) = match get_watchtower_challenge_info(
+        ctx.btc_client,
+        &watchtower_challenge_init_txid,
+        &watchtower_timeout_txids,
+        num_watchtowers,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::info!(
+                "Retry OperatorCommitPubinReady later for {instance_id}:{graph_id}: challenge info is not ready: {e}"
+            );
+            push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
+            return Ok(());
+        }
+    };
     let (btc_best_block_hash, included_watchtowers_bitmap) =
-        compute_operator_pubin_blockhash_and_bitmap(
+        match compute_operator_pubin_blockhash_and_bitmap(
             ctx.btc_client,
             &challenge_txids,
             &included_watchtowers_bits,
         )
-            .await?;
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                tracing::info!(
+                    "Retry OperatorCommitPubinReady later for {instance_id}:{graph_id}: operator pubin inputs are not ready: {e}"
+                );
+                push_local_unhandled_messages(ctx.local_db, graph_id, &message, wait_secs).await?;
+                return Ok(());
+            }
+        };
     let guest_pubin = build_operator_guest_pubin(
         &btc_best_block_hash,
         &graph.parameters.pubin_disprove_constant,
@@ -3604,7 +3899,7 @@ async fn handle_operator_commit_pubin_ready_operator(
         connector_e_amount,
         vec![],
     )
-        .await?;
+    .await?;
 
     Ok(())
 }
@@ -3669,7 +3964,6 @@ async fn handle_operator_commit_pubin_timeout_verifier(
     Ok(())
 }
 
-
 // after the watchtower challenge flow is complete, build proof and broadcast Assert transaction.
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
 async fn handle_assert_ready_operator(
@@ -3717,8 +4011,14 @@ async fn handle_assert_ready_operator(
             operator_proof.public_inputs.len()
         );
     }
-    let dynamic_input = operator_proof.public_inputs[1];
-    let assert_witness = build_assert_witness(&operator_proof.proof, &assert_secret_key, dynamic_input)?;
+    let dynamic_input = operator_proof.public_inputs.get(1).copied().ok_or_else(|| {
+        anyhow!(
+            "operator proof has {} public inputs; expected dynamic input at index 1",
+            operator_proof.public_inputs.len()
+        )
+    })?;
+    let assert_witness =
+        build_assert_witness(&operator_proof.proof, &assert_secret_key, dynamic_input)?;
     let assert_message = assert_wots_message(&assert_witness)?;
     let mut asserted_operator_proof = Vec::new();
     operator_proof.proof.serialize_compressed(&mut asserted_operator_proof)?;
@@ -3738,14 +4038,6 @@ async fn handle_assert_ready_operator(
 
     let assert_tx = operator_sign_assert(&mut graph, &assert_secret_key, &assert_message)?;
     broadcast_nonstandard_tx(ctx.btc_client, &assert_tx).await?;
-
-    let message_content = GOATMessageContent::AssertSent(AssertSent {
-        instance_id,
-        graph_id,
-        assert_txid: assert_tx.compute_txid(),
-        assert_witness: Some(assert_witness),
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
 
     Ok(())
 }
@@ -3785,22 +4077,28 @@ fn recover_challenge_assert_witness(
 }
 
 /// Collects the on-chain ACK TxIns from all watchtowers that submitted a challenge_ack.
-/// Only connectors that are already spent are included; unspent ones are skipped.
+/// Unspent ACK connectors are skipped; spent connectors must resolve to the spending input.
 async fn collect_ack_txins(
     btc_client: &BTCClient,
     wci_txid: &Txid,
-    num_watchtowers: usize,
+    watchtower_timeout_txids: &[Txid],
 ) -> Result<Vec<bitcoin::TxIn>> {
     let mut ack_txins = Vec::new();
-    for i in 0..num_watchtowers {
+    for (i, timeout_txid) in watchtower_timeout_txids.iter().enumerate() {
         let ack_vout = output_topology::watchtower_challenge_init::ack_connector(i) as u64;
-        if let Some(ack_txid) = outpoint_spent_txid(btc_client, wci_txid, ack_vout).await? {
-            if let Some(ack_tx) = btc_client.get_tx(&ack_txid).await? {
-                if let Some(txin) = ack_tx.input.first().cloned() {
-                    ack_txins.push(txin);
-                }
-            }
+        let Some(ack_spent_txid) = outpoint_spent_txid(btc_client, wci_txid, ack_vout).await?
+        else {
+            continue;
+        };
+        if &ack_spent_txid == timeout_txid {
+            continue;
         }
+        let Some((_spent_txid, _vin, txin)) =
+            outpoint_spent_txin(btc_client, wci_txid, ack_vout).await?
+        else {
+            bail!("ACK spending tx {ack_spent_txid} for watchtower {i} is unavailable");
+        };
+        ack_txins.push(txin);
     }
     Ok(ack_txins)
 }
@@ -3812,7 +4110,7 @@ async fn handle_assert_sent_verifier(
     instance_id: Uuid,
     graph_id: Uuid,
     assert_txid: Txid,
-    assert_witness: &Option<TxAssertWitness>,
+    content: &GOATMessageContent,
 ) -> Result<()> {
     let (graph, _graph_status, _graph_sub_status) =
         match refresh_graph_status(ctx, instance_id, graph_id, None, GraphStatus::Challenge).await?
@@ -3853,9 +4151,42 @@ async fn handle_assert_sent_verifier(
                         .first()
                         .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
                     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
-                    let num_watchtowers = graph.parameters.watchtower_ack_hashlocks.len();
-                    let ack_txins = collect_ack_txins(ctx.btc_client, &wci_txid, num_watchtowers).await?;
-                    match validate_pubin_disprove(&graph, commit_pubin_txin, assert_txin, &ack_txins) {
+                    let watchtower_timeout_txids = graph
+                        .watchtower_challenge_timeouts
+                        .iter()
+                        .map(|tx| tx.tx().compute_txid())
+                        .collect::<Vec<_>>();
+                    let ack_txins = match collect_ack_txins(
+                        ctx.btc_client,
+                        &wci_txid,
+                        &watchtower_timeout_txids,
+                    )
+                    .await
+                    {
+                        Ok(txins) => txins,
+                        Err(e) => {
+                            let delay_secs =
+                                todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+                            let message = make_message(ctx, content);
+                            push_local_unhandled_messages(
+                                ctx.local_db,
+                                graph_id,
+                                &message,
+                                delay_secs as usize,
+                            )
+                            .await?;
+                            tracing::info!(
+                                "Retry AssertSent later for {instance_id}:{graph_id}: ACK inputs are not ready: {e}"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    match validate_pubin_disprove(
+                        &graph,
+                        commit_pubin_txin,
+                        assert_txin,
+                        &ack_txins,
+                    ) {
                         Ok(Some((witness_data, _))) => {
                             // build pubin disprove Tx
                             let pubin_disprove_txin =
@@ -3867,28 +4198,27 @@ async fn handle_assert_sent_verifier(
                                 output: vec![goat::scripts::p2a_output()],
                             };
                             broadcast_nonstandard_tx(ctx.btc_client, &pubin_disprove_tx).await?;
-                            let message_content =
-                                GOATMessageContent::DisproveSent(DisproveSent {
-                                    instance_id,
-                                    graph_id,
-                                    disprove_type: DisproveTxType::PubinDisprove,
-                                    index: verifier_index,
-                                    challenge_start_txid: None,
-                                    challenge_finish_txid: pubin_disprove_tx.compute_txid(),
-                                });
-                            send_to_peer(
-                                ctx.swarm,
-                                GOATMessage::new(Actor::Committee, message_content),
-                            )
-                                .await?;
                             return Ok(());
                         }
                         Ok(None) => tracing::debug!(
                             "PubinDisprove invalid for {instance_id}:{graph_id}: operator pubin consistent, proceeding to ChallengeAssert"
                         ),
-                        Err(e) => tracing::warn!(
-                            "PubinDisprove check failed for {instance_id}:{graph_id}: {e}, proceeding to ChallengeAssert"
-                        ),
+                        Err(e) => {
+                            let delay_secs =
+                                todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+                            let message = make_message(ctx, content);
+                            push_local_unhandled_messages(
+                                ctx.local_db,
+                                graph_id,
+                                &message,
+                                delay_secs as usize,
+                            )
+                            .await?;
+                            tracing::warn!(
+                                "Retry AssertSent later for {instance_id}:{graph_id}: PubinDisprove check failed: {e}"
+                            );
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -3896,29 +4226,21 @@ async fn handle_assert_sent_verifier(
     }
 
     // recover TxAssertWitness from the assert tx witness and graph.
-    let assert_witness_recovered: TxAssertWitness;
-    let assert_witness: &TxAssertWitness = match assert_witness {
-        Some(w) => w,
-        None => {
-            let raw_witness = graph
-                .connector_c()
-                .extract_leaf_1_raw_witness(
-                    assert_tx
-                        .input
-                        .first()
-                        .ok_or_else(|| anyhow!("operator assert transaction has no input"))?,
-                )
-                .map_err(|e| anyhow!("failed to extract WOTS signature from assert tx: {e}"))?;
-            let mut bitcoin_witness = bitcoin::Witness::new();
-            for item in &raw_witness {
-                bitcoin_witness.push(item);
-            }
-            assert_witness_recovered = TxAssertWitness {
-                wots_sig: Wots96::raw_witness_to_signature(&bitcoin_witness).to_vec(),
-            };
-            &assert_witness_recovered
-        }
-    };
+    let raw_witness = graph
+        .connector_c()
+        .extract_leaf_1_raw_witness(
+            assert_tx
+                .input
+                .first()
+                .ok_or_else(|| anyhow!("operator assert transaction has no input"))?,
+        )
+        .map_err(|e| anyhow!("failed to extract WOTS signature from assert tx: {e}"))?;
+    let mut bitcoin_witness = bitcoin::Witness::new();
+    for item in &raw_witness {
+        bitcoin_witness.push(item);
+    }
+    let assert_witness =
+        TxAssertWitness { wots_sig: Wots96::raw_witness_to_signature(&bitcoin_witness).to_vec() };
 
     let Some(saved_verifier_state) = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
         .and_then(|state| state.verifier)
@@ -3943,7 +4265,7 @@ async fn handle_assert_sent_verifier(
         &vk,
         static_input,
         &graph.parameters.operator_assert_wots_pubkey,
-        assert_witness,
+        &assert_witness,
         verifier_index,
     )?;
     let labels: [Vec<u8>; goat::assert_scripts::INPUT_WIRE_NUM] = challenge_witness
@@ -3968,14 +4290,6 @@ async fn handle_assert_sent_verifier(
     let challenge_assert_tx =
         build_verifier_assert_tx(&graph, operator_assert_txin, verifier_index, labels)?;
     broadcast_nonstandard_tx(ctx.btc_client, &challenge_assert_tx).await?;
-    let message_content = GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
-        instance_id,
-        graph_id,
-        challenge_assert_txid: challenge_assert_tx.compute_txid(),
-        verifier_index,
-        challenge_witness: Some(challenge_witness),
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Operator, message_content)).await?;
 
     Ok(())
 }
@@ -3988,7 +4302,6 @@ async fn handle_challenge_assert_sent_operator(
     graph_id: Uuid,
     challenge_assert_txid: Txid,
     verifier_index: usize,
-    challenge_witness: &Option<BabeChallengeAssertWitness>,
     content: &GOATMessageContent,
 ) -> Result<()> {
     let (graph, _graph_status, _graph_sub_status) =
@@ -4011,16 +4324,8 @@ async fn handle_challenge_assert_sent_operator(
         return Ok(());
     };
 
-    let challenge_witness_recovered: BabeChallengeAssertWitness;
-    let challenge_witness: &BabeChallengeAssertWitness = match challenge_witness {
-        Some(w) => w,
-        None => {
-            challenge_witness_recovered =
-                recover_challenge_assert_witness(&challenge_assert_tx, verifier_index)?;
-            &challenge_witness_recovered
-        }
-    };
-    validate_challenge_witness_index(verifier_index, challenge_witness)?;
+    let challenge_witness = recover_challenge_assert_witness(&challenge_assert_tx, verifier_index)?;
+    validate_challenge_witness_index(verifier_index, &challenge_witness)?;
 
     let labels: [Vec<u8>; goat::assert_scripts::INPUT_WIRE_NUM] = challenge_witness
         .witness
@@ -4079,12 +4384,21 @@ async fn handle_challenge_assert_sent_operator(
         .ok_or_else(|| anyhow!("missing asserted operator proof for graph {graph_id}"))?;
     let proof = Groth16Proof::deserialize_compressed(proof_bytes.as_slice())
         .context("deserialize asserted operator proof")?;
-    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE wrongly challenged")?;
+    let vk = crate::vk::get_vk()
+        .await
+        .context("load Groth16 verifying key for BABE wrongly challenged")?;
     let (_, dyn_pubin) = TxAssertWitness { wots_sig: challenge_witness.witness.wots_sig.clone() }
         .recover_pi1_xd_without_verify()
-        .ok_or_else(|| anyhow!("cannot recover dynamic input from challenge witness WOTS signature"))?;
-    let wrongly_challenged_witness =
-        recover_real_wrongly_challenged_witness(prover_state, challenge_witness, &proof, vk, dyn_pubin)?;
+        .ok_or_else(|| {
+            anyhow!("cannot recover dynamic input from challenge witness WOTS signature")
+        })?;
+    let wrongly_challenged_witness = recover_real_wrongly_challenged_witness(
+        prover_state,
+        &challenge_witness,
+        &proof,
+        vk,
+        dyn_pubin,
+    )?;
     let (wrongly_challenged_input, _amount) = operator_sign_wrongly_challenged(
         &graph,
         verifier_index,
@@ -4164,7 +4478,10 @@ async fn handle_wrongly_challenge_timeout_verifier(
     };
 
     let disprove_height = challenge_assert_height
-        + disprove_timelock(graph.parameters.instance_parameters.network) as u64;
+        + disprove_timelock_with_config(
+            graph.parameters.instance_parameters.network,
+            &graph.parameters.timelock_config,
+        ) as u64;
     let goat_confirmed_height = ctx.goat_client.btc_spv_latest_height().await?;
     if goat_confirmed_height < disprove_height {
         let retry_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network())
@@ -4186,16 +4503,6 @@ async fn handle_wrongly_challenge_timeout_verifier(
 
     let disprove_tx = build_disprove_tx(&graph, verifier_index, None)?;
     broadcast_nonstandard_tx(ctx.btc_client, &disprove_tx).await?;
-
-    let message_content = GOATMessageContent::DisproveSent(DisproveSent {
-        instance_id,
-        graph_id,
-        disprove_type: DisproveTxType::Disprove,
-        index: verifier_index,
-        challenge_start_txid: Some(challenge_assert_txid),
-        challenge_finish_txid: disprove_tx.compute_txid(),
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
 
     Ok(())
 }
@@ -4362,7 +4669,9 @@ async fn handle_take1_ready_operator(
             return Ok(());
         }
     };
-    if !is_take1_timelock_expired(ctx.btc_client, kickoff_height).await? {
+    if !is_take1_timelock_expired(ctx.btc_client, kickoff_height, &graph.parameters.timelock_config)
+        .await?
+    {
         tracing::warn!(
             "Ignore Take1Ready for {instance_id}:{graph_id}: kickoff tx timelock not expired yet"
         );
@@ -4502,7 +4811,8 @@ async fn handle_take2_ready_operator(
         return Ok(());
     }
     let operator_assert_txid = graph.operator_assert.tx().compute_txid();
-    // Take2 spends Connector-0, Connector-D, and Guardian Connector. Recheck every input before
+    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    // Take2 spends Connector-0, Connector-D, Connector-F, and Guardian Connector. Recheck every input before
     // signing so a stale Take2Ready cannot race an already-spent connector.
     let take2_inputs =
         graph.take2.tx().input.iter().map(|txin| txin.previous_output).collect::<Vec<OutPoint>>();
@@ -4534,7 +4844,28 @@ async fn handle_take2_ready_operator(
             return Ok(());
         }
     };
-    if !is_take2_timelock_expired(ctx.btc_client, operator_assert_height).await? {
+    let watchtower_challenge_init_height = match ctx
+        .btc_client
+        .get_tx_status(&watchtower_challenge_init_txid)
+        .await?
+        .block_height
+    {
+        Some(height) => height,
+        None => {
+            tracing::warn!(
+                "Ignore Take2Ready for {instance_id}:{graph_id}: watchtower challenge init tx not confirmed yet"
+            );
+            return Ok(());
+        }
+    };
+    if !is_take2_timelock_expired(
+        ctx.btc_client,
+        operator_assert_height,
+        watchtower_challenge_init_height,
+        &graph.parameters.timelock_config,
+    )
+    .await?
+    {
         tracing::warn!(
             "Ignore Take2Ready for {instance_id}:{graph_id}: take2 timelock not expired yet"
         );
@@ -4723,11 +5054,11 @@ async fn handle_response_node_info(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
     use bitcoin::hashes::Hash;
     use bitvm_lib::babe_adapter::{
         BABE_M_CC, BabeProverState, build_setup_package, open_and_solder,
     };
+    use std::str::FromStr;
 
     use super::*;
 
@@ -4741,7 +5072,8 @@ mod tests {
         let selected = (0..BABE_M_CC).collect::<Vec<_>>();
         let (_, finalized, soldering) = open_and_solder(&package, &selected).unwrap();
         let epk = &package.commits[finalized[0].index].epk;
-        let h_msgs: Vec<[u8; 20]> = finalized.iter().map(|f| package.commits[f.index].h_msg).collect();
+        let h_msgs: Vec<[u8; 20]> =
+            finalized.iter().map(|f| package.commits[f.index].h_msg).collect();
         let gc_data = extract_gc_circuit_data(verifier_pubkey(), epk, &h_msgs).unwrap();
         let prover_state = BabeProverState {
             package: package.clone(),
@@ -4886,20 +5218,23 @@ mod tests {
         let (btc_client, mock) = client::btc_chain::BTCClient::new_mock_client();
         let wci_txid = make_txid(0x00);
         let ack_txid_0 = make_txid(0x01);
-        let num_watchtowers = 3;
+        let timeout_txid_1 = make_txid(0x03);
+        let timeout_txids = vec![make_txid(0x10), timeout_txid_1, make_txid(0x12)];
 
         // Watchtower 0 ACKed
         let vout_0 = output_topology::watchtower_challenge_init::ack_connector(0) as u32;
         mock.set_tx(ack_txid_0, make_confirmed_ack_tx(ack_txid_0, wci_txid, vout_0));
 
-        // Watchtower 1 did NOT ACK (connector unspent — nothing registered)
+        // Watchtower 1 timed out; the timeout spend must not count as an ACK.
+        let vout_1 = output_topology::watchtower_challenge_init::ack_connector(1) as u32;
+        mock.set_tx(timeout_txid_1, make_confirmed_ack_tx(timeout_txid_1, wci_txid, vout_1));
 
         // Watchtower 2 ACKed
         let ack_txid_2 = make_txid(0x02);
         let vout_2 = output_topology::watchtower_challenge_init::ack_connector(2) as u32;
         mock.set_tx(ack_txid_2, make_confirmed_ack_tx(ack_txid_2, wci_txid, vout_2));
 
-        let txins = collect_ack_txins(&btc_client, &wci_txid, num_watchtowers).await.unwrap();
+        let txins = collect_ack_txins(&btc_client, &wci_txid, &timeout_txids).await.unwrap();
 
         assert_eq!(txins.len(), 2);
         assert_eq!(txins[0].previous_output.vout, vout_0);
@@ -4938,9 +5273,8 @@ mod tests {
         let msg = [0x42u8; 96];
         let sig = Wots96::sign(&sk, &msg);
 
-        let labels: Vec<[u8; 16]> = (0..goat::assert_scripts::INPUT_WIRE_NUM)
-            .map(|i| [(i % 256) as u8; 16])
-            .collect();
+        let labels: Vec<[u8; 16]> =
+            (0..goat::assert_scripts::INPUT_WIRE_NUM).map(|i| [(i % 256) as u8; 16]).collect();
 
         let tx = build_challenge_assert_tx(&sig, &labels);
         let verifier_index = 3;

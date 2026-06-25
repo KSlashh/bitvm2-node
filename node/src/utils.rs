@@ -32,6 +32,7 @@ use bitvm_lib::actors::Actor;
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::{OperatorMasterKey, VerifierMasterKey, WatchtowerMasterKey};
 use bitvm_lib::operator::*;
+use bitvm_lib::timelocks::{connector_f_timelock_blocks, default_timelock_config};
 use bitvm_lib::types::{
     BitvmGcCircuitData, BitvmGcGraph, BitvmGcGraphParameters, BitvmGcInstanceParameters,
     PrekickoffParameters, SimplifiedBitvmGcGraph, UserInfo,
@@ -45,6 +46,7 @@ use goat::connectors::{
     base::TaprootConnector,
     kickoff_connectors::{ForceSkipConnector, KickoffConnector, PrekickoffConnector},
 };
+use goat::constants::TimelockConfig;
 use goat::contexts::base::generate_n_of_n_public_key;
 use goat::scripts::{generate_opreturn_script, p2a_output};
 use goat::transactions::base::{Input, output_topology};
@@ -76,6 +78,7 @@ use crate::env;
 use crate::rpc_service::routes::v1::{
     NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
 };
+
 use crate::scheduled_tasks::get_goat_message_content_type;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     ChallengeSubStatus, VerifierChallengeStatus,
@@ -137,18 +140,12 @@ pub mod todo_funcs {
     #![allow(dead_code, unreachable_code, unused_variables)]
 
     use super::*;
+    use bitvm_lib::timelocks::estimated_block_interval_secs;
     use bitvm_lib::types::SimplifiedBitvmGcGraph;
 
     // other operations
     pub fn avg_block_time_secs(network: Network) -> u64 {
-        match network {
-            Network::Bitcoin => 600,  // 10 minutes
-            Network::Testnet => 300,  // 5 minutes
-            Network::Testnet4 => 300, // 5 minutes
-            Network::Regtest => 60,   // 1 minute
-            Network::Signet => 60,    // 1 minute
-                                       // _ => 600,                // default to 10 minutes
-        }
+        estimated_block_interval_secs(network) as u64
     }
     pub fn min_required_operator() -> usize {
         // todo!("get min required operator number")
@@ -989,6 +986,35 @@ async fn detect_connector_d_disprove(
     }))
 }
 
+async fn detect_watchtower_flow_disprove(
+    btc_client: &BTCClient,
+    graph: &BitvmGcGraph,
+) -> Result<Option<DetectedDisprove>> {
+    for (index, nack) in graph.operator_challenge_nacks.iter().enumerate() {
+        let txid = nack.tx().compute_txid();
+        if tx_on_chain(btc_client, &txid).await? {
+            return Ok(Some(DetectedDisprove {
+                disprove_type: DisproveTxType::OperatorChallengeNack,
+                index,
+                challenge_start_txid: None,
+                challenge_finish_txid: txid,
+            }));
+        }
+    }
+
+    let txid = graph.operator_commit_timeout.tx().compute_txid();
+    if tx_on_chain(btc_client, &txid).await? {
+        return Ok(Some(DetectedDisprove {
+            disprove_type: DisproveTxType::OperatorCommitTimeout,
+            index: 0,
+            challenge_start_txid: None,
+            challenge_finish_txid: txid,
+        }));
+    }
+
+    Ok(None)
+}
+
 async fn scan_graph_chain_state(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
@@ -1179,6 +1205,19 @@ async fn scan_graph_chain_state(
             });
         }
 
+        if let Some(disprove) = detect_watchtower_flow_disprove(btc_client, graph).await? {
+            sub_status.disprove_type = Some(disprove.disprove_type);
+            sub_status.disprove_index = disprove.index as i32;
+            return Ok(GraphChainScan {
+                status: GraphStatus::Disprove,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: Some(disprove),
+            });
+        }
+
         let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
         watchtower_challenge_init_on_chain =
             tx_on_chain(btc_client, &watchtower_challenge_init_txid).await?;
@@ -1229,6 +1268,19 @@ async fn scan_graph_chain_state(
 
     if current_status == GraphStatus::Challenge {
         if let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await? {
+            sub_status.disprove_type = Some(disprove.disprove_type);
+            sub_status.disprove_index = disprove.index as i32;
+            return Ok(GraphChainScan {
+                status: GraphStatus::Disprove,
+                sub_status,
+                challenge_txid,
+                watchtower_challenge_init_on_chain,
+                operator_assert_on_chain,
+                disprove: Some(disprove),
+            });
+        }
+
+        if let Some(disprove) = detect_watchtower_flow_disprove(btc_client, graph).await? {
             sub_status.disprove_type = Some(disprove.disprove_type);
             sub_status.disprove_index = disprove.index as i32;
             return Ok(GraphChainScan {
@@ -1768,8 +1820,12 @@ pub async fn read_instance_info_from_goat(
     })
 }
 
-pub async fn is_take1_timelock_expired(client: &BTCClient, kickoff_height: u32) -> Result<bool> {
-    let lock_blocks = take1_timelock(get_network());
+pub async fn is_take1_timelock_expired(
+    client: &BTCClient,
+    kickoff_height: u32,
+    timelock_config: &TimelockConfig,
+) -> Result<bool> {
+    let lock_blocks = take1_timelock_with_config(get_network(), timelock_config);
     let current_height = client.get_height().await?;
     Ok(current_height >= kickoff_height + lock_blocks)
 }
@@ -1777,10 +1833,15 @@ pub async fn is_take1_timelock_expired(client: &BTCClient, kickoff_height: u32) 
 pub async fn is_take2_timelock_expired(
     client: &BTCClient,
     operator_assert_height: u32,
+    watchtower_challenge_init_height: u32,
+    timelock_config: &TimelockConfig,
 ) -> Result<bool> {
-    let lock_blocks = take2_timelock(get_network());
+    let network = get_network();
+    let connector_d_lock_blocks = take2_timelock_with_config(network, timelock_config);
+    let connector_f_lock_blocks = connector_f_timelock_blocks(network, timelock_config);
     let current_height = client.get_height().await?;
-    Ok(current_height >= operator_assert_height + lock_blocks)
+    Ok(current_height >= operator_assert_height + connector_d_lock_blocks
+        && current_height >= watchtower_challenge_init_height + connector_f_lock_blocks)
 }
 
 pub async fn get_fee_rate(client: &BTCClient) -> Result<f64> {
@@ -1969,6 +2030,7 @@ pub async fn get_watchtower_commitment(
 pub async fn get_watchtower_challenge_info(
     btc_client: &BTCClient,
     watchtower_challenge_init_txid: &SerializableTxid,
+    watchtower_timeout_txids: &[Txid],
     num_watchtowers: usize,
 ) -> Result<(Vec<Option<String>>, Vec<bool>)> {
     let mut challenge_txids = Vec::with_capacity(num_watchtowers);
@@ -1983,10 +2045,19 @@ pub async fn get_watchtower_challenge_info(
             Some(txid) => {
                 let status = btc_client.get_tx_status(&txid).await?;
                 if !status.confirmed {
-                    bail!("watchtower challenge tx {txid} at index {index} is not confirmed yet");
+                    bail!("watchtower branch tx {txid} at index {index} is not confirmed yet");
                 }
-                challenge_txids.push(Some(txid.to_string()));
-                included_watchtowers.push(true);
+
+                let is_timeout = watchtower_timeout_txids
+                    .get(index)
+                    .is_some_and(|timeout_txid| txid == *timeout_txid);
+                if is_timeout {
+                    challenge_txids.push(None);
+                    included_watchtowers.push(false);
+                } else {
+                    challenge_txids.push(Some(txid.to_string()));
+                    included_watchtowers.push(true);
+                }
             }
             None => {
                 challenge_txids.push(None);
@@ -2029,6 +2100,29 @@ pub async fn compute_operator_pubin_blockhash_and_bitmap(
     }
 
     Ok((btc_best_block_hash, included_watchtowers))
+}
+
+async fn get_operator_committed_blockhash(
+    btc_client: &BTCClient,
+    challenge_txids: &[Option<String>],
+    included_watchtowers_bits: &[bool],
+    graph_id: Uuid,
+) -> Result<Option<String>> {
+    match compute_operator_pubin_blockhash_and_bitmap(
+        btc_client,
+        challenge_txids,
+        included_watchtowers_bits,
+    )
+    .await
+    {
+        Ok((btc_best_block_hash, _)) => {
+            Ok(Some(BlockHash::from_byte_array(btc_best_block_hash).to_string()))
+        }
+        Err(e) => {
+            warn!("operator proof inputs are not ready for graph {graph_id}: {e}");
+            Ok(None)
+        }
+    }
 }
 
 /// Assembles the 96-byte guest pubin:
@@ -2124,9 +2218,12 @@ pub async fn get_operator_proof(
         .watchtower_challenge_init_txid
         .ok_or_else(|| anyhow::anyhow!("watchtower_challenge_init_txid is none"))?;
     let num_challenger = bitvm_graph.parameters.watchtower_pubkeys.len();
+    let watchtower_timeout_txids: Vec<Txid> =
+        bitvm_graph.watchtower_challenge_timeouts.iter().map(|tx| tx.tx().compute_txid()).collect();
     let (watchtower_challenge_txids, included_watchtowers) = match get_watchtower_challenge_info(
         btc_client,
         &watchtower_challenge_init_txid,
+        &watchtower_timeout_txids,
         num_challenger,
     )
     .await
@@ -2137,13 +2234,16 @@ pub async fn get_operator_proof(
             return Ok((None, get_operator_proof_wait_secs()));
         }
     };
-    let (btc_best_block_hash, _) = compute_operator_pubin_blockhash_and_bitmap(
+    let Some(operator_committed_blockhash) = get_operator_committed_blockhash(
         btc_client,
         &watchtower_challenge_txids,
         &included_watchtowers,
+        graph_id,
     )
-    .await?;
-    let operator_committed_blockhash = BlockHash::from_byte_array(btc_best_block_hash).to_string();
+    .await?
+    else {
+        return Ok((None, get_operator_proof_wait_secs()));
+    };
 
     let base_url = Url::parse(
         &get_proof_build_rpc_host()
@@ -2207,7 +2307,10 @@ pub async fn get_operator_proof(
     let ark_proof =
         convert_ark_imm_wrap_vk(&proof, &proof_data.vk, &IMM_GROTH16_VK_BYTES, &part_stark_vk)
             .map_err(|e| anyhow!("failed to convert operator proof to ark format: {e}"))?;
-    if ark_proof.public_inputs[0] != statement.static_input {
+    let Some(static_input) = ark_proof.public_inputs.first() else {
+        bail!("operator proof has no public inputs");
+    };
+    if *static_input != statement.static_input {
         bail!("operator proof static public input does not match graph setup statement");
     }
 
@@ -2852,6 +2955,7 @@ pub async fn build_graph_params(
     graph_id: Uuid,
 ) -> Result<BitvmGcGraphParameters> {
     let instance_id = instance_parameters.instance_id;
+    let network = instance_parameters.network;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let operator_master_keypair = operator_master_key.master_keypair();
     let operator_pubkey = operator_master_keypair.public_key().into();
@@ -2884,6 +2988,7 @@ pub async fn build_graph_params(
     Ok(BitvmGcGraphParameters {
         instance_parameters,
         prekickoff_parameters,
+        timelock_config: default_timelock_config(network),
         graph_id,
         graph_nonce,
         challenge_amount: todo_funcs::challenge_amount(),
@@ -3129,6 +3234,32 @@ pub async fn endorse_pegin(
     let pegin_digest = goat_client.gateway_get_post_pegin_digest(&instance_id, pegin_txid).await?;
     let sig = signer.sign_hash(&pegin_digest.into()).await?;
     Ok(sig)
+}
+
+pub async fn verify_pegin_endorsement(
+    goat_client: &GOATClient,
+    instance_id: Uuid,
+    committee_pubkey: &PublicKey,
+    pegin_txid: &Txid,
+    signature: &[u8],
+) -> Result<bool> {
+    let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
+    let expected_evm_address = pegin_data
+        .committee_pubkeys
+        .iter()
+        .zip(pegin_data.committee_addresses.iter())
+        .find_map(|(pubkey, evm_address)| {
+            PublicKey::from_slice(pubkey)
+                .ok()
+                .filter(|on_chain_pubkey| on_chain_pubkey == committee_pubkey)
+                .map(|_| *evm_address)
+        })
+        .ok_or_else(|| anyhow!("committee pubkey {committee_pubkey} not found on-chain"))?;
+    let pegin_digest = goat_client.gateway_get_post_pegin_digest(&instance_id, pegin_txid).await?;
+    let sig = EvmSignature::try_from(signature)?;
+    sig.recover_address_from_prehash(&pegin_digest.into())
+        .map(|addr| addr == expected_evm_address)
+        .map_err(|e| e.into())
 }
 
 pub async fn verify_graph_endorsement(
@@ -3643,6 +3774,32 @@ pub struct GraphProcessDataItem {
 }
 pub type GraphProcessDataMap = IndexMap<PublicKey, GraphProcessDataItem>;
 
+pub fn order_committee_values<T: Clone>(
+    committee_pubkeys: &[PublicKey],
+    values: Vec<(PublicKey, T)>,
+    label: &str,
+) -> Result<Vec<T>> {
+    for (idx, (pubkey, _)) in values.iter().enumerate() {
+        if !committee_pubkeys.contains(pubkey) {
+            bail!("{label} contains non-committee pubkey {pubkey}");
+        }
+        if values.iter().skip(idx + 1).any(|(other, _)| other == pubkey) {
+            bail!("{label} contains duplicate pubkey {pubkey}");
+        }
+    }
+
+    committee_pubkeys
+        .iter()
+        .map(|committee_pubkey| {
+            values
+                .iter()
+                .find(|(pubkey, _)| pubkey == committee_pubkey)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| anyhow!("{label} missing pubkey {committee_pubkey}"))
+        })
+        .collect()
+}
+
 // db operations
 pub async fn get_current_prekickoff_tx(
     local_db: &LocalDB,
@@ -3764,6 +3921,22 @@ pub async fn store_instance_parameters(
     instance_params: &BitvmGcInstanceParameters,
 ) -> Result<()> {
     let mut storage_processor = local_db.acquire().await?;
+    let incoming_parameters_hash = instance_params.parameters_hash()?;
+    if let Some(existing_parameters) =
+        storage_processor.get_instance_parameters_by_id(&instance_params.instance_id).await?
+    {
+        let existing_instance_params: BitvmGcInstanceParameters =
+            serde_json::from_str(&existing_parameters)?;
+        let existing_parameters_hash = existing_instance_params.parameters_hash()?;
+        if existing_parameters_hash != incoming_parameters_hash {
+            bail!(SpecialError::InvalidPeginData(format!(
+                "instance parameters changed for instance_id {}: existing={}, incoming={}",
+                instance_params.instance_id,
+                hex::encode(existing_parameters_hash),
+                hex::encode(incoming_parameters_hash)
+            )));
+        }
+    }
     storage_processor
         .update_instance_parameters(
             &instance_params.instance_id,
@@ -3862,6 +4035,29 @@ pub async fn store_graph(local_db: &LocalDB, simple_graph: &SimplifiedBitvmGcGra
     let instance_id = simple_graph.parameters.instance_parameters.instance_id;
     let current_time = current_time_secs();
     let mut graph = convert_graph(&bitvm_graph, current_time);
+    let incoming_parameters_hash = simple_graph.parameters_hash()?;
+
+    if let Some(existing_raw_data) = tx.find_graph_raw_data(&graph_id).await? {
+        let existing_graph = parse_graph_raw_data(existing_raw_data.raw_data, graph_id).await?;
+        let existing_parameters_hash = existing_graph.parameters_hash()?;
+        if existing_parameters_hash != incoming_parameters_hash {
+            bail!(SpecialError::InvalidGraph(format!(
+                "graph parameters changed for graph_id {graph_id}: existing={}, incoming={}",
+                hex::encode(existing_parameters_hash),
+                hex::encode(incoming_parameters_hash)
+            )));
+        }
+        if existing_graph.operator_pre_signed() && !simple_graph.operator_pre_signed() {
+            bail!(SpecialError::InvalidGraph(format!(
+                "graph {graph_id} cannot be downgraded after operator pre-signatures are stored"
+            )));
+        }
+        if existing_graph.committee_pre_signed() && !simple_graph.committee_pre_signed() {
+            bail!(SpecialError::InvalidGraph(format!(
+                "graph {graph_id} cannot be downgraded after committee pre-signatures are stored"
+            )));
+        }
+    }
 
     if let Some(node_info) =
         tx.get_node_by_btc_pub_key(&bitvm_graph.parameters.operator_pubkey.to_string()).await?
@@ -4115,6 +4311,14 @@ pub async fn store_committee_pub_nonces_for_graph(
     let mut storage_processor = local_db.acquire().await?;
     let (is_endorsed, mut process_data) =
         find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    if let Some(existing_pub_nonces) =
+        process_data.get(&committee_pubkey).and_then(|v| v.committee_pub_nonce.as_ref())
+        && existing_pub_nonces != &pub_nonces
+    {
+        bail!(SpecialError::InvalidGraph(format!(
+            "committee pub nonces changed for graph {graph_id} and committee {committee_pubkey}"
+        )));
+    }
     process_data
         .entry(committee_pubkey)
         .and_modify(|v| v.committee_pub_nonce = Some(pub_nonces.clone()))
@@ -4157,6 +4361,14 @@ pub async fn store_committee_partial_sigs_for_graph(
     let mut storage_processor = local_db.acquire().await?;
     let (is_endorsed, mut process_data) =
         find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    if let Some(existing_partial_sigs) =
+        process_data.get(&committee_pubkey).and_then(|v| v.partial_sigs.as_ref())
+        && existing_partial_sigs != &partial_sigs
+    {
+        bail!(SpecialError::InvalidGraph(format!(
+            "committee partial signatures changed for graph {graph_id} and committee {committee_pubkey}"
+        )));
+    }
     process_data
         .entry(committee_pubkey)
         .and_modify(|v| v.partial_sigs = Some(partial_sigs.clone()))
@@ -4188,6 +4400,18 @@ pub async fn get_committee_partial_sigs_for_graph(
         .iter()
         .filter_map(|(k, v)| v.partial_sigs.as_ref().map(|nonce| (*k, nonce.clone())))
         .collect::<Vec<(PublicKey, CommitteePartialSignatures)>>())
+}
+
+pub async fn get_committee_partial_sigs_for_graph_member(
+    local_db: &LocalDB,
+    _instance_id: Uuid,
+    graph_id: Uuid,
+    committee_pubkey: &PublicKey,
+) -> Result<Option<CommitteePartialSignatures>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (_is_endorsed, process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    Ok(process_data.get(committee_pubkey).and_then(|v| v.partial_sigs.clone()))
 }
 pub async fn store_committee_endorsement_for_graph(
     local_db: &LocalDB,
@@ -4300,6 +4524,14 @@ pub async fn store_committee_pub_nonce_for_instance(
     let mut storage_processor = local_db.acquire().await?;
     let mut process_data =
         find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    if let Some(existing_pub_nonce) =
+        process_data.get(&committee_pubkey).and_then(|v| v.pub_nonce.as_ref())
+        && existing_pub_nonce != &pub_nonce
+    {
+        bail!(SpecialError::InvalidPeginData(format!(
+            "committee pub nonce changed for instance {instance_id} and committee {committee_pubkey}"
+        )));
+    }
     process_data
         .entry(committee_pubkey)
         .and_modify(|v| v.pub_nonce = Some(pub_nonce.clone()))
@@ -4342,6 +4574,14 @@ pub async fn store_committee_partial_sig_for_instance(
     let mut storage_processor = local_db.acquire().await?;
     let mut process_data =
         find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    if let Some(existing_partial_sig) =
+        process_data.get(&committee_pubkey).and_then(|v| v.partial_sign.as_ref())
+        && existing_partial_sig != &partial_sigs
+    {
+        bail!(SpecialError::InvalidPeginData(format!(
+            "committee partial signature changed for instance {instance_id} and committee {committee_pubkey}"
+        )));
+    }
     process_data
         .entry(committee_pubkey)
         .and_modify(|v| v.partial_sign = Some(partial_sigs))
@@ -4367,6 +4607,17 @@ pub async fn get_committee_partial_sigs_for_instance(
         .collect())
 }
 
+pub async fn get_committee_partial_sig_for_instance(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    committee_pubkey: &PublicKey,
+) -> Result<Option<PartialSignature>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let process_data =
+        find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    Ok(process_data.get(committee_pubkey).and_then(|v| v.partial_sign))
+}
+
 pub async fn store_committee_endorse_sig_for_pegin(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -4376,6 +4627,15 @@ pub async fn store_committee_endorse_sig_for_pegin(
     let mut storage_processor = local_db.acquire().await?;
     let mut process_data =
         find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    if let Some(existing_endorse_sig) =
+        process_data.get(&committee_pubkey).map(|v| v.endorse_signature.as_slice())
+        && !existing_endorse_sig.is_empty()
+        && existing_endorse_sig != endorse_sig.as_slice()
+    {
+        bail!(SpecialError::InvalidPeginData(format!(
+            "committee endorse signature changed for instance {instance_id} and committee {committee_pubkey}"
+        )));
+    }
     process_data
         .entry(committee_pubkey)
         .and_modify(|v| v.endorse_signature = endorse_sig.clone())
@@ -4923,15 +5183,35 @@ mod commit_pubin_tests {
         let challenge_txid_wt0 = make_txid(0x01);
         let block_hash = make_block_hash(0xAA);
 
-        // watchtower 0 spent vout 0 of the init tx; watchtower 1 did not spend vout 1
+        let challenge_vout_0 =
+            output_topology::watchtower_challenge_init::watchtower_connector(0) as u32;
+        let ack_vout_0 = output_topology::watchtower_challenge_init::ack_connector(0) as u32;
+
+        // watchtower 0 spent its challenge connector and ACK connector; watchtower 1 is unresolved.
         mock_adaptor.set_tx(
             challenge_txid_wt0,
-            create_confirmed_tx(challenge_txid_wt0, &[(watchtower_init_txid, 0)], 100, block_hash),
+            create_confirmed_tx(
+                challenge_txid_wt0,
+                &[(watchtower_init_txid, challenge_vout_0)],
+                100,
+                block_hash,
+            ),
+        );
+        let ack_txid_wt0 = make_txid(0x02);
+        mock_adaptor.set_tx(
+            ack_txid_wt0,
+            create_confirmed_tx(
+                ack_txid_wt0,
+                &[(watchtower_init_txid, ack_vout_0)],
+                101,
+                block_hash,
+            ),
         );
 
         let (txids, bits) = get_watchtower_challenge_info(
             &btc_client,
             &SerializableTxid::from(watchtower_init_txid),
+            &[],
             2, // 2 watchtowers
         )
         .await
@@ -4951,21 +5231,33 @@ mod commit_pubin_tests {
         let block_hash_low = make_block_hash(0x10);
         let block_hash_high = make_block_hash(0x20);
 
+        let challenge_vout_0 =
+            output_topology::watchtower_challenge_init::watchtower_connector(0) as u32;
+        let challenge_vout_2 =
+            output_topology::watchtower_challenge_init::watchtower_connector(2) as u32;
+
         // wt0 confirmed at height 100, wt2 at height 200 (highest)
         mock_adaptor.set_tx(
             challenge_txid_wt0,
-            create_confirmed_tx(challenge_txid_wt0, &[(init_txid, 0)], 100, block_hash_low),
+            create_confirmed_tx(
+                challenge_txid_wt0,
+                &[(init_txid, challenge_vout_0)],
+                100,
+                block_hash_low,
+            ),
         );
         mock_adaptor.set_tx(
             challenge_txid_wt2,
-            create_confirmed_tx(challenge_txid_wt2, &[(init_txid, 2)], 200, block_hash_high),
+            create_confirmed_tx(
+                challenge_txid_wt2,
+                &[(init_txid, challenge_vout_2)],
+                200,
+                block_hash_high,
+            ),
         );
 
-        let challenge_txids = vec![
-            Some(challenge_txid_wt0.to_string()),
-            None,
-            Some(challenge_txid_wt2.to_string()),
-        ];
+        let challenge_txids =
+            vec![Some(challenge_txid_wt0.to_string()), None, Some(challenge_txid_wt2.to_string())];
         let bits = vec![true, false, true];
 
         let (best_hash, bitmap) =

@@ -25,6 +25,7 @@ use goat::{
         },
         watchtower_connectors::{AckConnector, WatchtowerChallengeConnector},
     },
+    constants::TimelockConfig,
     contexts::{base::BaseContext, committee::CommitteeContext, operator::OperatorContext},
     transactions::{
         assert::{DisproveTransaction, OperatorAssertTransaction, VerifierAssertTransaction},
@@ -48,11 +49,13 @@ use goat::{
 use secp256k1::SECP256K1;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     committee::{CommitteeSignatures, push_committee_pre_signatures},
     operator::{generate_bitvm_graph, push_operator_pre_signature},
+    timelocks::validate_timelock_config,
 };
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -89,6 +92,7 @@ pub struct PrekickoffParameters {
 pub struct BitvmGcGraphParameters {
     pub instance_parameters: BitvmGcInstanceParameters,
     pub prekickoff_parameters: PrekickoffParameters,
+    pub timelock_config: TimelockConfig,
     pub graph_id: Uuid,
     pub graph_nonce: u64,
     pub challenge_amount: Amount,
@@ -131,6 +135,7 @@ impl BitvmGcInstanceParameters {
             self.network,
             &self.n_of_n_taproot_public_key(),
             &self.user_taproot_public_key(),
+            &crate::timelocks::default_timelock_config(self.network),
         )
     }
 
@@ -301,6 +306,7 @@ impl BitvmGcGraphParameters {
             self.network(),
             &self.operator_taproot_public_key(),
             &self.n_of_n_taproot_public_key(),
+            &self.timelock_config,
         )
     }
 
@@ -325,6 +331,7 @@ impl BitvmGcGraphParameters {
             &self.operator_assert_wots_pubkey,
             &self.pubin_disprove_constant,
             &self.watchtower_ack_hashlocks,
+            &self.timelock_config,
         )
     }
 
@@ -333,6 +340,7 @@ impl BitvmGcGraphParameters {
             self.network(),
             &self.n_of_n_taproot_public_key(),
             &self.operator_commit_pubin_wots_pubkey,
+            &self.timelock_config,
         )
     }
 
@@ -341,6 +349,7 @@ impl BitvmGcGraphParameters {
             self.network(),
             &self.operator_taproot_public_key(),
             &self.n_of_n_taproot_public_key(),
+            &self.timelock_config,
         )
     }
 
@@ -360,6 +369,7 @@ impl BitvmGcGraphParameters {
             self.network(),
             &self.operator_taproot_public_key(),
             watchtower_taproot_public_key,
+            &self.timelock_config,
         ))
     }
 
@@ -371,6 +381,7 @@ impl BitvmGcGraphParameters {
                     self.network(),
                     &self.operator_taproot_public_key(),
                     pubkey,
+                    &self.timelock_config,
                 )
             })
             .collect()
@@ -381,14 +392,24 @@ impl BitvmGcGraphParameters {
             .watchtower_ack_hashlocks
             .get(watchtower_index)
             .ok_or_else(|| anyhow::anyhow!("invalid watchtower index {watchtower_index}"))?;
-        Ok(AckConnector::new(self.network(), &self.n_of_n_taproot_public_key(), *hashlock))
+        Ok(AckConnector::new(
+            self.network(),
+            &self.n_of_n_taproot_public_key(),
+            *hashlock,
+            &self.timelock_config,
+        ))
     }
 
     pub fn ack_connectors(&self) -> Vec<AckConnector> {
         self.watchtower_ack_hashlocks
             .iter()
             .map(|hashlock| {
-                AckConnector::new(self.network(), &self.n_of_n_taproot_public_key(), *hashlock)
+                AckConnector::new(
+                    self.network(),
+                    &self.n_of_n_taproot_public_key(),
+                    *hashlock,
+                    &self.timelock_config,
+                )
             })
             .collect()
     }
@@ -429,6 +450,7 @@ impl BitvmGcGraphParameters {
             self.network(),
             self.n_of_n_taproot_public_key(),
             gc_data.final_msg_hashlocks.clone(),
+            &self.timelock_config,
         ))
     }
 
@@ -440,9 +462,14 @@ impl BitvmGcGraphParameters {
                     self.network(),
                     self.n_of_n_taproot_public_key(),
                     data.final_msg_hashlocks.clone(),
+                    &self.timelock_config,
                 )
             })
             .collect()
+    }
+
+    pub fn validate_timelock_config(&self) -> Result<()> {
+        validate_timelock_config(self.network(), &self.timelock_config)
     }
 
     pub fn get_operator_context(&self, operator_keypair: Keypair) -> Result<OperatorContext> {
@@ -665,6 +692,34 @@ impl BitvmGcGraph {
             graph.committee_pre_signed = true;
         }
         Ok(graph)
+    }
+}
+
+impl SimplifiedBitvmGcGraph {
+    pub fn operator_pre_signed(&self) -> bool {
+        self.operator_pre_signed
+    }
+
+    pub fn committee_pre_signed(&self) -> bool {
+        self.committee_pre_signed
+    }
+
+    pub fn parameters_hash(&self) -> Result<[u8; 32]> {
+        self.parameters.parameters_hash()
+    }
+}
+
+impl BitvmGcInstanceParameters {
+    pub fn parameters_hash(&self) -> Result<[u8; 32]> {
+        let encoded = serde_json::to_vec(self)?;
+        Ok(Sha256::digest(encoded).into())
+    }
+}
+
+impl BitvmGcGraphParameters {
+    pub fn parameters_hash(&self) -> Result<[u8; 32]> {
+        let encoded = serde_json::to_vec(self)?;
+        Ok(Sha256::digest(encoded).into())
     }
 }
 
