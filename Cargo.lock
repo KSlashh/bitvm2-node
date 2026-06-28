@@ -3005,7 +3005,7 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2#db6adf333ca594400c698ec60ad3a1f37811e421"
+source = "git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2#fd8a985c16f39f0df26ad46749c266a3fb516d10"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -3040,6 +3040,7 @@ dependencies = [
  "anyhow",
  "ark-bn254",
  "ark-crypto-primitives",
+ "ark-ec",
  "ark-ff 0.5.0",
  "ark-groth16",
  "ark-serialize 0.5.0",
@@ -5576,7 +5577,7 @@ dependencies = [
 [[package]]
 name = "garbled-snark-verifier"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fgoat-bitvm3#a57d6df9f1f5bc782af306170886e14838552258"
+source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fgoat-bitvm3#bcdca2a02b0a8ef80835df9304d285cf8aa37e28"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5737,7 +5738,7 @@ dependencies = [
 [[package]]
 name = "goat"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2#db6adf333ca594400c698ec60ad3a1f37811e421"
+source = "git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2#fd8a985c16f39f0df26ad46749c266a3fb516d10"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -12202,7 +12203,7 @@ dependencies = [
 [[package]]
 name = "soldering-host"
 version = "1.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fgoat-bitvm3#a57d6df9f1f5bc782af306170886e14838552258"
+source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fgoat-bitvm3#bcdca2a02b0a8ef80835df9304d285cf8aa37e28"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -13888,7 +13889,7 @@ dependencies = [
 [[package]]
 name = "verifiable-circuit-babe"
 version = "0.0.1"
-source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fgoat-bitvm3#a57d6df9f1f5bc782af306170886e14838552258"
+source = "git+https://github.com/GOATNetwork/bitvm2-gc?branch=feat%2Fgoat-bitvm3#bcdca2a02b0a8ef80835df9304d285cf8aa37e28"
 dependencies = [
  "aes",
  "ark-bn254",
