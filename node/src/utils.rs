@@ -206,45 +206,114 @@ pub mod todo_funcs {
         Ok(())
     }
 
+    pub async fn validate_graph_instance_parameters(
+        btc_client: &BTCClient,
+        goat_client: &GOATClient,
+        parameters: &BitvmGcInstanceParameters,
+    ) -> Result<()> {
+        let expected = super::read_instance_info_from_goat(goat_client, parameters.instance_id)
+            .await
+            .map_err(|e| {
+                SpecialError::InvalidGraph(format!(
+                    "failed to load instance parameters from GoatChain: {e}"
+                ))
+            })?;
+        if parameters != &expected {
+            bail!(SpecialError::InvalidGraph(
+                "instance parameters mismatch with GoatChain peg-in data".to_string()
+            ));
+        }
+
+        for input in &expected.user_info.inputs {
+            let funding_tx = btc_client.get_tx(&input.outpoint.txid).await.map_err(|e| {
+                SpecialError::InvalidGraph(format!(
+                    "failed to load peg-in funding transaction {}: {e}",
+                    input.outpoint.txid
+                ))
+            })?;
+            let Some(funding_tx) = funding_tx else {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "peg-in funding transaction {} not found on Bitcoin",
+                    input.outpoint.txid
+                )));
+            };
+            let funding_output =
+                funding_tx.output.get(input.outpoint.vout as usize).ok_or_else(|| {
+                    SpecialError::InvalidGraph(format!(
+                        "peg-in funding outpoint {}:{} does not exist",
+                        input.outpoint.txid, input.outpoint.vout
+                    ))
+                })?;
+            if funding_output.value != input.amount {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "peg-in funding amount mismatch for {}:{}: graph={}, bitcoin={}",
+                    input.outpoint.txid,
+                    input.outpoint.vout,
+                    input.amount.to_sat(),
+                    funding_output.value.to_sat()
+                )));
+            }
+        }
+
+        let pegin_deposit_txid = expected
+            .build_pegin_tx()
+            .map_err(|e| {
+                SpecialError::InvalidGraph(format!("failed to reconstruct peg-in deposit: {e}"))
+            })?
+            .0
+            .tx()
+            .compute_txid();
+        if btc_client
+            .get_tx(&pegin_deposit_txid)
+            .await
+            .map_err(|e| {
+                SpecialError::InvalidGraph(format!(
+                    "failed to load peg-in deposit transaction {pegin_deposit_txid}: {e}"
+                ))
+            })?
+            .is_none()
+        {
+            bail!(SpecialError::InvalidGraph(format!(
+                "peg-in deposit transaction {pegin_deposit_txid} not found on Bitcoin"
+            )));
+        }
+
+        Ok(())
+    }
+
     pub async fn validate_init_graph(
-        local_db: &LocalDB,
         btc_client: &BTCClient,
         goat_client: &GOATClient,
         graph: &SimplifiedBitvmGcGraph,
     ) -> Result<()> {
+        if !graph.operator_pre_signed() {
+            bail!(SpecialError::InvalidGraph(
+                "graph is missing operator pre-signatures".to_string()
+            ));
+        }
         // Basic structural and on-chain consistency checks for an incoming graph proposal.
         // Return SpecialError::InvalidGraph on any validation failure.
         // 1) Rebuild full graph (ensures signatures present if flags are set and tx graph is coherent)
         let full_graph = BitvmGcGraph::from_simplified(graph)
             .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
+        verify_graph_operator_pre_signatures(&full_graph).map_err(|e| {
+            SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}"))
+        })?;
 
-        // 2) Network must match local node network
-        let net = get_network();
-        if graph.parameters.instance_parameters.network != net {
-            bail!(SpecialError::InvalidGraph(format!(
-                "network mismatch: graph={:?} local={:?}",
-                graph.parameters.instance_parameters.network, net
-            )));
-        }
+        // 2) Bind all instance and peg-in parameters to GoatChain and Bitcoin.
+        validate_graph_instance_parameters(
+            btc_client,
+            goat_client,
+            &graph.parameters.instance_parameters,
+        )
+        .await?;
 
-        // 3) Committee pubkeys must match what's registered on GoatChain for this instance
-        let instance_id = graph.parameters.instance_parameters.instance_id;
-        let committee_on_chain =
-            goat_client.gateway_get_committee_pubkeys(&instance_id).await.map_err(|e| {
-                SpecialError::InvalidGraph(format!("failed to load committee from chain: {e}"))
-            })?;
-        if committee_on_chain != graph.parameters.instance_parameters.committee_pubkeys {
-            bail!(SpecialError::InvalidGraph(
-                "committee pubkeys mismatch with GoatChain".to_string()
-            ));
-        }
-
-        // 4) Challenge amount and assert-commit count must match local constants
+        // 3) Challenge amount and assert-commit count must match local constants
         if graph.parameters.challenge_amount != super::todo_funcs::challenge_amount() {
             bail!(SpecialError::InvalidGraph("unexpected challenge amount".to_string()));
         }
 
-        // 5) Watchtower config sanity: number of watchtowers should match number of hashlocks and registry size
+        // 4) Watchtower config sanity: number of watchtowers should match number of hashlocks and registry size
         let watchtowers_on_chain =
             goat_client.committee_mana_get_watchtowers().await.map_err(|e| {
                 SpecialError::InvalidGraph(format!("failed to load watchtowers from chain: {e}"))
@@ -258,7 +327,7 @@ pub mod todo_funcs {
             graph.parameters.pubin_disprove_constant,
         )?;
 
-        // 6) Operator stake sanity: verify operator is registered and has enough locked stake
+        // 5) Operator stake sanity: verify operator is registered and has enough locked stake
         let op_pk_bytes = graph.parameters.operator_pubkey.to_bytes();
         let xonly: [u8; 32] = op_pk_bytes[1..33]
             .try_into()
@@ -286,32 +355,35 @@ pub mod todo_funcs {
         Ok(())
     }
     pub async fn validate_finalized_graph(
+        btc_client: &BTCClient,
         goat_client: &GOATClient,
         graph: &SimplifiedBitvmGcGraph,
         endorse_sigs: &[(PublicKey, EvmAddress, Vec<u8>)],
     ) -> Result<()> {
+        if !graph.operator_pre_signed() || !graph.committee_pre_signed() {
+            bail!(SpecialError::InvalidGraph(
+                "finalized graph is missing operator or committee pre-signatures".to_string()
+            ));
+        }
         // 1) Rebuild full graph to ensure structure is coherent and txns derivable
         let full_graph = BitvmGcGraph::from_simplified(graph)
             .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
+        verify_graph_operator_pre_signatures(&full_graph).map_err(|e| {
+            SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}"))
+        })?;
+        verify_graph_committee_pre_signatures(&full_graph).map_err(|e| {
+            SpecialError::InvalidGraph(format!("invalid committee pre-signatures: {e}"))
+        })?;
 
-        // 2) Repeat key static checks (network, committee set, counts)
-        let net = get_network();
-        if graph.parameters.instance_parameters.network != net {
-            bail!(SpecialError::InvalidGraph(format!(
-                "network mismatch: graph={:?} local={:?}",
-                graph.parameters.instance_parameters.network, net
-            )));
-        }
+        // 2) Repeat the full instance and peg-in binding for nodes that did not see CreateGraph.
+        validate_graph_instance_parameters(
+            btc_client,
+            goat_client,
+            &graph.parameters.instance_parameters,
+        )
+        .await?;
+
         let instance_id = graph.parameters.instance_parameters.instance_id;
-        let committee_on_chain =
-            goat_client.gateway_get_committee_pubkeys(&instance_id).await.map_err(|e| {
-                SpecialError::InvalidGraph(format!("failed to load committee from chain: {e}"))
-            })?;
-        if committee_on_chain != graph.parameters.instance_parameters.committee_pubkeys {
-            bail!(SpecialError::InvalidGraph(
-                "committee pubkeys mismatch with GoatChain".to_string()
-            ));
-        }
         if graph.parameters.challenge_amount != super::todo_funcs::challenge_amount() {
             bail!(SpecialError::InvalidGraph("unexpected challenge amount".to_string()));
         }
@@ -335,6 +407,18 @@ pub mod todo_funcs {
         let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await.map_err(|e| {
             SpecialError::InvalidGraph(format!("failed to load instance data: {e}"))
         })?;
+        if pegin_data.committee_pubkeys.len() != pegin_data.committee_addresses.len() {
+            bail!(SpecialError::InvalidGraph(
+                "on-chain committee pubkey and address counts differ".to_string()
+            ));
+        }
+        if endorse_sigs.len() != pegin_data.committee_pubkeys.len() {
+            bail!(SpecialError::InvalidGraph(format!(
+                "endorsement count {} does not match instance committee count {}",
+                endorse_sigs.len(),
+                pegin_data.committee_pubkeys.len()
+            )));
+        }
 
         for (pk, evm_addr, sig) in endorse_sigs.iter() {
             // no duplicates
@@ -5107,6 +5191,7 @@ pub struct VerifierBabeSetupState {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OperatorVerifierCandidate {
+    pub verifier_peer_id: Vec<u8>,
     pub verifier_pubkey: PublicKey,
     pub setup_package: CACSetupPackage,
     pub verifier_index: Option<usize>,

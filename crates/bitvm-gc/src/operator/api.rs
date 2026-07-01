@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
-use bitcoin::{Address, Amount, Transaction, TxIn, key::Keypair};
-use bitcoin::{Network, PublicKey, Witness};
+use bitcoin::{Address, Amount, TapSighashType, Transaction, TxIn, key::Keypair};
+use bitcoin::{Network, PublicKey, Witness, XOnlyPublicKey};
 use goat::assert_scripts::{
     OperatorAssertPublicKey, OperatorAssertSecretKey, OperatorCommitPubinPublicKey,
     OperatorCommitPubinSecretKey,
@@ -26,6 +26,7 @@ use goat::transactions::watchtower_challenge::{
 };
 use goat::wots::{Wots, Wots96};
 
+use crate::committee::verify_taproot_pre_signed_input;
 use crate::keys::hkdf_derive_bytes;
 use crate::timelocks::{
     default_timelock_config, take1_timelock_blocks, take2_timelock_blocks, validate_timelock_config,
@@ -393,6 +394,51 @@ pub fn push_operator_pre_signature(
     Ok(())
 }
 
+pub fn verify_graph_operator_pre_signatures(graph: &BitvmGcGraph) -> Result<()> {
+    if !graph.operator_pre_signed() {
+        bail!("graph is not pre-signed by the operator");
+    }
+    let operator_pubkey = XOnlyPublicKey::from(graph.parameters.operator_pubkey);
+
+    verify_taproot_pre_signed_input(
+        &graph.force_skip_kickoff,
+        &operator_pubkey,
+        0,
+        TapSighashType::None,
+    )?;
+    verify_taproot_pre_signed_input(
+        &graph.force_skip_kickoff,
+        &operator_pubkey,
+        1,
+        TapSighashType::None,
+    )?;
+    verify_taproot_pre_signed_input(
+        &graph.quick_challenge,
+        &operator_pubkey,
+        0,
+        TapSighashType::None,
+    )?;
+    verify_taproot_pre_signed_input(
+        &graph.quick_challenge,
+        &operator_pubkey,
+        1,
+        TapSighashType::None,
+    )?;
+    verify_taproot_pre_signed_input(
+        &graph.challenge_incomplete_kickoff,
+        &operator_pubkey,
+        0,
+        TapSighashType::None,
+    )?;
+    verify_taproot_pre_signed_input(
+        &graph.challenge_incomplete_kickoff,
+        &operator_pubkey,
+        1,
+        TapSighashType::None,
+    )?;
+    Ok(())
+}
+
 /// remember to sign replensish inputs (if any) after this
 pub fn operator_sign_prekickoff_input_0(
     operator_keypair: Keypair,
@@ -557,7 +603,8 @@ pub fn operator_sign_assert(
     graph: &mut BitvmGcGraph,
     wots_secret_key: &OperatorAssertSecretKey,
     proof: &[u8; 96],
-    extra_data: &[u8],
+    pi2: &[u8],
+    pi3: &[u8],
 ) -> Result<Transaction> {
     if Wots96::generate_public_key(wots_secret_key) != graph.parameters.operator_assert_wots_pubkey
     {
@@ -567,7 +614,7 @@ pub fn operator_sign_assert(
     let connector_c = graph.connector_c();
     graph
         .operator_assert
-        .operator_commit_proof(wots_secret_key, &connector_c, proof, extra_data)
+        .operator_commit_proof(wots_secret_key, &connector_c, proof, pi2, pi3)
         .map_err(|e| anyhow::anyhow!("failed to sign operator assert: {e}"))?;
     Ok(graph.operator_assert.tx().clone())
 }

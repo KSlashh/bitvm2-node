@@ -622,6 +622,12 @@ fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> 
             todo_funcs::min_required_verifier()
         );
     }
+    let mut verifier_peer_ids = std::collections::HashSet::new();
+    for candidate in &state.candidates {
+        if !verifier_peer_ids.insert(&candidate.verifier_peer_id) {
+            bail!("cannot freeze duplicate verifier peer id");
+        }
+    }
     state.candidates.truncate(todo_funcs::min_required_verifier());
     state.candidates.sort_by_key(|candidate| candidate.verifier_pubkey.to_bytes());
     for (verifier_index, candidate) in state.candidates.iter_mut().enumerate() {
@@ -1266,6 +1272,20 @@ async fn handle_gen_circuits_operator(
         bail!("GenCircuits setup package has no commitments");
     }
 
+    let verifier_peer_id = ctx.from_peer_id.to_bytes();
+    if !ctx.goat_client.committee_mana_is_verifier(&verifier_peer_id).await.with_context(|| {
+        format!(
+            "failed to validate GenCircuits sender {} against the verifier registry",
+            ctx.from_peer_id
+        )
+    })? {
+        tracing::warn!(
+            "Ignore GenCircuits for {instance_id}:{graph_id}: sender {} is not a registered verifier",
+            ctx.from_peer_id
+        );
+        return Ok(());
+    }
+
     let mut state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?.unwrap_or_default();
     let operator_state = state.operator.get_or_insert_with(|| OperatorBabeSetupState {
         frozen_verifier_pubkeys: None,
@@ -1277,11 +1297,27 @@ async fn handle_gen_circuits_operator(
     if let Some(existing) = operator_state
         .candidates
         .iter()
-        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+        .find(|candidate| candidate.verifier_peer_id == verifier_peer_id)
     {
+        if existing.verifier_pubkey != *verifier_pubkey {
+            tracing::warn!(
+                "Ignore GenCircuits for {instance_id}:{graph_id}: verifier peer {} already submitted a different public key",
+                ctx.from_peer_id
+            );
+            return Ok(());
+        }
         if existing.setup_package != *setup_package {
             bail!("conflicting GenCircuits setup package for verifier {verifier_pubkey}");
         }
+    } else if operator_state
+        .candidates
+        .iter()
+        .any(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+    {
+        tracing::warn!(
+            "Ignore GenCircuits for {instance_id}:{graph_id}: verifier public key {verifier_pubkey} is already bound to another peer"
+        );
+        return Ok(());
     } else if was_frozen {
         tracing::debug!(
             "Ignore GenCircuits for {instance_id}:{graph_id}: verifier membership is frozen"
@@ -1290,6 +1326,7 @@ async fn handle_gen_circuits_operator(
         return Ok(());
     } else {
         operator_state.candidates.push(OperatorVerifierCandidate {
+            verifier_peer_id,
             verifier_pubkey: *verifier_pubkey,
             setup_package: setup_package.clone(),
             verifier_index: None,
@@ -1496,6 +1533,14 @@ async fn handle_soldering_proof_ready_operator(
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
     if candidate.verifier_index != Some(verifier_index) {
         bail!("selected verifier candidate index does not match SolderingProofReady slot");
+    }
+    let verifier_peer_id = ctx.from_peer_id.to_bytes();
+    if candidate.verifier_peer_id != verifier_peer_id {
+        tracing::warn!(
+            "Ignore SolderingProofReady for {instance_id}:{graph_id}: sender {} does not own verifier slot {verifier_index}",
+            ctx.from_peer_id
+        );
+        return Ok(());
     }
 
     let store_base_path = get_soldering_proof_payload_store_path()?;
@@ -1784,9 +1829,7 @@ async fn handle_create_graph_committee(
 ) -> Result<()> {
     // received from Operator
     // 1. check graph data & operator stake
-    if let Err(e) =
-        todo_funcs::validate_init_graph(ctx.local_db, ctx.btc_client, ctx.goat_client, graph).await
-    {
+    if let Err(e) = todo_funcs::validate_init_graph(ctx.btc_client, ctx.goat_client, graph).await {
         if should_ignore_invalid_graph(&e, instance_id, graph_id, "CreateGraph", None) {
             return Ok(());
         }
@@ -2438,7 +2481,9 @@ async fn handle_graph_finalize_committee(
 ) -> Result<()> {
     // received from Operator
     // 1. check graph data
-    if let Err(e) = todo_funcs::validate_finalized_graph(ctx.goat_client, graph, endorse_sigs).await
+    if let Err(e) =
+        todo_funcs::validate_finalized_graph(ctx.btc_client, ctx.goat_client, graph, endorse_sigs)
+            .await
     {
         if should_ignore_invalid_graph(
             &e,
@@ -2546,7 +2591,9 @@ async fn handle_graph_finalize_default(
 ) -> Result<()> {
     // received from Operator
     // 1. check graph data
-    if let Err(e) = todo_funcs::validate_finalized_graph(ctx.goat_client, graph, endorse_sigs).await
+    if let Err(e) =
+        todo_funcs::validate_finalized_graph(ctx.btc_client, ctx.goat_client, graph, endorse_sigs)
+            .await
     {
         if should_ignore_invalid_graph(
             &e,
@@ -4021,10 +4068,6 @@ async fn handle_assert_ready_operator(
     let assert_witness =
         build_assert_witness(&operator_proof.proof, &assert_secret_key, dynamic_input)?;
     let assert_message = assert_wots_message(&assert_witness)?;
-    let mut assert_extra_data =
-        Vec::with_capacity(assert_witness.pi2.len() + assert_witness.pi3.len());
-    assert_extra_data.extend_from_slice(&assert_witness.pi2);
-    assert_extra_data.extend_from_slice(&assert_witness.pi3);
     let mut asserted_operator_proof = Vec::new();
     operator_proof.proof.serialize_compressed(&mut asserted_operator_proof)?;
     let mut setup_state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?
@@ -4041,8 +4084,13 @@ async fn handle_assert_ready_operator(
     operator_state.asserted_operator_proof = Some(asserted_operator_proof);
     save_babe_setup_state(ctx.local_db, instance_id, graph_id, &setup_state)?;
 
-    let assert_tx =
-        operator_sign_assert(&mut graph, &assert_secret_key, &assert_message, &assert_extra_data)?;
+    let assert_tx = operator_sign_assert(
+        &mut graph,
+        &assert_secret_key,
+        &assert_message,
+        &assert_witness.pi2,
+        &assert_witness.pi3,
+    )?;
     let assert_tx_total_input_amount =
         graph.operator_assert.prev_outs().iter().map(|o| o.value).sum::<Amount>();
     broadcast_tx_with_cpfp(ctx.btc_client, assert_tx, assert_tx_total_input_amount).await?;
@@ -5039,13 +5087,75 @@ async fn handle_sync_graph(
         );
         return Ok(());
     }
+
+    if !ctx
+        .goat_client
+        .committee_mana_is_validate_peer_id(&ctx.from_peer_id.to_bytes())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to validate SyncGraph sender {} against the committee registry",
+                ctx.from_peer_id
+            )
+        })?
+    {
+        tracing::warn!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: sender {} is not a registered committee peer",
+            ctx.from_peer_id
+        );
+        return Ok(());
+    }
+
+    if graph.parameters.instance_parameters.instance_id != instance_id
+        || graph.parameters.graph_id != graph_id
+    {
+        tracing::warn!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: message identifiers do not match graph parameters"
+        );
+        return Ok(());
+    }
+
     validate_graph_id_on_goat(ctx.goat_client, instance_id, graph_id).await.map_err(|e| {
         anyhow!(
             "Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}: {e}"
         )
     })?;
-    store_graph(ctx.local_db, graph).await?;
+    if let Err(e) = todo_funcs::validate_graph_instance_parameters(
+        ctx.btc_client,
+        ctx.goat_client,
+        &graph.parameters.instance_parameters,
+    )
+    .await
+    {
+        tracing::warn!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid instance parameters: {e}"
+        );
+        return Ok(());
+    }
     let graph = BitvmGcGraph::from_simplified(graph)?;
+    let graph_data = build_graph_data(&graph)?;
+    let graph_data_on_goat = ctx.goat_client.gateway_get_graph_data(&graph_id).await?;
+    if graph_data != graph_data_on_goat {
+        tracing::warn!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: reconstructed graph data does not match GoatChain"
+        );
+        return Ok(());
+    }
+
+    if let Err(e) = verify_graph_operator_pre_signatures(&graph) {
+        tracing::warn!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid operator pre-signatures: {e}"
+        );
+        return Ok(());
+    }
+    if let Err(e) = verify_graph_committee_pre_signatures(&graph) {
+        tracing::warn!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid committee pre-signatures: {e}"
+        );
+        return Ok(());
+    }
+    let simplified_graph = graph.to_simplified()?;
+    store_graph(ctx.local_db, &simplified_graph).await?;
     refresh_and_compensate(
         ctx,
         instance_id,
@@ -5112,6 +5222,7 @@ mod tests {
         OperatorBabeSetupState {
             frozen_verifier_pubkeys: Some(vec![verifier_pubkey()]),
             candidates: vec![OperatorVerifierCandidate {
+                verifier_peer_id: vec![1],
                 verifier_pubkey: verifier_pubkey(),
                 setup_package: package,
                 verifier_index: Some(0),
@@ -5129,6 +5240,7 @@ mod tests {
         let mut state = OperatorBabeSetupState {
             frozen_verifier_pubkeys: None,
             candidates: vec![OperatorVerifierCandidate {
+                verifier_peer_id: vec![1],
                 verifier_pubkey: verifier_pubkey(),
                 setup_package: package,
                 verifier_index: None,
