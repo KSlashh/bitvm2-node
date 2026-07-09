@@ -60,7 +60,8 @@ use p3_bn254_fr::Bn254Fr;
 use p3_field::{FieldAlgebra, PrimeField};
 use rand::Rng;
 use reqwest::Url;
-use secp256k1::Secp256k1;
+use secp256k1::schnorr::Signature as SchnorrSignature;
+use secp256k1::{Message as SecpMessage, SECP256K1, Secp256k1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -85,7 +86,7 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
 };
 use bitcoin_light_client_circuit::hash_operator_constant;
 use bitvm_lib::babe_adapter::{
-    BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData, SolderingData,
+    BABE_M_CC, BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData, SolderingData,
     compact_soldering_proof_payload,
 };
 use bitvm_lib::transactions::base::BaseTransaction;
@@ -281,7 +282,110 @@ pub mod todo_funcs {
         Ok(())
     }
 
-    pub async fn validate_init_graph(
+    fn validate_graph_policy(parameters: &BitvmGcGraphParameters) -> Result<()> {
+        let verifier_num = parameters.gc_data.len();
+        if verifier_num < min_required_verifier() {
+            bail!(SpecialError::InvalidGraph(format!(
+                "insufficient verifier GC slots: have {}, required {}",
+                verifier_num,
+                min_required_verifier()
+            )));
+        }
+
+        let mut verifier_pubkeys = std::collections::HashSet::new();
+        for gc_data in &parameters.gc_data {
+            if !verifier_pubkeys.insert(gc_data.verifier_pubkey) {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "duplicate verifier pubkey in GC data: {}",
+                    gc_data.verifier_pubkey
+                )));
+            }
+            if gc_data.final_msg_hashlocks.len() != BABE_M_CC {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "verifier {} has {} final message hashlocks, expected {}",
+                    gc_data.verifier_pubkey,
+                    gc_data.final_msg_hashlocks.len(),
+                    BABE_M_CC
+                )));
+            }
+        }
+
+        let watchtower_num = parameters.watchtower_pubkeys.len();
+        if watchtower_num < min_required_watchtower() {
+            bail!(SpecialError::InvalidGraph(format!(
+                "insufficient watchtower slots: have {}, required {}",
+                watchtower_num,
+                min_required_watchtower()
+            )));
+        }
+        let mut watchtower_pubkeys = std::collections::HashSet::new();
+        for pubkey in &parameters.watchtower_pubkeys {
+            if !watchtower_pubkeys.insert(*pubkey) {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "duplicate watchtower pubkey in graph: {pubkey}"
+                )));
+            }
+        }
+        let mut watchtower_hashlocks = std::collections::HashSet::new();
+        for hashlock in &parameters.watchtower_ack_hashlocks {
+            if !watchtower_hashlocks.insert(*hashlock) {
+                bail!(SpecialError::InvalidGraph(
+                    "duplicate watchtower ack hashlock in graph".to_string()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_prekickoff_continuity(
+        local_db: &LocalDB,
+        full_graph: &BitvmGcGraph,
+    ) -> Result<()> {
+        if full_graph.parameters.graph_nonce == 0 {
+            return Ok(());
+        }
+
+        let mut storage_processor = local_db.acquire().await?;
+        let previous_nonce = full_graph.parameters.graph_nonce - 1;
+        let graphs = storage_processor
+            .get_operator_graphs(
+                GraphQuery::default()
+                    .with_operator_pubkey(full_graph.parameters.operator_pubkey.to_string())
+                    .with_kickoff_index(previous_nonce as i64)
+                    .with_limit(2),
+            )
+            .await?;
+        if let Some(previous_graph) = graphs.first() {
+            let Some(graph_raw_data) =
+                storage_processor.find_graph_raw_data(&previous_graph.graph_id).await?
+            else {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "previous graph raw data is missing for graph nonce {previous_nonce}"
+                )));
+            };
+            let simplified_graph =
+                super::parse_graph_raw_data(graph_raw_data.raw_data, previous_graph.graph_id)
+                    .await?;
+            let expected_cur_prekickoff =
+                BitvmGcGraph::from_simplified(&simplified_graph)?.next_prekickoff;
+            let expected_txid = expected_cur_prekickoff.finalize().compute_txid();
+            let actual_txid = full_graph.cur_prekickoff.finalize().compute_txid();
+            if actual_txid != expected_txid {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "cur prekickoff continuity mismatch: graph={actual_txid}, expected={expected_txid}"
+                )));
+            }
+            Ok(())
+        } else {
+            bail!(SpecialError::InvalidGraph(format!(
+                "previous graph is missing for graph nonce {previous_nonce}"
+            )));
+        }
+    }
+
+    pub async fn validate_init_graph_base(
+        local_db: &LocalDB,
         btc_client: &BTCClient,
         goat_client: &GOATClient,
         graph: &SimplifiedBitvmGcGraph,
@@ -296,6 +400,8 @@ pub mod todo_funcs {
         // 1) Rebuild full graph (ensures signatures present if flags are set and tx graph is coherent)
         let full_graph = BitvmGcGraph::from_simplified(graph)
             .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
+        validate_graph_policy(&graph.parameters)?;
+        validate_prekickoff_continuity(local_db, &full_graph).await?;
         verify_graph_operator_pre_signatures(&full_graph).map_err(|e| {
             SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}"))
         })?;
@@ -354,11 +460,74 @@ pub mod todo_funcs {
 
         Ok(())
     }
+
+    pub fn validate_verifier_graph_params_endorsements(
+        graph: &SimplifiedBitvmGcGraph,
+        verifier_endorsements: &[(PublicKey, usize, SchnorrSignature)],
+    ) -> Result<()> {
+        let expected_verifier_num = graph.parameters.gc_data.len();
+        if verifier_endorsements.len() != expected_verifier_num {
+            bail!(SpecialError::InvalidGraph(format!(
+                "verifier params endorsement count {} does not match GC slot count {}",
+                verifier_endorsements.len(),
+                expected_verifier_num
+            )));
+        }
+
+        let mut seen_pubkeys = std::collections::HashSet::new();
+        let mut seen_indices = std::collections::HashSet::new();
+        for (verifier_pubkey, verifier_index, signature) in verifier_endorsements {
+            if *verifier_index >= expected_verifier_num {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "verifier params endorsement index {verifier_index} out of range"
+                )));
+            }
+            let slot_pubkey = graph.parameters.gc_data[*verifier_index].verifier_pubkey;
+            if slot_pubkey != *verifier_pubkey {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "verifier params endorsement slot mismatch at index {verifier_index}: signature pubkey={}, graph pubkey={slot_pubkey}",
+                    verifier_pubkey
+                )));
+            }
+            if !seen_pubkeys.insert(*verifier_pubkey) {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "duplicate verifier params endorsement pubkey: {verifier_pubkey}"
+                )));
+            }
+            if !seen_indices.insert(*verifier_index) {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "duplicate verifier params endorsement index: {verifier_index}"
+                )));
+            }
+            let ok =
+                super::verify_verifier_graph_params_endorsement(verifier_pubkey, graph, signature)?;
+            if !ok {
+                bail!(SpecialError::InvalidGraph(format!(
+                    "invalid verifier params endorsement signature for {verifier_pubkey}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn validate_init_graph(
+        local_db: &LocalDB,
+        btc_client: &BTCClient,
+        goat_client: &GOATClient,
+        graph: &SimplifiedBitvmGcGraph,
+        verifier_endorsements: &[(PublicKey, usize, SchnorrSignature)],
+    ) -> Result<()> {
+        validate_init_graph_base(local_db, btc_client, goat_client, graph).await?;
+        validate_verifier_graph_params_endorsements(graph, verifier_endorsements)?;
+        Ok(())
+    }
     pub async fn validate_finalized_graph(
         btc_client: &BTCClient,
         goat_client: &GOATClient,
         graph: &SimplifiedBitvmGcGraph,
         endorse_sigs: &[(PublicKey, EvmAddress, Vec<u8>)],
+        params_endorse_sigs: &[(PublicKey, EvmAddress, Vec<u8>)],
     ) -> Result<()> {
         if !graph.operator_pre_signed() || !graph.committee_pre_signed() {
             bail!(SpecialError::InvalidGraph(
@@ -368,6 +537,7 @@ pub mod todo_funcs {
         // 1) Rebuild full graph to ensure structure is coherent and txns derivable
         let full_graph = BitvmGcGraph::from_simplified(graph)
             .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
+        validate_graph_policy(&graph.parameters)?;
         verify_graph_operator_pre_signatures(&full_graph).map_err(|e| {
             SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}"))
         })?;
@@ -419,6 +589,13 @@ pub mod todo_funcs {
                 pegin_data.committee_pubkeys.len()
             )));
         }
+        if params_endorse_sigs.len() != pegin_data.committee_pubkeys.len() {
+            bail!(SpecialError::InvalidGraph(format!(
+                "params endorsement count {} does not match instance committee count {}",
+                params_endorse_sigs.len(),
+                pegin_data.committee_pubkeys.len()
+            )));
+        }
 
         for (pk, evm_addr, sig) in endorse_sigs.iter() {
             // no duplicates
@@ -465,6 +642,55 @@ pub mod todo_funcs {
                 })?;
             if !ok {
                 bail!(SpecialError::InvalidGraph("invalid endorsement signature".to_string()));
+            }
+        }
+
+        let mut seen_committee: HashSet<PublicKey> = HashSet::new();
+        let mut seen_evm: HashSet<EvmAddress> = HashSet::new();
+        for (pk, evm_addr, sig) in params_endorse_sigs.iter() {
+            if !seen_committee.insert(*pk) {
+                bail!(SpecialError::InvalidGraph(
+                    "duplicate committee pubkey in params endorsements".to_string()
+                ));
+            }
+            if !seen_evm.insert(*evm_addr) {
+                bail!(SpecialError::InvalidGraph(
+                    "duplicate evm address in params endorsements".to_string()
+                ));
+            }
+
+            let mut found = false;
+            for i in 0..pegin_data.committee_pubkeys.len() {
+                let on_chain_pk =
+                    PublicKey::from_slice(&pegin_data.committee_pubkeys[i]).map_err(|e| {
+                        SpecialError::InvalidGraph(format!(
+                            "invalid committee pubkey on-chain: {e}"
+                        ))
+                    })?;
+                if &on_chain_pk == pk {
+                    found = true;
+                    let expected_addr = pegin_data.committee_addresses[i];
+                    if &expected_addr != evm_addr {
+                        bail!(SpecialError::InvalidGraph(
+                            "committee evm address mismatch in params endorsements".to_string()
+                        ));
+                    }
+                    break;
+                }
+            }
+            if !found {
+                bail!(SpecialError::InvalidGraph(
+                    "params endorser not in committee set".to_string()
+                ));
+            }
+
+            let ok = super::verify_graph_params_endorsement(evm_addr, &full_graph, sig).map_err(
+                |e| SpecialError::InvalidGraph(format!("failed to verify params endorsement: {e}")),
+            )?;
+            if !ok {
+                bail!(SpecialError::InvalidGraph(
+                    "invalid params endorsement signature".to_string()
+                ));
             }
         }
 
@@ -2110,15 +2336,23 @@ pub async fn get_watchtower_commitment(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct WatchtowerChallengeInfo {
+    pub challenge_txids: Vec<Option<String>>,
+    pub included_watchtowers: Vec<bool>,
+    pub resolved_branch_txids: Vec<Txid>,
+}
+
 #[tracing::instrument(name = "get_watchtower_challenge_info", skip(btc_client))]
 pub async fn get_watchtower_challenge_info(
     btc_client: &BTCClient,
     watchtower_challenge_init_txid: &SerializableTxid,
     watchtower_timeout_txids: &[Txid],
     num_watchtowers: usize,
-) -> Result<(Vec<Option<String>>, Vec<bool>)> {
+) -> Result<WatchtowerChallengeInfo> {
     let mut challenge_txids = Vec::with_capacity(num_watchtowers);
     let mut included_watchtowers = Vec::with_capacity(num_watchtowers);
+    let mut resolved_branch_txids = Vec::with_capacity(num_watchtowers);
     for index in 0..num_watchtowers {
         let challenge_vout =
             output_topology::watchtower_challenge_init::watchtower_connector(index) as u64;
@@ -2131,6 +2365,7 @@ pub async fn get_watchtower_challenge_info(
                 if !status.confirmed {
                     bail!("watchtower branch tx {txid} at index {index} is not confirmed yet");
                 }
+                resolved_branch_txids.push(txid);
 
                 let is_timeout = watchtower_timeout_txids
                     .get(index)
@@ -2149,23 +2384,23 @@ pub async fn get_watchtower_challenge_info(
             }
         }
     }
-    Ok((challenge_txids, included_watchtowers))
+    Ok(WatchtowerChallengeInfo { challenge_txids, included_watchtowers, resolved_branch_txids })
 }
 
-/// Returns `(btc_best_block_hash, included_watchtowers_bitmap)` from already-fetched
-/// `get_watchtower_challenge_info` output.
+/// Returns `(btc_best_block_hash, included_watchtowers_bitmap)` using every confirmed
+/// challenge-branch resolution for the block hash while only challenges set bitmap bits.
 pub async fn compute_operator_pubin_blockhash_and_bitmap(
     btc_client: &BTCClient,
-    challenge_txids: &[Option<String>],
+    resolved_branch_txids: &[Txid],
     included_watchtowers_bits: &[bool],
 ) -> Result<([u8; 32], [u8; 32])> {
     let btc_best_block_hash = {
         let mut largest: Option<(u32, BlockHash)> = None;
-        for txid in challenge_txids.iter().flatten() {
-            let status = btc_client.get_tx_status(&Txid::from_str(txid)?).await?;
+        for txid in resolved_branch_txids {
+            let status = btc_client.get_tx_status(txid).await?;
             let (height, hash) = match (status.block_height, status.block_hash) {
                 (Some(height), Some(hash)) => (height, hash),
-                _ => bail!("watchtower challenge tx {txid} is not confirmed yet"),
+                _ => bail!("watchtower branch resolution tx {txid} is not confirmed yet"),
             };
             if largest.is_none_or(|(h, _)| height > h) {
                 largest = Some((height, hash));
@@ -2173,7 +2408,7 @@ pub async fn compute_operator_pubin_blockhash_and_bitmap(
         }
         largest
             .map(|(_, hash)| hash.to_byte_array())
-            .ok_or_else(|| anyhow!("no confirmed watchtower challenge tx available"))?
+            .ok_or_else(|| anyhow!("no confirmed watchtower branch resolution tx available"))?
     };
 
     let mut included_watchtowers = [0u8; 32];
@@ -2188,13 +2423,13 @@ pub async fn compute_operator_pubin_blockhash_and_bitmap(
 
 async fn get_operator_committed_blockhash(
     btc_client: &BTCClient,
-    challenge_txids: &[Option<String>],
+    resolved_branch_txids: &[Txid],
     included_watchtowers_bits: &[bool],
     graph_id: Uuid,
 ) -> Result<Option<String>> {
     match compute_operator_pubin_blockhash_and_bitmap(
         btc_client,
-        challenge_txids,
+        resolved_branch_txids,
         included_watchtowers_bits,
     )
     .await
@@ -2304,7 +2539,11 @@ pub async fn get_operator_proof(
     let num_challenger = bitvm_graph.parameters.watchtower_pubkeys.len();
     let watchtower_timeout_txids: Vec<Txid> =
         bitvm_graph.watchtower_challenge_timeouts.iter().map(|tx| tx.tx().compute_txid()).collect();
-    let (watchtower_challenge_txids, included_watchtowers) = match get_watchtower_challenge_info(
+    let WatchtowerChallengeInfo {
+        challenge_txids: watchtower_challenge_txids,
+        included_watchtowers,
+        resolved_branch_txids,
+    } = match get_watchtower_challenge_info(
         btc_client,
         &watchtower_challenge_init_txid,
         &watchtower_timeout_txids,
@@ -2320,7 +2559,7 @@ pub async fn get_operator_proof(
     };
     let Some(operator_committed_blockhash) = get_operator_committed_blockhash(
         btc_client,
-        &watchtower_challenge_txids,
+        &resolved_branch_txids,
         &included_watchtowers,
         graph_id,
     )
@@ -3309,6 +3548,13 @@ pub async fn endorse_graph(goat_client: &GOATClient, graph: &BitvmGcGraph) -> Re
     Ok(sig)
 }
 
+pub async fn endorse_graph_params(graph: &BitvmGcGraph) -> Result<EvmSignature> {
+    let signer = PrivateKeySigner::from_str(&get_node_goat_private_key()?)?;
+    let params_hash = graph.parameters.canonical_graph_params_hash()?;
+    let sig = signer.sign_hash(&params_hash.into()).await?;
+    Ok(sig)
+}
+
 pub async fn endorse_pegin(
     goat_client: &GOATClient,
     instance_id: Uuid,
@@ -3357,6 +3603,41 @@ pub async fn verify_graph_endorsement(
     sig.recover_address_from_prehash(&graph_digest.into())
         .map(|addr| &addr == evm_address)
         .map_err(|e| e.into())
+}
+
+pub fn verify_graph_params_endorsement(
+    evm_address: &EvmAddress,
+    graph: &BitvmGcGraph,
+    signature: &[u8],
+) -> Result<bool> {
+    let params_hash = graph.parameters.canonical_graph_params_hash()?;
+    let sig = EvmSignature::try_from(signature)?;
+    sig.recover_address_from_prehash(&params_hash.into())
+        .map(|addr| &addr == evm_address)
+        .map_err(|e| e.into())
+}
+
+pub fn sign_verifier_graph_params(
+    verifier_keypair: Keypair,
+    graph: &SimplifiedBitvmGcGraph,
+) -> Result<SchnorrSignature> {
+    let params_hash = graph.canonical_graph_params_hash()?;
+    Ok(SECP256K1.sign_schnorr(&SecpMessage::from_digest(params_hash), &verifier_keypair))
+}
+
+pub fn verify_verifier_graph_params_endorsement(
+    verifier_pubkey: &PublicKey,
+    graph: &SimplifiedBitvmGcGraph,
+    signature: &SchnorrSignature,
+) -> Result<bool> {
+    let params_hash = graph.canonical_graph_params_hash()?;
+    Ok(SECP256K1
+        .verify_schnorr(
+            signature,
+            &SecpMessage::from_digest(params_hash),
+            &XOnlyPublicKey::from(*verifier_pubkey),
+        )
+        .is_ok())
 }
 
 /// Validates whether the given kickoff transaction has been confirmed on Layer 1.
@@ -3855,6 +4136,9 @@ pub struct GraphProcessDataItem {
     pub partial_sigs: Option<CommitteePartialSignatures>,
     pub committee_evm_address: Option<EvmAddress>,
     pub endorse_signature: Vec<u8>,
+    pub params_endorse_signature: Vec<u8>,
+    pub verifier_index: Option<usize>,
+    pub verifier_params_signature: Option<SchnorrSignature>,
 }
 pub type GraphProcessDataMap = IndexMap<PublicKey, GraphProcessDataItem>;
 
@@ -4408,9 +4692,7 @@ pub async fn store_committee_pub_nonces_for_graph(
         .and_modify(|v| v.committee_pub_nonce = Some(pub_nonces.clone()))
         .or_insert_with(|| GraphProcessDataItem {
             committee_pub_nonce: Some(pub_nonces),
-            partial_sigs: None,
-            committee_evm_address: None,
-            endorse_signature: vec![],
+            ..Default::default()
         });
     upsert_pegin_graph_process_data(
         &mut storage_processor,
@@ -4457,10 +4739,8 @@ pub async fn store_committee_partial_sigs_for_graph(
         .entry(committee_pubkey)
         .and_modify(|v| v.partial_sigs = Some(partial_sigs.clone()))
         .or_insert_with(|| GraphProcessDataItem {
-            committee_pub_nonce: None,
             partial_sigs: Some(partial_sigs),
-            committee_evm_address: None,
-            endorse_signature: vec![],
+            ..Default::default()
         });
     upsert_pegin_graph_process_data(
         &mut storage_processor,
@@ -4504,6 +4784,7 @@ pub async fn store_committee_endorsement_for_graph(
     committee_pubkey: PublicKey,
     committee_evm_address: EvmAddress,
     endorse_signature: Vec<u8>,
+    params_endorse_signature: Vec<u8>,
 ) -> Result<()> {
     let mut storage_processor = local_db.acquire().await?;
     let (is_endorsed, mut process_data) =
@@ -4512,13 +4793,14 @@ pub async fn store_committee_endorsement_for_graph(
         .entry(committee_pubkey)
         .and_modify(|v| {
             v.endorse_signature = endorse_signature.clone();
+            v.params_endorse_signature = params_endorse_signature.clone();
             v.committee_evm_address = Some(committee_evm_address);
         })
         .or_insert_with(|| GraphProcessDataItem {
-            committee_pub_nonce: None,
-            partial_sigs: None,
             committee_evm_address: Some(committee_evm_address),
             endorse_signature,
+            params_endorse_signature,
+            ..Default::default()
         });
     upsert_pegin_graph_process_data(
         &mut storage_processor,
@@ -4535,6 +4817,7 @@ pub async fn store_committee_endorsements_for_graph(
     instance_id: Uuid,
     graph_id: Uuid,
     endorse_sigs: Vec<(PublicKey, EvmAddress, Vec<u8>)>,
+    params_endorse_sigs: Vec<(PublicKey, EvmAddress, Vec<u8>)>,
 ) -> Result<()> {
     let mut storage_processor = local_db.acquire().await?;
     let (is_endorsed, mut process_data) =
@@ -4548,10 +4831,22 @@ pub async fn store_committee_endorsements_for_graph(
                 v.committee_evm_address = Some(committee_evm_address);
             })
             .or_insert_with(|| GraphProcessDataItem {
-                committee_pub_nonce: None,
-                partial_sigs: None,
                 committee_evm_address: Some(committee_evm_address),
                 endorse_signature,
+                ..Default::default()
+            });
+    }
+    for (committee_pubkey, committee_evm_address, params_endorse_signature) in params_endorse_sigs {
+        process_data
+            .entry(committee_pubkey)
+            .and_modify(|v| {
+                v.params_endorse_signature = params_endorse_signature.clone();
+                v.committee_evm_address = Some(committee_evm_address);
+            })
+            .or_insert_with(|| GraphProcessDataItem {
+                committee_evm_address: Some(committee_evm_address),
+                params_endorse_signature,
+                ..Default::default()
             });
     }
     upsert_pegin_graph_process_data(
@@ -4584,6 +4879,94 @@ pub async fn get_committee_endorsements_for_graph(
             }
         })
         .collect::<Vec<(PublicKey, EvmAddress, Vec<u8>)>>())
+}
+
+pub async fn get_committee_params_endorsements_for_graph(
+    local_db: &LocalDB,
+    _instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<Vec<(PublicKey, EvmAddress, Vec<u8>)>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (_is_endorsed, process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    Ok(process_data
+        .iter()
+        .filter_map(|(k, v)| {
+            if !v.params_endorse_signature.is_empty() {
+                v.committee_evm_address
+                    .as_ref()
+                    .map(|evm_addr| (*k, *evm_addr, v.params_endorse_signature.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<(PublicKey, EvmAddress, Vec<u8>)>>())
+}
+
+pub async fn store_verifier_graph_params_endorsement(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_pubkey: PublicKey,
+    verifier_index: usize,
+    signature: SchnorrSignature,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (is_endorsed, mut process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    if let Some(existing_index) = process_data.get(&verifier_pubkey).and_then(|v| v.verifier_index)
+        && existing_index != verifier_index
+    {
+        bail!(SpecialError::InvalidGraph(format!(
+            "verifier params endorsement index changed for graph {graph_id} and verifier {verifier_pubkey}"
+        )));
+    }
+    if let Some(existing_signature) =
+        process_data.get(&verifier_pubkey).and_then(|v| v.verifier_params_signature.as_ref())
+        && existing_signature != &signature
+    {
+        bail!(SpecialError::InvalidGraph(format!(
+            "verifier params endorsement signature changed for graph {graph_id} and verifier {verifier_pubkey}"
+        )));
+    }
+    process_data
+        .entry(verifier_pubkey)
+        .and_modify(|v| {
+            v.verifier_index = Some(verifier_index);
+            v.verifier_params_signature = Some(signature);
+        })
+        .or_insert_with(|| GraphProcessDataItem {
+            verifier_index: Some(verifier_index),
+            verifier_params_signature: Some(signature),
+            ..Default::default()
+        });
+    upsert_pegin_graph_process_data(
+        &mut storage_processor,
+        graph_id,
+        instance_id,
+        is_endorsed,
+        &process_data,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn get_verifier_graph_params_endorsements_for_graph(
+    local_db: &LocalDB,
+    _instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<Vec<(PublicKey, usize, SchnorrSignature)>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (_is_endorsed, process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    Ok(process_data
+        .iter()
+        .filter_map(|(k, v)| {
+            v.verifier_index
+                .zip(v.verifier_params_signature.as_ref())
+                .map(|(index, signature)| (*k, index, signature.clone()))
+        })
+        .collect())
 }
 pub async fn mark_graph_as_endorsed(
     local_db: &LocalDB,
@@ -5374,7 +5757,7 @@ mod commit_pubin_tests {
             ),
         );
 
-        let (txids, bits) = get_watchtower_challenge_info(
+        let info = get_watchtower_challenge_info(
             &btc_client,
             &SerializableTxid::from(watchtower_init_txid),
             &[],
@@ -5383,8 +5766,9 @@ mod commit_pubin_tests {
         .await
         .unwrap();
 
-        assert_eq!(txids, vec![Some(challenge_txid_wt0.to_string()), None]);
-        assert_eq!(bits, vec![true, false]);
+        assert_eq!(info.challenge_txids, vec![Some(challenge_txid_wt0.to_string()), None]);
+        assert_eq!(info.included_watchtowers, vec![true, false]);
+        assert_eq!(info.resolved_branch_txids, vec![challenge_txid_wt0]);
     }
 
     #[tokio::test]
@@ -5422,12 +5806,11 @@ mod commit_pubin_tests {
             ),
         );
 
-        let challenge_txids =
-            vec![Some(challenge_txid_wt0.to_string()), None, Some(challenge_txid_wt2.to_string())];
+        let resolved_branch_txids = vec![challenge_txid_wt0, challenge_txid_wt2];
         let bits = vec![true, false, true];
 
         let (best_hash, bitmap) =
-            compute_operator_pubin_blockhash_and_bitmap(&btc_client, &challenge_txids, &bits)
+            compute_operator_pubin_blockhash_and_bitmap(&btc_client, &resolved_branch_txids, &bits)
                 .await
                 .unwrap();
 
