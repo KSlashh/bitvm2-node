@@ -2512,21 +2512,36 @@ pub async fn get_watchtower_challenge_info(
     Ok(WatchtowerChallengeInfo { challenge_txids, included_watchtowers, resolved_branch_txids })
 }
 
-/// Returns `(btc_best_block_hash, included_watchtowers_bitmap)` using every confirmed
+/// Returns `(btc_best_block_hash, included_watchtowers_bitmap)` using every finalized
 /// challenge-branch resolution for the block hash while only challenges set bitmap bits.
+///
+/// The selected hash is signed into the operator's pubin and cannot be replaced after a
+/// reorganization. Require every branch that determines the bitmap to be at least as deeply
+/// buried as the header/SPV finality window before returning it.
 pub async fn compute_operator_pubin_blockhash_and_bitmap(
     btc_client: &BTCClient,
     resolved_branch_txids: &[Txid],
     included_watchtowers_bits: &[bool],
 ) -> Result<([u8; 32], [u8; 32])> {
+    let tip_height = btc_client.get_height().await?;
+    let required_burial_depth = get_btc_block_confirms(btc_client.network());
     let btc_best_block_hash = {
         let mut largest: Option<(u32, BlockHash)> = None;
         for txid in resolved_branch_txids {
             let status = btc_client.get_tx_status(txid).await?;
-            let (height, hash) = match (status.block_height, status.block_hash) {
-                (Some(height), Some(hash)) => (height, hash),
+            let (height, hash) = match (status.confirmed, status.block_height, status.block_hash) {
+                (true, Some(height), Some(hash)) => (height, hash),
                 _ => bail!("watchtower branch resolution tx {txid} is not confirmed yet"),
             };
+            // `BTC_BLOCK_CONFIRMS` is the number of blocks that must follow a block before
+            // the SPV/header pipeline consumes it. Match the proof-builder's strict boundary:
+            // the anchor must have more than this many blocks after it.
+            let burial_depth = tip_height.saturating_sub(height);
+            if burial_depth <= required_burial_depth {
+                bail!(
+                    "watchtower branch resolution tx {txid} is not final enough for operator pubin: height={height}, tip={tip_height}, burial_depth={burial_depth}, required_burial_depth>{required_burial_depth}"
+                );
+            }
             if largest.is_none_or(|(h, _)| height > h) {
                 largest = Some((height, hash));
             }
@@ -6195,8 +6210,10 @@ mod commit_pubin_tests {
 
         let init_txid = make_txid(0x00);
         let challenge_txid_wt0 = make_txid(0x01);
+        let timeout_txid_wt1 = make_txid(0x03);
         let challenge_txid_wt2 = make_txid(0x02);
         let block_hash_low = make_block_hash(0x10);
+        let block_hash_middle = make_block_hash(0x15);
         let block_hash_high = make_block_hash(0x20);
 
         let challenge_vout_0 =
@@ -6204,7 +6221,9 @@ mod commit_pubin_tests {
         let challenge_vout_2 =
             output_topology::watchtower_challenge_init::watchtower_connector(2) as u32;
 
-        // wt0 confirmed at height 100, wt2 at height 200 (highest)
+        // All three branches are finalized; wt2's height 200 block is the anchor.
+        let required_burial_depth = get_btc_block_confirms(btc_client.network());
+        mock_adaptor.set_height(200 + required_burial_depth + 1);
         mock_adaptor.set_tx(
             challenge_txid_wt0,
             create_confirmed_tx(
@@ -6213,6 +6232,10 @@ mod commit_pubin_tests {
                 100,
                 block_hash_low,
             ),
+        );
+        mock_adaptor.set_tx(
+            timeout_txid_wt1,
+            create_confirmed_tx(timeout_txid_wt1, &[(init_txid, 1)], 150, block_hash_middle),
         );
         mock_adaptor.set_tx(
             challenge_txid_wt2,
@@ -6224,7 +6247,7 @@ mod commit_pubin_tests {
             ),
         );
 
-        let resolved_branch_txids = vec![challenge_txid_wt0, challenge_txid_wt2];
+        let resolved_branch_txids = vec![challenge_txid_wt0, timeout_txid_wt1, challenge_txid_wt2];
         let bits = vec![true, false, true];
 
         let (best_hash, bitmap) =
