@@ -1940,6 +1940,16 @@ async fn handle_compact_soldering_proof_operator(
     .await
     .context("real BABE setup verification task failed")??;
 
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "soldering_verified",
+        verifier_index,
+        verifier_pubkey = %verifier_pubkey,
+        finalized_instances = finalized.len(),
+        payload_hash = %hex::encode(soldering_proof_ready.payload_hash),
+        "verified verifier soldering proof"
+    );
+
     if finalized.len() != BABE_M_CC {
         bail!("each verifier must contribute exactly {BABE_M_CC} finalized BABE instances");
     }
@@ -1956,10 +1966,50 @@ async fn handle_compact_soldering_proof_operator(
         soldering_proof_ready.clone(),
     )?
     else {
-        save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+        let completed_slots = operator_state
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.gc_data.is_some())
+            .count();
+        let expected_slots = operator_state.candidates.len();
+        if let Err(error) = save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state) {
+            tracing::error!(
+                event = "operator_graph_creation",
+                outcome = "failed",
+                stage = "babe_state_persist",
+                verifier_index,
+                error = %error,
+                "failed to persist incomplete operator BABE setup state"
+            );
+            return Err(error).context("persist incomplete operator BABE setup state");
+        }
+        tracing::info!(
+            event = "operator_graph_creation",
+            outcome = "waiting_for_soldering",
+            verifier_index,
+            completed_slots,
+            expected_slots,
+            "persisted verifier soldering proof; waiting for remaining graph slots"
+        );
         return Ok(());
     };
-    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+    if let Err(error) = save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state) {
+        tracing::error!(
+            event = "operator_graph_creation",
+            outcome = "failed",
+            stage = "babe_state_persist",
+            verifier_index,
+            error = %error,
+            "failed to persist complete operator BABE setup state"
+        );
+        return Err(error).context("persist complete operator BABE setup state");
+    }
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "all_soldering_collected",
+        verifier_slots = bitvm_gc_circuit_datas.len(),
+        "all verifier soldering proofs are ready to build the graph"
+    );
 
     let instance_params = get_instance_parameters(ctx.local_db, instance_id)
         .await?
@@ -1988,14 +2038,107 @@ async fn handle_compact_soldering_proof_operator(
     operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
 
     let graph = graph.to_simplified()?;
-    store_operator_presigned_graph(ctx.local_db, &graph).await?;
+    let definition_hash = hex::encode(graph.parameters_hash()?);
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "started",
+        stage = "definition_store",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        "storing operator-pre-signed graph definition"
+    );
+    if let Err(error) = store_operator_presigned_graph(ctx.local_db, &graph).await {
+        tracing::error!(
+            event = "operator_graph_creation",
+            outcome = "failed",
+            stage = "definition_store",
+            graph_nonce,
+            definition_hash = %definition_hash,
+            error = %error,
+            "failed to store operator-pre-signed graph definition"
+        );
+        return Err(error).context("store operator-pre-signed graph definition");
+    }
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "committed",
+        stage = "definition_store",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        "stored operator-pre-signed graph definition"
+    );
 
-    let mut storage = ctx.local_db.acquire().await?;
-    storage.delete_pending_graph_init(&instance_id, &local_operator_pubkey.to_string()).await?;
+    let mut storage = match ctx.local_db.acquire().await {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::error!(
+                event = "operator_graph_creation",
+                outcome = "failed",
+                stage = "pending_session_delete",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                error = %error,
+                "failed to acquire database connection to delete pending graph session"
+            );
+            return Err(error)
+                .context("acquire database connection to delete pending graph session");
+        }
+    };
+    let deleted_pending_sessions = match storage
+        .delete_pending_graph_init(&instance_id, &local_operator_pubkey.to_string())
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(
+                event = "operator_graph_creation",
+                outcome = "failed",
+                stage = "pending_session_delete",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                error = %error,
+                "failed to delete pending graph session after definition persistence"
+            );
+            return Err(error).context("delete pending graph session after definition persistence");
+        }
+    };
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "completed",
+        stage = "pending_session_delete",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        deleted_pending_sessions,
+        "deleted pending graph session after definition persistence"
+    );
 
     let message_content =
         GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph_nonce, graph });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    let message_id =
+        match send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                tracing::error!(
+                    event = "operator_graph_creation",
+                    outcome = "failed",
+                    stage = "create_graph_publish",
+                    graph_nonce,
+                    definition_hash = %definition_hash,
+                    error = %error,
+                    "failed to publish CreateGraph"
+                );
+                return Err(error).context("publish CreateGraph");
+            }
+        };
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "published",
+        stage = "create_graph_publish",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        message_id = ?message_id,
+        "published CreateGraph to the local gossipsub mesh"
+    );
 
     Ok(())
 }
