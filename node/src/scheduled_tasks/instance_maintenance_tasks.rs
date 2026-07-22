@@ -1,4 +1,7 @@
-use crate::action::{ConfirmInstance, GOATMessageContent, PeginRequest, PostReady};
+use crate::action::{
+    ConfirmInstance, GOATMessage, GOATMessageContent, PeginConfirmNonce, PeginConfirmPartialSig,
+    PeginRequest, PostReady, push_local_unhandled_messages,
+};
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_committee_instance_key_delete_timelock_blocks,
     get_instance_maintenance_batch_size, get_instance_presigned_time_expired_secs,
@@ -10,7 +13,9 @@ use crate::scheduled_tasks::get_timestamp_from_contract_data;
 use crate::utils::evm_swap_utils::IEscrowManager::EscrowData;
 use crate::utils::{
     SELF_SENDER, check_bridge_in_uxto_available_or_self_spent, gen_instance_parameters_local,
-    upsert_message,
+    get_committee_endorse_sigs_for_pegin, get_committee_partial_sig_for_instance,
+    get_committee_pub_nonce_for_instance, load_committee_instance_keypair,
+    store_committee_pub_nonce_for_instance, upsert_message,
 };
 use alloy::sol_types::SolType;
 use bitvm_lib::actors::Actor;
@@ -38,6 +43,7 @@ const TASK_KEY_INSTANCE_WINDOW_EXPIRATION: &str = "instance_window_expiration_mo
 const TASK_KEY_INSTANCE_EXPIRATION: &str = "instance_expiration_monitor";
 const TASK_KEY_INSTANCE_BTC_TX: &str = "instance_btc_tx_monitor";
 const TASK_KEY_INSTANCE_BRIDGE_OUT: &str = "instance_bridge_out_monitor";
+const TASK_KEY_PEGIN_CONFIRM_RECOVERY: &str = "pegin_confirm_recovery_monitor";
 
 #[derive(Clone, Debug)]
 struct InstancePageState {
@@ -503,6 +509,145 @@ pub async fn instance_btc_tx_monitor(
                 .await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Re-publish persisted PeginConfirm signing material until the transaction is visible on Bitcoin.
+/// This never derives a new partial signature: it only reuses the deterministic nonce or stored signature.
+pub async fn pegin_confirm_recovery_monitor(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    actor: &Actor,
+) -> anyhow::Result<()> {
+    if actor != &Actor::Committee {
+        return Ok(());
+    }
+
+    let instances = find_one_instance_page(
+        local_db,
+        TASK_KEY_PEGIN_CONFIRM_RECOVERY,
+        InstanceQuery::default()
+            .with_is_bridge_in(true)
+            .with_status(InstanceBridgeInStatus::Presigned.to_string()),
+        get_instance_maintenance_batch_size(),
+    )
+    .await?;
+    if instances.is_empty() {
+        return Ok(());
+    }
+
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    for instance in instances {
+        let Some(pegin_confirm_txid) = instance.pegin_confirm_txid.clone() else {
+            warn!(
+                instance_id = %instance.instance_id,
+                "skip PeginConfirm recovery: instance has no expected PeginConfirm txid"
+            );
+            continue;
+        };
+        match btc_client.get_tx(&pegin_confirm_txid.0).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    instance_id = %instance.instance_id,
+                    error = %error,
+                    "defer PeginConfirm recovery: unable to query Bitcoin transaction"
+                );
+                continue;
+            }
+        }
+
+        let instance_id = instance.instance_id;
+        let instance_parameters = gen_instance_parameters_local(&instance)?;
+        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+        let local_committee_pubkey = instance_keypair.public_key().into();
+
+        if let Some(partial_sig) =
+            get_committee_partial_sig_for_instance(local_db, instance_id, &local_committee_pubkey)
+                .await?
+        {
+            let Some((_, endorse_sig)) =
+                get_committee_endorse_sigs_for_pegin(local_db, instance_id)
+                    .await?
+                    .into_iter()
+                    .find(|(pubkey, _)| *pubkey == local_committee_pubkey)
+            else {
+                warn!(
+                    instance_id = %instance_id,
+                    "skip PeginConfirm partial signature recovery: local endorsement signature is missing"
+                );
+                continue;
+            };
+            let message = GOATMessage::new(
+                Actor::Committee,
+                GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
+                    instance_id,
+                    committee_pubkey: local_committee_pubkey,
+                    partial_sig,
+                    endorse_sig,
+                }),
+            );
+            push_local_unhandled_messages(local_db, instance_id, &message, 0).await?;
+            tracing::info!(
+                event = "pegin_confirm_recovery",
+                action = "republish_partial_signature",
+                instance_id = %instance_id,
+                "queued persisted PeginConfirm partial signature for re-publication"
+            );
+            continue;
+        }
+
+        let instance_parameters_hash = instance_parameters.parameters_hash()?;
+        let (_, derived_pub_nonce, nonce_sig) = committee_master_key
+            .nonce_for_instance_job_with_keypair(
+                instance_id,
+                instance_parameters_hash,
+                instance_keypair,
+            );
+        let pub_nonce = match get_committee_pub_nonce_for_instance(
+            local_db,
+            instance_id,
+            &local_committee_pubkey,
+        )
+        .await?
+        {
+            Some(stored_pub_nonce) => {
+                if stored_pub_nonce != derived_pub_nonce {
+                    anyhow::bail!(
+                        "stored PeginConfirm nonce differs from deterministic nonce for instance {instance_id}"
+                    );
+                }
+                stored_pub_nonce
+            }
+            None => {
+                store_committee_pub_nonce_for_instance(
+                    local_db,
+                    instance_id,
+                    local_committee_pubkey,
+                    derived_pub_nonce.clone(),
+                )
+                .await?;
+                derived_pub_nonce
+            }
+        };
+        let message = GOATMessage::new(
+            Actor::Committee,
+            GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
+                instance_id,
+                committee_pubkey: local_committee_pubkey,
+                pub_nonce,
+                nonce_sig,
+            }),
+        );
+        push_local_unhandled_messages(local_db, instance_id, &message, 0).await?;
+        tracing::info!(
+            event = "pegin_confirm_recovery",
+            action = "republish_nonce",
+            instance_id = %instance_id,
+            "queued persisted PeginConfirm nonce for re-publication"
+        );
     }
     Ok(())
 }

@@ -70,20 +70,6 @@ fn is_io_not_found_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn load_committee_instance_keypair(
-    committee_master_key: &CommitteeMasterKey,
-    instance_id: Uuid,
-) -> Result<bitcoin::key::Keypair> {
-    let envelope_path = committee_instance_keys_envelope_path(instance_id);
-    committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(|| {
-        format!(
-            "load committee instance keypair failed for {} at {}",
-            instance_id,
-            envelope_path.display()
-        )
-    })
-}
-
 fn load_or_create_committee_instance_keypair(
     committee_master_key: &CommitteeMasterKey,
     instance_id: Uuid,
@@ -449,6 +435,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 received_committee_pubkey,
                 pub_nonce,
                 nonce_sig,
+                content,
             )
             .await
         }
@@ -3240,7 +3227,6 @@ async fn handle_graph_finalize_committee(
                 pub_nonce: pub_nonce.clone(),
                 nonce_sig,
             });
-            send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
             store_committee_pub_nonce_for_instance(
                 ctx.local_db,
                 instance_id,
@@ -3248,6 +3234,7 @@ async fn handle_graph_finalize_committee(
                 pub_nonce,
             )
             .await?;
+            send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
         }
     }
     // 4. (Relayer) try to call Gateway.postGraphData
@@ -3341,6 +3328,7 @@ async fn handle_pegin_confirm_nonce_committee(
     received_committee_pubkey: &PublicKey,
     pub_nonce: &musig2::PubNonce,
     nonce_sig: &secp256k1::schnorr::Signature,
+    content: &GOATMessageContent,
 ) -> Result<()> {
     // received from Committee members
     if !ensure_self_or_valid_committee(
@@ -3371,6 +3359,9 @@ async fn handle_pegin_confirm_nonce_committee(
         pub_nonce.clone(),
     )
     .await?;
+    if ctx.id == GOATMessage::default_message_id() {
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
+    }
     // 3. if received enough pub_nonces, generate partial signature & broadcast PeginConfirmPartialSig
     let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
     let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
@@ -3556,8 +3547,9 @@ async fn handle_pegin_confirm_partial_sig_committee(
             return Ok(());
         }
         Err(e) => {
+            push_local_unhandled_messages(ctx.local_db, instance_id, &message, 30).await?;
             tracing::warn!(
-                "Ignore PeginConfirmPartialSig for {instance_id} from {}: failed to verify endorsement signature: {e}",
+                "Retry PeginConfirmPartialSig later for {instance_id} from {}: failed to verify endorsement signature: {e}",
                 received_committee_pubkey
             );
             return Ok(());
@@ -3578,6 +3570,9 @@ async fn handle_pegin_confirm_partial_sig_committee(
         endorse_sig.to_owned(),
     )
     .await?;
+    if ctx.id == GOATMessage::default_message_id() {
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
+    }
     // 3. (Relayer) if received enough partial signatures, aggregate the sigs
     if is_relayer() {
         let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
@@ -3633,8 +3628,20 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
         let pegin_tx = match ctx.btc_client.get_tx(&pegin_txid).await? {
             Some(tx) => tx,
             None => {
+                let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+                let message = GOATMessage::new(
+                    ctx.actor.clone(),
+                    GOATMessageContent::PostReady(PostReady { instance_id }),
+                );
+                push_local_unhandled_messages(
+                    ctx.local_db,
+                    instance_id,
+                    &message,
+                    delay_secs as usize,
+                )
+                .await?;
                 tracing::warn!(
-                    "Ignore PostReady for {instance_id}: Pegin-Confirm transaction not found on Bitcoin: {pegin_txid}"
+                    "Retry postPeginData later for {instance_id}: Pegin-Confirm transaction not found on Bitcoin: {pegin_txid}"
                 );
                 return Ok(());
             }
@@ -3645,8 +3652,15 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
             .map(|(_, es)| es)
             .collect::<Vec<_>>();
         if endorse_sigs.len() != committee_pubkeys.len() {
+            let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+            let message = GOATMessage::new(
+                ctx.actor.clone(),
+                GOATMessageContent::PostReady(PostReady { instance_id }),
+            );
+            push_local_unhandled_messages(ctx.local_db, instance_id, &message, delay_secs as usize)
+                .await?;
             tracing::warn!(
-                "Ignore PostReady for {instance_id}: not enough endorse sigs for pegin confirm tx: {}",
+                "Retry postPeginData later for {instance_id}: not enough endorse sigs for pegin confirm tx: {}",
                 endorse_sigs.len()
             );
             return Ok(());
@@ -3695,6 +3709,7 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
     }
     // 2. (Relayer)call Gateway.postGraphData on GoatChain
     let graph_ids = get_graph_ids_for_instance(ctx.local_db, instance_id).await?;
+    let mut missing_graph_endorsements = false;
     for graph_id in &graph_ids {
         let graph_data = ctx.goat_client.gateway_get_graph_data(graph_id).await?;
         if graph_data.operator_pubkey != [0u8; 32] {
@@ -3708,8 +3723,9 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                 .map(|(_, _, sig)| sig)
                 .collect::<Vec<_>>();
         if endorsement_sigs.len() != committee_pubkeys.len() {
+            missing_graph_endorsements = true;
             tracing::warn!(
-                "Ignore postGraphData for {instance_id}:{graph_id}: not enough endorse sigs for graph: {}",
+                "Defer postGraphData for {instance_id}:{graph_id}: not enough endorse sigs for graph: {}",
                 endorsement_sigs.len()
             );
             continue;
@@ -3722,6 +3738,18 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
         ctx.goat_client
             .gateway_post_graph_data(&instance_id, graph_id, &graph_data, &endorsement_sigs)
             .await?;
+    }
+    if missing_graph_endorsements {
+        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+        let message = GOATMessage::new(
+            ctx.actor.clone(),
+            GOATMessageContent::PostReady(PostReady { instance_id }),
+        );
+        push_local_unhandled_messages(ctx.local_db, instance_id, &message, delay_secs as usize)
+            .await?;
+        tracing::info!(
+            "Retry postGraphData later for {instance_id}: waiting for committee graph endorsements"
+        );
     }
     Ok(())
 }

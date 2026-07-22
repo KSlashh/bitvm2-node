@@ -19,7 +19,7 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
 use crate::scheduled_tasks::instance_maintenance_tasks::{
     instance_answers_monitor, instance_bridge_out_monitor, instance_btc_tx_monitor,
     instance_committee_key_cleanup_monitor, instance_expiration_monitor,
-    instance_window_expiration_monitor,
+    instance_window_expiration_monitor, pegin_confirm_recovery_monitor,
 };
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
@@ -149,6 +149,11 @@ async fn run(
     run_maintenance_subtask(
         "instance_btc_tx_monitor",
         instance_btc_tx_monitor(local_db, btc_client),
+    )
+    .await;
+    run_maintenance_subtask(
+        "pegin_confirm_recovery_monitor",
+        pegin_confirm_recovery_monitor(local_db, btc_client, &actor),
     )
     .await;
     run_maintenance_subtask(

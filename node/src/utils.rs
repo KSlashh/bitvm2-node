@@ -29,7 +29,9 @@ use bitcoin_light_client_circuit::{
 use bitvm::treepp::*;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::committee::*;
-use bitvm_lib::keys::{OperatorMasterKey, VerifierMasterKey, WatchtowerMasterKey};
+use bitvm_lib::keys::{
+    CommitteeMasterKey, OperatorMasterKey, VerifierMasterKey, WatchtowerMasterKey,
+};
 use bitvm_lib::operator::*;
 use bitvm_lib::timelocks::{connector_f_timelock_blocks, default_timelock_config};
 use bitvm_lib::types::{
@@ -111,6 +113,21 @@ use zkm_verifier::{
 
 pub const SELF_SENDER: &str = "self";
 const BRIDGE_OUT_INSTANCE_ID_PREFIX: [u8; 4] = *b"BOID";
+
+pub(crate) fn load_committee_instance_keypair(
+    committee_master_key: &CommitteeMasterKey,
+    instance_id: Uuid,
+) -> Result<Keypair> {
+    let mut envelope_path = PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
+    envelope_path.push(format!("{instance_id}.json"));
+    committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(|| {
+        format!(
+            "load committee instance keypair failed for {} at {}",
+            instance_id,
+            envelope_path.display()
+        )
+    })
+}
 
 /// Derive the shared bridge-out instance ID from its escrow hash.
 ///
