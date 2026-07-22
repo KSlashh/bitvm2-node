@@ -4575,7 +4575,9 @@ pub(crate) async fn store_operator_presigned_graph(
         )));
     }
 
-    let mut tx = local_db.start_transaction().await?;
+    // The definition path reads existing state before updating it. Reserve the
+    // writer up front so another task cannot invalidate that read snapshot.
+    let mut tx = local_db.start_immediate_transaction().await?;
     ingest_graph_definition(&mut tx, simple_graph, GraphDefinitionIngestKind::OperatorPresigned)
         .await?;
     tx.commit().await?;
@@ -4593,7 +4595,9 @@ pub(crate) async fn store_finalized_graph_if_needed(
         bail!(SpecialError::InvalidGraph(format!("graph {graph_id} is not fully pre-signed")));
     }
 
-    let mut tx = local_db.start_transaction().await?;
+    // The definition path reads existing state before updating it. Reserve the
+    // writer up front so another task cannot invalidate that read snapshot.
+    let mut tx = local_db.start_immediate_transaction().await?;
     let outcome =
         ingest_graph_definition(&mut tx, simple_graph, GraphDefinitionIngestKind::Finalized)
             .await?;

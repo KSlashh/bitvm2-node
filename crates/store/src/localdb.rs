@@ -10,7 +10,7 @@ use crate::{
 use indexmap::IndexMap;
 use sqlx::migrate::Migrator;
 use sqlx::pool::PoolConnection;
-use sqlx::sqlite::SqliteRow;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteRow};
 use sqlx::types::Uuid;
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction, migrate::MigrateDatabase};
 use std::str::FromStr;
@@ -82,7 +82,13 @@ impl LocalDB {
             tracing::info!("Database already exists");
         }
 
-        let conn = SqlitePool::connect(path).await.unwrap();
+        let mut options = SqliteConnectOptions::from_str(path).unwrap().create_if_missing(true);
+        if !is_mem {
+            // File-backed nodes run event watchers, P2P handlers, and maintenance tasks
+            // concurrently. WAL allows their readers to proceed while a short write commits.
+            options = options.journal_mode(SqliteJournalMode::Wal);
+        }
+        let conn = SqlitePool::connect_with(options).await.unwrap();
         Self { path: path.to_string(), is_mem, conn }
     }
 

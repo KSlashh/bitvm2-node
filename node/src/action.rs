@@ -35,6 +35,7 @@ pub struct GOATMessage {
 }
 
 const GOAT_MESSAGE_BIN_PREFIX: &[u8] = b"GOATBIN1";
+const TRANSIENT_PEGIN_RETRY_DELAY_SECS: usize = 30;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum GOATMessageContent {
@@ -127,6 +128,58 @@ impl GOATMessageContent {
             Self::Tick => "Tick",
         }
     }
+
+    fn pegin_retry_business_id(&self) -> Option<Uuid> {
+        match self {
+            Self::PeginRequest(message) => Some(message.instance_id),
+            Self::ConfirmInstance(message) => Some(message.instance_id),
+            Self::CreateGraph(message) => Some(message.graph_id),
+            Self::InitGraph(message) => Some(message.graph_id),
+            Self::GenCircuits(message) => Some(message.graph_id),
+            Self::CutCircuits(message) => Some(message.graph_id),
+            Self::SolderingProofReady(message) => Some(message.graph_id),
+            Self::VerifierGraphParamsEndorsement(message) => Some(message.graph_id),
+            Self::NonceGeneration(message) => Some(message.graph_id),
+            Self::CommitteePresign(message) => Some(message.graph_id),
+            Self::EndorseGraph(message) => Some(message.graph_id),
+            Self::GraphFinalize(message) => Some(message.graph_id),
+            Self::PeginConfirmNonce(message) => Some(message.instance_id),
+            Self::PeginConfirmPartialSig(message) => Some(message.instance_id),
+            Self::PostReady(message) => Some(message.instance_id),
+            _ => None,
+        }
+    }
+}
+
+fn is_retryable_sqlite_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database is busy")
+            || message.contains("sqlite_busy")
+    })
+}
+
+fn is_pegin_message_type(message_type: &str) -> bool {
+    matches!(
+        message_type,
+        "PeginRequest"
+            | "ConfirmInstance"
+            | "CreateGraph"
+            | "InitGraph"
+            | "GenCircuits"
+            | "CutCircuits"
+            | "SolderingProof"
+            | "SolderingProofReady"
+            | "VerifierGraphParamsEndorsement"
+            | "NonceGeneration"
+            | "CommitteePresign"
+            | "EndorseGraph"
+            | "GraphFinalize"
+            | "PeginConfirmNonce"
+            | "PeginConfirmPartialSig"
+            | "PostReady"
+    )
 }
 
 /// Pegin
@@ -519,7 +572,13 @@ pub async fn handle_self_p2p_msg(
                 }
             }
             Err(err) => {
-                let lock_time = 600;
+                let lock_time: i64 = if is_retryable_sqlite_error(&err)
+                    && is_pegin_message_type(&message.msg_type)
+                {
+                    TRANSIENT_PEGIN_RETRY_DELAY_SECS as i64
+                } else {
+                    600
+                };
                 tracing::warn!(
                     event = "local_message_queue",
                     outcome = "deferred",
@@ -564,7 +623,8 @@ pub async fn recv_and_dispatch(
     id: MessageId,
     message: &[u8],
 ) -> Result<()> {
-    if id != GOATMessage::default_message_id() {
+    let is_local_queue_message = id == GOATMessage::default_message_id();
+    if !is_local_queue_message {
         update_node_timestamp(local_db, &from_peer_id.to_string()).await?;
     }
     // Determine whether the message comes from this node itself to optionally skip validations
@@ -586,7 +646,40 @@ pub async fn recv_and_dispatch(
         id,
         is_self_peer,
     };
-    let result = handle_dispatch(&mut handler_ctx, message.content()).await;
+    let result = match handle_dispatch(&mut handler_ctx, message.content()).await {
+        Err(error) if !is_local_queue_message && is_retryable_sqlite_error(&error) => {
+            if let Some(business_id) = message.content.pegin_retry_business_id() {
+                match push_local_unhandled_messages(
+                    local_db,
+                    business_id,
+                    &message,
+                    TRANSIENT_PEGIN_RETRY_DELAY_SECS,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::warn!(
+                            event = "pegin_message_retry",
+                            outcome = "deferred",
+                            role = %role,
+                            message_type,
+                            business_id = %business_id,
+                            retry_after_secs = TRANSIENT_PEGIN_RETRY_DELAY_SECS,
+                            error = %error,
+                            "deferred pegin message after a transient SQLite failure"
+                        );
+                        Ok(())
+                    }
+                    Err(queue_error) => Err(error.context(format!(
+                        "failed to enqueue transient pegin message retry: {queue_error}"
+                    ))),
+                }
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
+    };
     match &result {
         Ok(()) => tracing::info!(
             event = "message_dispatch_result",

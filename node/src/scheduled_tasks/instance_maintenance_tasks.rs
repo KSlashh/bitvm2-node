@@ -141,10 +141,14 @@ pub async fn instance_answers_monitor(
     let current_height = goat_client.get_finalized_block_number().await?;
     let response_window_blocks = goat_client.gateway_get_response_window_blocks().await? as i64;
     for tx_record in tx_records {
-        let mut tx = local_db.start_transaction().await?;
-        if let Some(event) = tx_record.extra {
-            let event: BridgeInRequestEvent = serde_json::from_str(&event)?;
-            if tx_record.height + response_window_blocks < current_height {
+        let event = tx_record
+            .extra
+            .as_deref()
+            .map(serde_json::from_str::<BridgeInRequestEvent>)
+            .transpose()?;
+        let is_outside_response_window = tx_record.height + response_window_blocks < current_height;
+        let discarded_instance = if is_outside_response_window {
+            if let Some(event) = event.as_ref() {
                 info!(
                     "instance_answers_monitor: instance_id:{} BridgeInRequest is outside the response window",
                     tx_record.instance_id
@@ -154,7 +158,7 @@ pub async fn instance_answers_monitor(
                     generate_instance_from_bridge_in_request_event(
                         btc_client,
                         goat_client,
-                        &event,
+                        event,
                         true,
                     )
                     .await
@@ -167,6 +171,21 @@ pub async fn instance_answers_monitor(
                     // for the case: if bridgeIn confirm is broadcast,but L2 not minted,
                     // instance status will been updated to L2Minted when normal finished
                     instance.status = InstanceBridgeInStatus::UserDiscarded.to_string();
+                    Some(instance)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut tx = local_db.start_transaction().await?;
+        if let Some(event) = event {
+            if is_outside_response_window {
+                if let Some(instance) = discarded_instance {
                     tx.upsert_instance(&instance).await?;
                 }
             } else {
