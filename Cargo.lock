@@ -3095,16 +3095,15 @@ dependencies = [
  "clap",
  "client",
  "commit-chain",
- "dirs",
  "dotenv",
  "esplora-client",
  "futures",
  "goat",
+ "header-chain",
  "hex",
  "http 1.4.0",
  "http-body-util",
  "indexmap 2.14.0",
- "indicatif",
  "libp2p",
  "libp2p-metrics",
  "libp2p-swarm-derive",
@@ -3120,6 +3119,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "state-chain",
  "store",
  "strum 0.26.3",
  "stun-client",
@@ -3133,6 +3133,7 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "util",
  "uuid 1.23.0",
+ "verifier",
  "zeroize",
  "zkm-recursion-core",
  "zkm-sdk",
@@ -3750,6 +3751,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "verifier",
  "zkm-build",
  "zkm-prover",
  "zkm-sdk",
@@ -6022,6 +6024,7 @@ dependencies = [
 name = "header-chain"
 version = "0.4.0"
 dependencies = [
+ "bincode",
  "bitcoin",
  "borsh",
  "crypto-bigint",
@@ -6029,6 +6032,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "verifier",
+ "zkm-primitives",
  "zkm-zkvm",
 ]
 
@@ -6057,6 +6061,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "util",
+ "verifier",
  "zkm-build",
  "zkm-prover",
  "zkm-sdk",
@@ -8641,6 +8646,7 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "url",
  "util",
+ "verifier",
  "zkm-build",
  "zkm-prover",
  "zkm-sdk",
@@ -9745,6 +9751,7 @@ dependencies = [
  "state-chain",
  "strum 0.26.3",
  "thiserror 1.0.69",
+ "verifier",
  "zkm-sdk",
 ]
 
@@ -12476,6 +12483,7 @@ dependencies = [
  "tendermint-light-client-verifier",
  "tracing",
  "verifier",
+ "zkm-primitives",
  "zkm-zkvm",
 ]
 
@@ -12513,6 +12521,7 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "url",
  "util",
+ "verifier",
  "zkm-build",
  "zkm-prover",
  "zkm-sdk",
@@ -13934,6 +13943,7 @@ dependencies = [
 name = "verifier"
 version = "0.4.0"
 dependencies = [
+ "sha2 0.10.9",
  "zkm-verifier",
 ]
 
@@ -14153,6 +14163,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "verifier",
  "zkm-build",
  "zkm-prover",
  "zkm-sdk",
