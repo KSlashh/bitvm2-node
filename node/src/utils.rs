@@ -15,7 +15,7 @@ use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::key::Keypair;
 use bitcoin::{
@@ -29,7 +29,9 @@ use bitcoin_light_client_circuit::{
 use bitvm::treepp::*;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::committee::*;
-use bitvm_lib::keys::{OperatorMasterKey, VerifierMasterKey, WatchtowerMasterKey};
+use bitvm_lib::keys::{
+    CommitteeMasterKey, OperatorMasterKey, VerifierMasterKey, WatchtowerMasterKey,
+};
 use bitvm_lib::operator::*;
 use bitvm_lib::timelocks::{connector_f_timelock_blocks, default_timelock_config};
 use bitvm_lib::types::{
@@ -110,6 +112,21 @@ use zkm_verifier::{
 
 pub const SELF_SENDER: &str = "self";
 const BRIDGE_OUT_INSTANCE_ID_PREFIX: [u8; 4] = *b"BOID";
+
+pub(crate) fn load_committee_instance_keypair(
+    committee_master_key: &CommitteeMasterKey,
+    instance_id: Uuid,
+) -> Result<Keypair> {
+    let mut envelope_path = PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
+    envelope_path.push(format!("{instance_id}.json"));
+    committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(|| {
+        format!(
+            "load committee instance keypair failed for {} at {}",
+            instance_id,
+            envelope_path.display()
+        )
+    })
+}
 
 /// Derive the shared bridge-out instance ID from its escrow hash.
 ///
@@ -2260,62 +2277,6 @@ pub async fn get_fee_rate(client: &BTCClient) -> Result<f64> {
     }
 }
 
-pub async fn get_nst_fee_rate(client: &BTCClient) -> Result<f64> {
-    Ok(get_fee_rate(client).await? * 3.0)
-}
-
-pub async fn broadcast_nonstandard_tx(btc_client: &BTCClient, tx: &Transaction) -> Result<()> {
-    match broadcast_tx(btc_client, tx).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let network = btc_client.network();
-            let base_url = get_mara_slipstream_api_base_url(network);
-            let submit_url = format!("{}/transactions", base_url.trim_end_matches('/'));
-            let tx_hex = hex::encode(serialize(tx));
-
-            warn!(
-                "normal broadcast failed, fallback to MARA slipstream api. network: {network:?}, url: {submit_url}, err: {e}"
-            );
-
-            let response = reqwest::Client::new()
-                .post(&submit_url)
-                .json(&serde_json::json!({ "tx_hex": tx_hex }))
-                .send()
-                .await
-                .map_err(|fallback_err| {
-                    anyhow!(
-                        "fallback broadcast request failed. normal error: {e}; fallback error: {fallback_err}"
-                    )
-                })?;
-
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
-
-            if !status.is_success() {
-                bail!(
-                    "fallback broadcast failed. normal error: {e}; fallback status: {status}; fallback body: {body}"
-                );
-            }
-
-            let status_field = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
-            if let Some(status_field) = status_field
-                && !status_field.eq_ignore_ascii_case("success")
-            {
-                bail!(
-                    "fallback broadcast returned non-success status. normal error: {e}; fallback body: {body}"
-                );
-            }
-
-            Ok(())
-        }
-    }
-}
-
 /// Broadcasts a raw transaction to the Bitcoin network using the mempool API.
 ///
 /// Requirements:
@@ -2326,6 +2287,9 @@ pub async fn broadcast_tx(client: &BTCClient, tx: &Transaction) -> Result<()> {
     let started_at = Instant::now();
     match client.broadcast(tx).await {
         Ok(()) => {
+            if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                metrics_state.record_btc_tx_broadcast(true);
+            }
             tracing::info!(
                 event = "btc_tx_broadcast",
                 outcome = "broadcasted",
@@ -2338,6 +2302,9 @@ pub async fn broadcast_tx(client: &BTCClient, tx: &Transaction) -> Result<()> {
             Ok(())
         }
         Err(err) => {
+            if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                metrics_state.record_btc_tx_broadcast(false);
+            }
             tracing::warn!(
                 event = "btc_tx_broadcast",
                 outcome = "failed",
@@ -2362,6 +2329,9 @@ pub async fn broadcast_package(
     let started_at = Instant::now();
     match client.broadcast_package(txns).await {
         Ok(_) => {
+            if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                metrics_state.record_btc_tx_broadcast(true);
+            }
             tracing::info!(
                 event = "btc_tx_package_broadcast",
                 outcome = "broadcasted",
@@ -2386,6 +2356,9 @@ pub async fn broadcast_package(
                     broadcast_tx(client, tx).await?;
                 }
             } else {
+                if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                    metrics_state.record_btc_tx_broadcast(false);
+                }
                 // Surface the original error when fallback is disabled
                 return Err(e);
             }
@@ -2523,21 +2496,36 @@ pub async fn get_watchtower_challenge_info(
     Ok(WatchtowerChallengeInfo { challenge_txids, included_watchtowers, resolved_branch_txids })
 }
 
-/// Returns `(btc_best_block_hash, included_watchtowers_bitmap)` using every confirmed
+/// Returns `(btc_best_block_hash, included_watchtowers_bitmap)` using every finalized
 /// challenge-branch resolution for the block hash while only challenges set bitmap bits.
+///
+/// The selected hash is signed into the operator's pubin and cannot be replaced after a
+/// reorganization. Require every branch that determines the bitmap to be at least as deeply
+/// buried as the header/SPV finality window before returning it.
 pub async fn compute_operator_pubin_blockhash_and_bitmap(
     btc_client: &BTCClient,
     resolved_branch_txids: &[Txid],
     included_watchtowers_bits: &[bool],
 ) -> Result<([u8; 32], [u8; 32])> {
+    let tip_height = btc_client.get_height().await?;
+    let required_burial_depth = get_btc_block_confirms(btc_client.network());
     let btc_best_block_hash = {
         let mut largest: Option<(u32, BlockHash)> = None;
         for txid in resolved_branch_txids {
             let status = btc_client.get_tx_status(txid).await?;
-            let (height, hash) = match (status.block_height, status.block_hash) {
-                (Some(height), Some(hash)) => (height, hash),
+            let (height, hash) = match (status.confirmed, status.block_height, status.block_hash) {
+                (true, Some(height), Some(hash)) => (height, hash),
                 _ => bail!("watchtower branch resolution tx {txid} is not confirmed yet"),
             };
+            // `BTC_BLOCK_CONFIRMS` is the number of blocks that must follow a block before
+            // the SPV/header pipeline consumes it. Match the proof-builder's strict boundary:
+            // the anchor must have more than this many blocks after it.
+            let burial_depth = tip_height.saturating_sub(height);
+            if burial_depth <= required_burial_depth {
+                bail!(
+                    "watchtower branch resolution tx {txid} is not final enough for operator pubin: height={height}, tip={tip_height}, burial_depth={burial_depth}, required_burial_depth>{required_burial_depth}"
+                );
+            }
             if largest.is_none_or(|(h, _)| height > h) {
                 largest = Some((height, hash));
             }
@@ -2926,68 +2914,6 @@ pub async fn build_sign_and_broadcast_tx(
                 )?;
             }
             broadcast_tx(client, &tx).await?;
-            Ok(tx.compute_txid())
-        }
-        None => {
-            let current_balance = client
-                .get_address_utxo(node_address)
-                .await?
-                .iter()
-                .map(|u| u.value)
-                .sum::<Amount>();
-            bail!(SpecialError::InsufficientBalance(format!(
-                "Not enough balance to complete the transaction, current_balance: {current_balance} < shortfall: {shortfall}"
-            )));
-        }
-    }
-}
-
-pub async fn build_sign_and_broadcast_non_standard_tx(
-    client: &BTCClient,
-    node_keypair: Keypair,
-    mut tx: Transaction,
-    total_input_amount: Amount,
-) -> Result<Txid> {
-    let fixed_inputs_num = tx.input.len();
-    let total_output_amount: Amount = tx.output.iter().map(|o| o.value).sum();
-    let fee_rate = get_nst_fee_rate(client).await?;
-    let node_address = node_p2wsh_address(get_network(), &node_keypair.public_key().into());
-    let shortfall =
-        Amount::from_sat(total_output_amount.to_sat().saturating_sub(total_input_amount.to_sat()));
-    match get_proper_utxo_set(
-        client,
-        tx.weight().to_vbytes_ceil(),
-        node_address.clone(),
-        shortfall,
-        fee_rate,
-    )
-    .await?
-    {
-        Some((inputs, _, change_amount)) => {
-            for input in &inputs {
-                tx.input.push(TxIn {
-                    previous_output: input.outpoint,
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: Witness::default(),
-                });
-            }
-            if change_amount > Amount::from_sat(DUST_AMOUNT) {
-                tx.output.push(TxOut {
-                    script_pubkey: node_address.script_pubkey(),
-                    value: change_amount,
-                });
-            }
-            for (i, input) in inputs.iter().enumerate() {
-                node_sign(
-                    &mut tx,
-                    i + fixed_inputs_num,
-                    input.amount,
-                    EcdsaSighashType::All,
-                    &node_keypair,
-                )?;
-            }
-            broadcast_nonstandard_tx(client, &tx).await?;
             Ok(tx.compute_txid())
         }
         None => {
@@ -4568,7 +4494,9 @@ pub(crate) async fn store_operator_presigned_graph(
         )));
     }
 
-    let mut tx = local_db.start_transaction().await?;
+    // The definition path reads existing state before updating it. Reserve the
+    // writer up front so another task cannot invalidate that read snapshot.
+    let mut tx = local_db.start_immediate_transaction().await?;
     ingest_graph_definition(&mut tx, simple_graph, GraphDefinitionIngestKind::OperatorPresigned)
         .await?;
     tx.commit().await?;
@@ -4586,7 +4514,9 @@ pub(crate) async fn store_finalized_graph_if_needed(
         bail!(SpecialError::InvalidGraph(format!("graph {graph_id} is not fully pre-signed")));
     }
 
-    let mut tx = local_db.start_transaction().await?;
+    // The definition path reads existing state before updating it. Reserve the
+    // writer up front so another task cannot invalidate that read snapshot.
+    let mut tx = local_db.start_immediate_transaction().await?;
     let outcome =
         ingest_graph_definition(&mut tx, simple_graph, GraphDefinitionIngestKind::Finalized)
             .await?;
@@ -6209,8 +6139,10 @@ mod commit_pubin_tests {
 
         let init_txid = make_txid(0x00);
         let challenge_txid_wt0 = make_txid(0x01);
+        let timeout_txid_wt1 = make_txid(0x03);
         let challenge_txid_wt2 = make_txid(0x02);
         let block_hash_low = make_block_hash(0x10);
+        let block_hash_middle = make_block_hash(0x15);
         let block_hash_high = make_block_hash(0x20);
 
         let challenge_vout_0 =
@@ -6218,7 +6150,9 @@ mod commit_pubin_tests {
         let challenge_vout_2 =
             output_topology::watchtower_challenge_init::watchtower_connector(2) as u32;
 
-        // wt0 confirmed at height 100, wt2 at height 200 (highest)
+        // All three branches are finalized; wt2's height 200 block is the anchor.
+        let required_burial_depth = get_btc_block_confirms(btc_client.network());
+        mock_adaptor.set_height(200 + required_burial_depth + 1);
         mock_adaptor.set_tx(
             challenge_txid_wt0,
             create_confirmed_tx(
@@ -6227,6 +6161,10 @@ mod commit_pubin_tests {
                 100,
                 block_hash_low,
             ),
+        );
+        mock_adaptor.set_tx(
+            timeout_txid_wt1,
+            create_confirmed_tx(timeout_txid_wt1, &[(init_txid, 1)], 150, block_hash_middle),
         );
         mock_adaptor.set_tx(
             challenge_txid_wt2,
@@ -6238,7 +6176,7 @@ mod commit_pubin_tests {
             ),
         );
 
-        let resolved_branch_txids = vec![challenge_txid_wt0, challenge_txid_wt2];
+        let resolved_branch_txids = vec![challenge_txid_wt0, timeout_txid_wt1, challenge_txid_wt2];
         let bits = vec![true, false, true];
 
         let (best_hash, bitmap) =

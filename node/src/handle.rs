@@ -4,6 +4,7 @@ use crate::env::{
     get_soldering_proof_payload_store_path, is_relayer,
 };
 use crate::error::SpecialError;
+use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::soldering_payload_store::{
@@ -50,6 +51,7 @@ pub struct HandlerContext<'a> {
     pub goat_client: &'a GOATClient,
     pub http_client: &'a HttpAsyncClient,
     pub soldering_builder: &'a Option<Arc<BabeBundleBuilder>>,
+    pub metrics_state: &'a MetricsState,
     pub actor: Actor,
     pub from_peer_id: PeerId,
     pub id: MessageId,
@@ -67,20 +69,6 @@ fn is_io_not_found_error(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
-    })
-}
-
-fn load_committee_instance_keypair(
-    committee_master_key: &CommitteeMasterKey,
-    instance_id: Uuid,
-) -> Result<bitcoin::key::Keypair> {
-    let envelope_path = committee_instance_keys_envelope_path(instance_id);
-    committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(|| {
-        format!(
-            "load committee instance keypair failed for {} at {}",
-            instance_id,
-            envelope_path.display()
-        )
     })
 }
 
@@ -449,6 +437,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 received_committee_pubkey,
                 pub_nonce,
                 nonce_sig,
+                content,
             )
             .await
         }
@@ -1803,7 +1792,10 @@ async fn handle_soldering_proof_ready_operator(
         payload_path = %payload_path,
         "read soldering proof payload from store, start processing"
     );
-    handle_soldering_proof_payload_operator(ctx, &soldering_proof_ready, &payload).await
+    let result =
+        handle_soldering_proof_payload_operator(ctx, &soldering_proof_ready, &payload).await;
+    ctx.metrics_state.record_pegin_graph_setup(result.is_ok());
+    result
 }
 
 fn decode_soldering_proof_payload(
@@ -1932,6 +1924,16 @@ async fn handle_compact_soldering_proof_operator(
     .await
     .context("real BABE setup verification task failed")??;
 
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "soldering_verified",
+        verifier_index,
+        verifier_pubkey = %verifier_pubkey,
+        finalized_instances = finalized.len(),
+        payload_hash = %hex::encode(soldering_proof_ready.payload_hash),
+        "verified verifier soldering proof"
+    );
+
     if finalized.len() != BABE_M_CC {
         bail!("each verifier must contribute exactly {BABE_M_CC} finalized BABE instances");
     }
@@ -1948,10 +1950,50 @@ async fn handle_compact_soldering_proof_operator(
         soldering_proof_ready.clone(),
     )?
     else {
-        save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+        let completed_slots = operator_state
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.gc_data.is_some())
+            .count();
+        let expected_slots = operator_state.candidates.len();
+        if let Err(error) = save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state) {
+            tracing::error!(
+                event = "operator_graph_creation",
+                outcome = "failed",
+                stage = "babe_state_persist",
+                verifier_index,
+                error = %error,
+                "failed to persist incomplete operator BABE setup state"
+            );
+            return Err(error).context("persist incomplete operator BABE setup state");
+        }
+        tracing::info!(
+            event = "operator_graph_creation",
+            outcome = "waiting_for_soldering",
+            verifier_index,
+            completed_slots,
+            expected_slots,
+            "persisted verifier soldering proof; waiting for remaining graph slots"
+        );
         return Ok(());
     };
-    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+    if let Err(error) = save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state) {
+        tracing::error!(
+            event = "operator_graph_creation",
+            outcome = "failed",
+            stage = "babe_state_persist",
+            verifier_index,
+            error = %error,
+            "failed to persist complete operator BABE setup state"
+        );
+        return Err(error).context("persist complete operator BABE setup state");
+    }
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "all_soldering_collected",
+        verifier_slots = bitvm_gc_circuit_datas.len(),
+        "all verifier soldering proofs are ready to build the graph"
+    );
 
     let instance_params = get_instance_parameters(ctx.local_db, instance_id)
         .await?
@@ -1991,14 +2033,107 @@ async fn handle_compact_soldering_proof_operator(
     operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
 
     let graph = graph.to_simplified()?;
-    store_operator_presigned_graph(ctx.local_db, &graph).await?;
+    let definition_hash = hex::encode(graph.parameters_hash()?);
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "started",
+        stage = "definition_store",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        "storing operator-pre-signed graph definition"
+    );
+    if let Err(error) = store_operator_presigned_graph(ctx.local_db, &graph).await {
+        tracing::error!(
+            event = "operator_graph_creation",
+            outcome = "failed",
+            stage = "definition_store",
+            graph_nonce,
+            definition_hash = %definition_hash,
+            error = %error,
+            "failed to store operator-pre-signed graph definition"
+        );
+        return Err(error).context("store operator-pre-signed graph definition");
+    }
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "committed",
+        stage = "definition_store",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        "stored operator-pre-signed graph definition"
+    );
 
-    let mut storage = ctx.local_db.acquire().await?;
-    storage.delete_pending_graph_init(&instance_id, &local_operator_pubkey.to_string()).await?;
+    let mut storage = match ctx.local_db.acquire().await {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::error!(
+                event = "operator_graph_creation",
+                outcome = "failed",
+                stage = "pending_session_delete",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                error = %error,
+                "failed to acquire database connection to delete pending graph session"
+            );
+            return Err(error)
+                .context("acquire database connection to delete pending graph session");
+        }
+    };
+    let deleted_pending_sessions = match storage
+        .delete_pending_graph_init(&instance_id, &local_operator_pubkey.to_string())
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(
+                event = "operator_graph_creation",
+                outcome = "failed",
+                stage = "pending_session_delete",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                error = %error,
+                "failed to delete pending graph session after definition persistence"
+            );
+            return Err(error).context("delete pending graph session after definition persistence");
+        }
+    };
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "completed",
+        stage = "pending_session_delete",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        deleted_pending_sessions,
+        "deleted pending graph session after definition persistence"
+    );
 
     let message_content =
         GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph_nonce, graph });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    let message_id =
+        match send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                tracing::error!(
+                    event = "operator_graph_creation",
+                    outcome = "failed",
+                    stage = "create_graph_publish",
+                    graph_nonce,
+                    definition_hash = %definition_hash,
+                    error = %error,
+                    "failed to publish CreateGraph"
+                );
+                return Err(error).context("publish CreateGraph");
+            }
+        };
+    tracing::info!(
+        event = "operator_graph_creation",
+        outcome = "published",
+        stage = "create_graph_publish",
+        graph_nonce,
+        definition_hash = %definition_hash,
+        message_id = ?message_id,
+        "published CreateGraph to the local gossipsub mesh"
+    );
 
     Ok(())
 }
@@ -2149,15 +2284,16 @@ async fn try_start_graph_committee_setup(
         );
         return Ok(());
     }
-    if let Err(e) = todo_funcs::validate_init_graph(
+    let validation = todo_funcs::validate_init_graph(
         ctx.local_db,
         ctx.btc_client,
         ctx.goat_client,
         graph,
         &verifier_endorsements,
     )
-    .await
-    {
+    .await;
+    ctx.metrics_state.record_graph_validation(validation.is_ok());
+    if let Err(e) = validation {
         if should_ignore_invalid_graph(&e, instance_id, graph_id, "CreateGraph", None) {
             return Ok(());
         }
@@ -2349,10 +2485,11 @@ async fn handle_create_graph_committee(
     }
 
     // 1. check graph data & operator stake without verifier params endorsements; those may arrive later.
-    if let Err(e) =
+    let validation =
         todo_funcs::validate_init_graph_base(ctx.local_db, ctx.btc_client, ctx.goat_client, graph)
-            .await
-    {
+            .await;
+    ctx.metrics_state.record_graph_validation(validation.is_ok());
+    if let Err(e) = validation {
         if should_ignore_invalid_graph(&e, instance_id, graph_id, "CreateGraph", None) {
             return Ok(());
         }
@@ -3026,15 +3163,16 @@ async fn handle_graph_finalize_committee(
 
     // received from Operator
     // 1. check graph data
-    if let Err(e) = todo_funcs::validate_finalized_graph(
+    let validation = todo_funcs::validate_finalized_graph(
         ctx.btc_client,
         ctx.goat_client,
         graph,
         endorse_sigs,
         params_endorse_sigs,
     )
-    .await
-    {
+    .await;
+    ctx.metrics_state.record_graph_validation(validation.is_ok());
+    if let Err(e) = validation {
         if should_ignore_invalid_graph(
             &e,
             instance_id,
@@ -3100,7 +3238,6 @@ async fn handle_graph_finalize_committee(
                 pub_nonce: pub_nonce.clone(),
                 nonce_sig,
             });
-            send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
             store_committee_pub_nonce_for_instance(
                 ctx.local_db,
                 instance_id,
@@ -3108,6 +3245,7 @@ async fn handle_graph_finalize_committee(
                 pub_nonce,
             )
             .await?;
+            send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
         }
     }
     // 4. (Relayer) try to call Gateway.postGraphData
@@ -3157,15 +3295,16 @@ async fn handle_graph_finalize_default(
 
     // received from Operator
     // 1. check graph data
-    if let Err(e) = todo_funcs::validate_finalized_graph(
+    let validation = todo_funcs::validate_finalized_graph(
         ctx.btc_client,
         ctx.goat_client,
         graph,
         endorse_sigs,
         params_endorse_sigs,
     )
-    .await
-    {
+    .await;
+    ctx.metrics_state.record_graph_validation(validation.is_ok());
+    if let Err(e) = validation {
         if should_ignore_invalid_graph(
             &e,
             instance_id,
@@ -3201,6 +3340,7 @@ async fn handle_pegin_confirm_nonce_committee(
     received_committee_pubkey: &PublicKey,
     pub_nonce: &musig2::PubNonce,
     nonce_sig: &secp256k1::schnorr::Signature,
+    content: &GOATMessageContent,
 ) -> Result<()> {
     // received from Committee members
     if !ensure_self_or_valid_committee(
@@ -3231,6 +3371,9 @@ async fn handle_pegin_confirm_nonce_committee(
         pub_nonce.clone(),
     )
     .await?;
+    if ctx.id == GOATMessage::default_message_id() {
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
+    }
     // 3. if received enough pub_nonces, generate partial signature & broadcast PeginConfirmPartialSig
     let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
     let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
@@ -3311,7 +3454,9 @@ async fn handle_pegin_confirm_nonce_committee(
                     })?;
                 let connector_z = instance_params.connector_z();
                 pegin_confirm.push_input_0_signature(&connector_z, full_sig);
-                broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await?;
+                let result = broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await;
+                ctx.metrics_state.record_pegin_confirm(result.is_ok());
+                result?;
             }
         }
     }
@@ -3416,8 +3561,9 @@ async fn handle_pegin_confirm_partial_sig_committee(
             return Ok(());
         }
         Err(e) => {
+            push_local_unhandled_messages(ctx.local_db, instance_id, &message, 30).await?;
             tracing::warn!(
-                "Ignore PeginConfirmPartialSig for {instance_id} from {}: failed to verify endorsement signature: {e}",
+                "Retry PeginConfirmPartialSig later for {instance_id} from {}: failed to verify endorsement signature: {e}",
                 received_committee_pubkey
             );
             return Ok(());
@@ -3438,6 +3584,9 @@ async fn handle_pegin_confirm_partial_sig_committee(
         endorse_sig.to_owned(),
     )
     .await?;
+    if ctx.id == GOATMessage::default_message_id() {
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
+    }
     // 3. (Relayer) if received enough partial signatures, aggregate the sigs
     if is_relayer() {
         let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
@@ -3466,7 +3615,9 @@ async fn handle_pegin_confirm_partial_sig_committee(
                 })?;
             let connector_z = instance_params.connector_z();
             pegin_confirm.push_input_0_signature(&connector_z, full_sig);
-            broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await?;
+            let result = broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await;
+            ctx.metrics_state.record_pegin_confirm(result.is_ok());
+            result?;
         }
     }
     Ok(())
@@ -3493,8 +3644,20 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
         let pegin_tx = match ctx.btc_client.get_tx(&pegin_txid).await? {
             Some(tx) => tx,
             None => {
+                let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+                let message = GOATMessage::new(
+                    ctx.actor.clone(),
+                    GOATMessageContent::PostReady(PostReady { instance_id }),
+                );
+                push_local_unhandled_messages(
+                    ctx.local_db,
+                    instance_id,
+                    &message,
+                    delay_secs as usize,
+                )
+                .await?;
                 tracing::warn!(
-                    "Ignore PostReady for {instance_id}: Pegin-Confirm transaction not found on Bitcoin: {pegin_txid}"
+                    "Retry postPeginData later for {instance_id}: Pegin-Confirm transaction not found on Bitcoin: {pegin_txid}"
                 );
                 return Ok(());
             }
@@ -3505,8 +3668,15 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
             .map(|(_, es)| es)
             .collect::<Vec<_>>();
         if endorse_sigs.len() != committee_pubkeys.len() {
+            let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+            let message = GOATMessage::new(
+                ctx.actor.clone(),
+                GOATMessageContent::PostReady(PostReady { instance_id }),
+            );
+            push_local_unhandled_messages(ctx.local_db, instance_id, &message, delay_secs as usize)
+                .await?;
             tracing::warn!(
-                "Ignore PostReady for {instance_id}: not enough endorse sigs for pegin confirm tx: {}",
+                "Retry postPeginData later for {instance_id}: not enough endorse sigs for pegin confirm tx: {}",
                 endorse_sigs.len()
             );
             return Ok(());
@@ -3547,14 +3717,18 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
             );
             return Ok(());
         }
-        ctx.goat_client
+        let result = ctx
+            .goat_client
             .gateway_post_pegin_data(ctx.btc_client, &instance_id, &pegin_tx, &endorse_sigs)
-            .await?;
+            .await;
+        ctx.metrics_state.record_pegin_post(result.is_ok());
+        result?;
     } else {
         // already posted
     }
     // 2. (Relayer)call Gateway.postGraphData on GoatChain
     let graph_ids = get_graph_ids_for_instance(ctx.local_db, instance_id).await?;
+    let mut missing_graph_endorsements = false;
     for graph_id in &graph_ids {
         let graph_data = ctx.goat_client.gateway_get_graph_data(graph_id).await?;
         if graph_data.operator_pubkey != [0u8; 32] {
@@ -3568,8 +3742,9 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                 .map(|(_, _, sig)| sig)
                 .collect::<Vec<_>>();
         if endorsement_sigs.len() != committee_pubkeys.len() {
+            missing_graph_endorsements = true;
             tracing::warn!(
-                "Ignore postGraphData for {instance_id}:{graph_id}: not enough endorse sigs for graph: {}",
+                "Defer postGraphData for {instance_id}:{graph_id}: not enough endorse sigs for graph: {}",
                 endorsement_sigs.len()
             );
             continue;
@@ -3582,6 +3757,18 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
         ctx.goat_client
             .gateway_post_graph_data(&instance_id, graph_id, &graph_data, &endorsement_sigs)
             .await?;
+    }
+    if missing_graph_endorsements {
+        let delay_secs = todo_funcs::avg_block_time_secs(ctx.btc_client.network());
+        let message = GOATMessage::new(
+            ctx.actor.clone(),
+            GOATMessageContent::PostReady(PostReady { instance_id }),
+        );
+        push_local_unhandled_messages(ctx.local_db, instance_id, &message, delay_secs as usize)
+            .await?;
+        tracing::info!(
+            "Retry postGraphData later for {instance_id}: waiting for committee graph endorsements"
+        );
     }
     Ok(())
 }
@@ -4841,7 +5028,8 @@ async fn handle_assert_sent_verifier(
             };
             match validate_pubin_disprove(&graph, commit_pubin_txin, assert_txin, &ack_txins) {
                 Ok(Some((witness_data, _))) => {
-                    // build pubin disprove Tx
+                    // PubinDisprove is not pre-signed, so fund it directly rather
+                    // than relying on CPFP.
                     let pubin_disprove_tx_total_input_amount = graph
                         .operator_assert
                         .connector_d_input()
@@ -4852,12 +5040,26 @@ async fn handle_assert_sent_verifier(
                         version: bitcoin::transaction::Version(2),
                         lock_time: bitcoin::absolute::LockTime::ZERO,
                         input: vec![pubin_disprove_txin],
-                        output: vec![goat::scripts::p2a_output()],
+                        output: vec![
+                            goat::scripts::p2a_output(),
+                            // Keep the transaction above Bitcoin Core's minimum
+                            // non-witness relay size.
+                            bitcoin::TxOut {
+                                value: Amount::ZERO,
+                                script_pubkey: goat::scripts::generate_opreturn_script(
+                                    PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
+                                ),
+                            },
+                        ],
                     };
-                    broadcast_tx_with_cpfp(
+                    let verifier_keypair =
+                        VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
+                    build_sign_and_broadcast_tx(
                         ctx.btc_client,
-                        pubin_disprove_tx,
+                        verifier_keypair,
+                        pubin_disprove_tx.input,
                         pubin_disprove_tx_total_input_amount,
+                        pubin_disprove_tx.output,
                     )
                     .await?;
                     return Ok(());
@@ -4914,6 +5116,8 @@ async fn handle_assert_sent_verifier(
 
     Ok(())
 }
+
+const PUBIN_DISPROVE_OP_RETURN_DATA: &[u8] = b"pubin-disprove";
 
 pub async fn broadcast_verifier_challenge_assert_tx(
     local_db: &LocalDB,
@@ -5356,7 +5560,8 @@ async fn handle_disprove_sent_committee(
         );
         return Ok(());
     }
-    ctx.goat_client
+    let result = ctx
+        .goat_client
         .gateway_finish_withdraw_disproved(
             ctx.btc_client,
             &graph_id,
@@ -5365,7 +5570,9 @@ async fn handle_disprove_sent_committee(
             challenge_start_tx.as_ref(),
             &challenge_finish_tx,
         )
-        .await?;
+        .await;
+    ctx.metrics_state.record_withdraw_finalize(result.is_ok());
+    result?;
     Ok(())
 }
 
@@ -5803,13 +6010,14 @@ async fn handle_sync_graph(
             "Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}: {e}"
         )
     })?;
-    if let Err(e) = todo_funcs::validate_graph_instance_parameters(
+    let validation = todo_funcs::validate_graph_instance_parameters(
         ctx.btc_client,
         ctx.goat_client,
         &graph.parameters.instance_parameters,
     )
-    .await
-    {
+    .await;
+    ctx.metrics_state.record_graph_validation(validation.is_ok());
+    if let Err(e) = validation {
         tracing::warn!(
             "Ignore SyncGraph for {instance_id}:{graph_id}: invalid instance parameters: {e}"
         );
@@ -6174,6 +6382,31 @@ mod tests {
         assert!(
             tx.base_size() >= 65,
             "wrongly-challenge transaction is {} non-witness bytes",
+            tx.base_size()
+        );
+    }
+
+    #[test]
+    fn pubin_disprove_outputs_exceed_minimum_non_witness_size() {
+        // Bitcoin Core rejects standard transactions smaller than 65 non-witness bytes.
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![
+                goat::scripts::p2a_output(),
+                bitcoin::TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: goat::scripts::generate_opreturn_script(
+                        PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
+                    ),
+                },
+            ],
+        };
+
+        assert!(
+            tx.base_size() >= 65,
+            "pubin-disprove transaction is {} non-witness bytes",
             tx.base_size()
         );
     }
