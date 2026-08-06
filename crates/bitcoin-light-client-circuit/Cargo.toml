@@ -56,6 +56,16 @@ imm-wrap-vk = [
 rand = "0.8.5"
 borsh = { version = "1.5.3", features = ["derive"] }
 blake3 = "1.6.1"
+ark-bn254.workspace = true
+ark-groth16.workspace = true
+bitvm-lib.workspace = true
+client.workspace = true
+goat.workspace = true
+proof-builder.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["full"] }
+zkm-sdk.workspace = true
+zkm-verifier = { workspace = true, features = ["ark"] }
 #zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
 
 [build-dependencies]

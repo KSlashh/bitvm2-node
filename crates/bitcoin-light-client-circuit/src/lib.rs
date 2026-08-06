@@ -707,12 +707,137 @@ pub fn parse_watchtower_commitment(
 mod tests {
     use super::*;
 
-    use bitcoin::Transaction;
+    use bitcoin::{Network, Transaction, Txid, Witness};
+    use bitvm_lib::babe_adapter::{TxAssertWitness, recover_operator_proof_from_assert_witness};
+    use client::btc_chain::BTCClient;
+    use client::http_client::async_client::HttpAsyncClient;
+    use goat::wots::{Wots, Wots96};
+    use proof_builder::{OperatorProofRequest, OperatorProofResponse, ProofDescResponse};
+    use sha2::{Digest, Sha256};
+    use std::str::FromStr;
+    use zkm_sdk::ZKMProofWithPublicValues;
     const PROOF: &[u8] = include_bytes!("../../../circuits/data/watchtower/output3.bin.proof.bin");
     const PUBLIC_INPUTS: &[u8] =
         include_bytes!("../../../circuits/data/watchtower/output3.bin.public_inputs.bin");
     const VK_HASH: &str = include_str!("../../../circuits/data/watchtower/output3.bin.vk_hash.bin");
     const ZKM_VERSION: &str = "v1.2.4";
+
+    fn recover_wots96_message(tx: &Transaction) -> [u8; 96] {
+        let raw_witness_len = 2 * Wots96::TOTAL_DIGIT_LEN as usize;
+        let witness = tx
+            .input
+            .iter()
+            .map(|input| &input.witness)
+            .find(|witness| {
+                witness.len() >= raw_witness_len
+                    && witness.iter().take(raw_witness_len).enumerate().all(|(index, item)| {
+                        if index % 2 == 0 { item.len() == 20 } else { item.len() <= 2 }
+                    })
+            })
+            .expect("transaction must contain a raw WOTS96 witness");
+
+        let signature = Wots96::raw_witness_to_signature(&Witness::from_slice(
+            &witness.iter().take(raw_witness_len).map(|item| item.to_vec()).collect::<Vec<_>>(),
+        ));
+        Wots96::signature_to_message(&signature)
+    }
+
+    fn recover_operator_assert_proof(tx: &Transaction) -> ark_groth16::Proof<ark_bn254::Bn254> {
+        let raw_witness_len = 2 * Wots96::TOTAL_DIGIT_LEN as usize;
+        let witness = tx
+            .input
+            .iter()
+            .map(|input| &input.witness)
+            .find(|witness| {
+                witness.len() >= raw_witness_len + 4
+                    && witness.iter().take(raw_witness_len).enumerate().all(|(index, item)| {
+                        if index % 2 == 0 { item.len() == 20 } else { item.len() <= 2 }
+                    })
+            })
+            .expect("transaction must contain an operator assert witness");
+        let wots_sig = Wots96::raw_witness_to_signature(&Witness::from_slice(
+            &witness.iter().take(raw_witness_len).map(|item| item.to_vec()).collect::<Vec<_>>(),
+        ));
+        recover_operator_proof_from_assert_witness(&TxAssertWitness {
+            wots_sig: wots_sig.to_vec(),
+            pi2: witness[raw_witness_len].to_vec(),
+            pi3: witness[raw_witness_len + 1].to_vec(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "fetches the observed testnet4 assert and commit-pubin transactions"]
+    async fn onchain_operator_assert_xd_uses_sha256_commit_pubin() {
+        let btc = BTCClient::new(Network::Testnet4, Some("http://34.215.238.232:13002"));
+        let instance_id = "219ec788-eae6-4f14-a5bb-870f89c1b5c0";
+        let graph_id = "e3f5b857-bf26-4cb1-8183-dcba5d32e767";
+        let commit_pubin_txid =
+            Txid::from_str("179ed60ac23952b0ed82cba74e2b8444cfda3a6ae69e18d984dd170cb73a5042")
+                .unwrap();
+        let assert_txid =
+            Txid::from_str("54ea9e635ca90b54191d71f305e075eaaf91233293be05140490884fcf066fa0")
+                .unwrap();
+
+        let commit_pubin_tx = btc.get_tx(&commit_pubin_txid).await.unwrap().unwrap();
+        let assert_tx = btc.get_tx(&assert_txid).await.unwrap().unwrap();
+
+        let proof_desc_url = format!(
+            "http://34.215.238.232:8900/v1/proofs/operator_proofs_desc?instance_id={instance_id}&graph_id={graph_id}"
+        );
+        let proof_desc: ProofDescResponse =
+            HttpAsyncClient::new(Some(0)).get_response_json(&proof_desc_url).await.unwrap();
+        let proof_values = hex::decode(proof_desc.proof_desc.unwrap().pub_values).unwrap();
+        let proof_response: OperatorProofResponse = HttpAsyncClient::new(Some(0))
+            .post_response_json(
+                "http://34.215.238.232:8900/v1/proofs/operator_proofs",
+                &OperatorProofRequest {
+                    instance_id: instance_id.to_owned(),
+                    graph_id: graph_id.to_owned(),
+                    // This task is already proven, so the service only uses the IDs and returns
+                    // its stored artifact; remaining fields are not consumed on this path.
+                    operator_committed_blockhash: String::new(),
+                    execution_layer_block_number: 0,
+                    watchtower_challenge_txids: vec![],
+                    included_watchtowers: vec![],
+                    watchtower_challenge_init_txid: String::new(),
+                    watchtower_challenge_pubkeys: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let proof_data = proof_response.proof_data.unwrap();
+        let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_data.proof).unwrap();
+        assert_eq!(proof.public_values.to_vec(), proof_values);
+        let proof_builder_groth16 = zkm_verifier::convert_ark_imm_wrap_vk(
+            &proof,
+            &proof_data.vk,
+            &zkm_verifier::IMM_GROTH16_VK_BYTES,
+            zkm_verifier::Groth16Verifier::get_part_stark_vk(&proof.zkm_version),
+        )
+        .unwrap();
+        let proof_outputs = decode_operator_public_outputs(&proof_values).unwrap();
+        let mut proof_builder_pubin = [0u8; 96];
+        proof_builder_pubin[..32].copy_from_slice(&proof_outputs.btc_best_block_hash);
+        proof_builder_pubin[32..64].copy_from_slice(&proof_outputs.constant);
+        proof_builder_pubin[64..].copy_from_slice(&proof_outputs.included_watchtowers);
+
+        let commit_pubin = recover_wots96_message(&commit_pubin_tx);
+        assert_eq!(proof_builder_pubin, commit_pubin);
+        let assert_message = recover_wots96_message(&assert_tx);
+        assert_eq!(proof_builder_groth16.proof, recover_operator_assert_proof(&assert_tx));
+        let mut asserted_xd: [u8; 32] = assert_message[64..96].try_into().unwrap();
+        asserted_xd.reverse(); // WOTS commits x_d in little-endian order.
+
+        let mut sha256_xd: [u8; 32] = Sha256::digest(commit_pubin).into();
+        sha256_xd[0] &= 0x1f;
+        assert_eq!(asserted_xd, sha256_xd);
+        assert_eq!(zkm_verifier::hash_public_inputs(&commit_pubin), sha256_xd);
+
+        let mut blake3_xd = *blake3::hash(&commit_pubin).as_bytes();
+        blake3_xd[0] &= 0x1f;
+        assert_ne!(asserted_xd, blake3_xd);
+    }
 
     #[test]
     fn checked_history_root_binds_actual_output_and_expected_program_ids() {
