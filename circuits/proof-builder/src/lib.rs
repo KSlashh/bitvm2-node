@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bitcoin::{Block, BlockHash, ScriptBuf, Transaction, TxOut};
+use bitcoin::{Block, BlockHash, Transaction, Txid};
 use commit_chain::CircuitCommit;
 use header_chain::CircuitBlockHeader;
 use serde::{Deserialize, Serialize};
@@ -7,8 +7,10 @@ use state_chain::CircuitStateBlock;
 use std::fs;
 use strum::{Display, EnumString};
 use thiserror::Error;
-use zkm_sdk::{ProverClient, ZKMProofWithPublicValues};
+use zkm_sdk::{HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues};
 use zkm_sdk::{ZKMProvingKey, ZKMVerifyingKey};
+
+pub mod api_auth;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProofRequest {
@@ -63,10 +65,10 @@ pub enum ProofRequest {
 
         operator_committed_blockhash: BlockHash,
 
-        watchtower_challenge_txns: Vec<Transaction>,
-        watchtower_challenge_txn_prev_outs: Vec<TxOut>,
-        watchtower_challenge_txn_pubkeys: Vec<bitcoin::secp256k1::PublicKey>,
-        watchtower_challenge_txn_scripts: Vec<ScriptBuf>,
+        graph_watchtower_xonly_public_keys: Vec<[u8; 32]>,
+        watchtower_challenge_init_txid: Txid,
+        watchtower_challenge_init_txn: Option<Transaction>,
+        watchtower_challenge_witnesses: Vec<(u16, u32, Block, Transaction)>,
     },
 }
 
@@ -84,6 +86,12 @@ pub trait ProofBuilder {
     fn client(&self) -> &ProverClient;
     fn pk(&self) -> &ZKMProvingKey;
     fn vk(&self) -> &ZKMVerifyingKey;
+
+    /// Returns the Program ID derived from the builder's verifying key.
+    fn program_id(&self) -> Result<verifier::ProgramId> {
+        verifier::program_id(self.vk().bytes32().as_bytes(), ZKM_CIRCUIT_VERSION)
+            .map_err(anyhow::Error::msg)
+    }
 
     fn build_proof(
         &self,
@@ -114,7 +122,7 @@ pub struct OnDemandTask {
     pub state_chain_input_proof: String,
 
     pub watchtower_challenge_init_txid: Option<String>,
-    pub watchtower_challenge_txids: Vec<String>,
+    pub watchtower_challenge_txids: Vec<Option<String>>,
     pub included_watchtowers: Vec<bool>,
     pub watchtower_public_keys: Vec<String>,
     pub graph_id: Option<String>,
@@ -192,9 +200,11 @@ pub struct ProofDescResponse {
 pub struct OperatorProofRequest {
     pub instance_id: String,
     pub graph_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<String>,
     pub operator_committed_blockhash: String,
     pub execution_layer_block_number: i64,
-    pub watchtower_challenge_txids: Vec<String>,
+    pub watchtower_challenge_txids: Vec<Option<String>>,
     pub included_watchtowers: Vec<bool>,
     pub watchtower_challenge_init_txid: String,
     pub watchtower_challenge_pubkeys: Vec<String>,
@@ -206,7 +216,6 @@ pub struct ProofData {
     pub vk: String,
     pub public_inputs: Vec<u8>,
     pub zkm_version: String,
-    pub proof_part_stark_vk: Vec<u8>,
 }
 
 impl ProofData {
@@ -228,8 +237,6 @@ impl ProofData {
                     fs::read(format!("{path}.zkm_version.bin")).unwrap_or_default(),
                 )
                 .unwrap_or_default();
-                proof_data.proof_part_stark_vk =
-                    fs::read(format!("{path}.proof_part_stark_vk.bin")).unwrap_or_default();
             }
         }
         proof_data
@@ -246,6 +253,8 @@ pub struct OperatorProofResponse {
 pub struct WatchtowerProofRequest {
     pub instance_id: String,
     pub graph_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<String>,
     pub public_key: String,
     pub challenge_init_txid: String,
     pub execution_layer_block_number: i64,
@@ -261,6 +270,8 @@ pub struct WatchtowerProofResponse {
 pub struct OperatorProofTimeoutUpdateRequest {
     pub instance_id: String,
     pub graph_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperatorProofTimeoutUpdateResponse {
@@ -274,6 +285,8 @@ pub struct OperatorProofTimeoutUpdateResponse {
 pub struct WatchtowerProofTimeoutUpdateRequest {
     pub instance_id: String,
     pub graph_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<String>,
     pub public_key: String,
 }
 
@@ -284,41 +297,4 @@ pub struct WatchtowerProofTimeoutUpdateResponse {
     pub public_key: String,
     pub data: Option<String>,
     pub error: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_proof_base() -> PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("proof-data-test-{nanos}"))
-    }
-
-    #[test]
-    fn load_proof_data_reads_proof_part_stark_vk_sidecar() {
-        let base = temp_proof_base();
-        let base_str = base.to_string_lossy().to_string();
-        fs::write(&base, [1u8, 2, 3]).unwrap();
-        fs::write(format!("{base_str}.public_inputs.bin"), [4u8, 5, 6]).unwrap();
-        fs::write(format!("{base_str}.vk_hash.bin"), b"vk-hash").unwrap();
-        fs::write(format!("{base_str}.zkm_version.bin"), b"v1.2.5").unwrap();
-        fs::write(format!("{base_str}.proof_part_stark_vk.bin"), [9u8, 8, 7]).unwrap();
-
-        let proof_data = ProofData::load_proof_data(&base_str, ProofType::Watchtower);
-
-        assert_eq!(proof_data.proof, vec![1u8, 2, 3]);
-        assert_eq!(proof_data.public_inputs, vec![4u8, 5, 6]);
-        assert_eq!(proof_data.vk, "vk-hash");
-        assert_eq!(proof_data.zkm_version, "v1.2.5");
-        assert_eq!(proof_data.proof_part_stark_vk, vec![9u8, 8, 7]);
-
-        let _ = fs::remove_file(&base);
-        let _ = fs::remove_file(format!("{base_str}.public_inputs.bin"));
-        let _ = fs::remove_file(format!("{base_str}.vk_hash.bin"));
-        let _ = fs::remove_file(format!("{base_str}.zkm_version.bin"));
-        let _ = fs::remove_file(format!("{base_str}.proof_part_stark_vk.bin"));
-    }
 }

@@ -1,4 +1,4 @@
-# BitVM2 Circuits
+# BitVM Circuits
 
 ## Overview
 
@@ -203,7 +203,7 @@ RUST_LOG=info cargo run --package watchtower-proof --bin watchtower-proof -r -- 
 * Simutate a withdraw challenge
 
 ```bash
-cd crates/bitvm2-ga
+cd crates/bitvm-gc
 cargo test -r test_take2
 ```
 
@@ -242,10 +242,13 @@ export WATCHTOWER_CHALLENGE_INIT_TXID="e7723e03ac97172cf033e40d4b9d9c0e22efa7a41
 RUST_LOG=info cargo run --package operator-proof --bin operator-proof -r -- --output "data/operator-proof/output.bin"
 ```
 
+The operator proof is consumed directly by the Assert flow. BABE setup binds its static public
+input, while the dynamic public input is committed after the watchtower challenge set is known.
+
 * latest-sequencer-commit-txid: the latest publisher's commitment Bitcoin transaction id
 * header-chain-input-proof: the header chain's proof, input and vk.
 * commit-chain-input-proof: the commit chain's proof, input and vk.
-* included-watchtower: a 256-bit bitmask; each bit flags a valid watchtower.
+* included-watchtower: a 256-bit bitmask; each bit flags a valid watchtower inside operator proof.
 * execution-layer-block-number: the block number that including `proceedWithdraw`(Peg-out) transaction of GOAT Network's execution layer(Geth).
 * watchtower-challenge-info: list of watchtower's challenge transaction id and compressed public key, i.e: [wachtower_info.json](./data/watchtower/watchtower_info.json).
-* watchtower-challenge-init-txid: the watchtower challenge init transaction id in GOAT's BitVM2 graph.
+* watchtower-challenge-init-txid: the watchtower challenge init transaction id in GOAT's BitVM graph.
