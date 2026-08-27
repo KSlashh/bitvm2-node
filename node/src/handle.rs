@@ -4646,16 +4646,27 @@ async fn handle_kickoff_sent_verifier(
     let goat_confirmed_btc_height = ctx.goat_client.btc_spv_latest_height().await? as u32;
     if [WithdrawStatus::None, WithdrawStatus::Canceled].contains(&withdraw_status) {
         if kickoff_height >= goat_confirmed_btc_height {
-            tracing::warn!(
-                "Ignore KickoffSent for {instance_id}:{graph_id}: kickoff tx not confirmed by goat spv yet"
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network())
+                * (kickoff_height - goat_confirmed_btc_height) as u64;
+            push_local_unhandled_messages_with_reason(
+                ctx.local_db,
+                graph_id,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::GoatSpvPending,
+                "kickoff block is not available through GOAT SPV",
+            )
+            .await?;
+            tracing::info!(
+                "Retry Challenge later for {instance_id}:{graph_id}: kickoff tx block is not posted to GOAT SPV yet"
             );
             return Ok(());
-        } else {
-            let (challenge_tx, _) = export_challenge_tx(&graph).unwrap();
-            let challenge_txid = challenge_tx.compute_txid();
-            if ctx.btc_client.get_tx(&challenge_txid).await?.is_none() {
-                send_challenge_tx(ctx.btc_client, &graph).await?;
-            }
+        }
+
+        let (challenge_tx, _) = export_challenge_tx(&graph).unwrap();
+        let challenge_txid = challenge_tx.compute_txid();
+        if ctx.btc_client.get_tx(&challenge_txid).await?.is_none() {
+            send_challenge_tx(ctx.btc_client, &graph).await?;
         }
     } else {
         tracing::info!(
