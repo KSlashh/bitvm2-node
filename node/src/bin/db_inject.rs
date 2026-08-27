@@ -84,6 +84,7 @@ fn infer_business_id(content: &GOATMessageContent) -> Option<Uuid> {
         GOATMessageContent::GenCircuits(v) => Some(v.graph_id),
         GOATMessageContent::CutCircuits(v) => Some(v.graph_id),
         GOATMessageContent::SolderingProofReady(v) => Some(v.graph_id),
+        GOATMessageContent::GraphSetupAck(_) => None,
         GOATMessageContent::VerifierGraphParamsEndorsement(v) => Some(v.graph_id),
         GOATMessageContent::CreateGraph(v) => Some(v.graph_id),
         GOATMessageContent::NonceGeneration(v) => Some(v.graph_id),

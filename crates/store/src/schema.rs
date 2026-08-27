@@ -565,6 +565,9 @@ pub struct P2pOutboxMessage {
     pub next_retry_at: i64,
     pub lease_until: i64,
     pub last_error: Option<String>,
+    pub retry_until: i64,
+    pub retry_interval_secs: i64,
+    pub ack_peer_id: String,
     pub created_at: i64,
 }
 

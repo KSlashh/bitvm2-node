@@ -69,6 +69,9 @@ fn p2p_outbox_message_from_row(row: &SqliteRow) -> Result<P2pOutboxMessage, sqlx
         next_retry_at: row.try_get("next_retry_at")?,
         lease_until: row.try_get("lease_until")?,
         last_error: row.try_get("last_error")?,
+        retry_until: row.try_get("retry_until")?,
+        retry_interval_secs: row.try_get("retry_interval_secs")?,
+        ack_peer_id: row.try_get("ack_peer_id")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -2864,6 +2867,40 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Queue a graph-setup notification for a bounded retransmission window.
+    ///
+    /// A non-empty `ack_peer_id` is the only ACK that may stop this retry
+    /// loop early. Broadcast messages without an authenticated recipient keep
+    /// publishing until their window expires.
+    pub async fn enqueue_p2p_outbox_retry_message(
+        &mut self,
+        message_id: &str,
+        msg_type: &str,
+        content: &[u8],
+        retry_until: i64,
+        retry_interval_secs: i64,
+        ack_peer_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let now = get_current_timestamp_secs();
+        let result = sqlx::query(
+            "INSERT INTO p2p_outbox \
+                (message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, retry_until, retry_interval_secs, ack_peer_id, created_at, updated_at) \
+             VALUES (?, ?, ?, 'Pending', 0, 0, 0, ?, ?, ?, ?, ?) \
+             ON CONFLICT(message_id) DO NOTHING",
+        )
+        .bind(message_id)
+        .bind(msg_type)
+        .bind(content)
+        .bind(retry_until)
+        .bind(retry_interval_secs)
+        .bind(ack_peer_id.unwrap_or_default())
+        .bind(now)
+        .bind(now)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn claim_p2p_outbox_messages(
         &mut self,
         now: i64,
@@ -2871,12 +2908,14 @@ impl<'a> StorageProcessor<'a> {
         limit: i64,
     ) -> anyhow::Result<Vec<P2pOutboxMessage>> {
         let rows = sqlx::query(
-            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, created_at \
+            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, retry_until, retry_interval_secs, ack_peer_id, created_at \
              FROM p2p_outbox \
-             WHERE (state = 'Pending' AND next_retry_at <= ?) \
+             WHERE ((state = 'Pending' AND next_retry_at <= ?) \
                 OR (state = 'Processing' AND lease_until <= ?) \
+             ) AND (retry_until = 0 OR retry_until > ?) \
              ORDER BY created_at ASC LIMIT ?",
         )
+        .bind(now)
         .bind(now)
         .bind(now)
         .bind(limit)
@@ -2905,6 +2944,71 @@ impl<'a> StorageProcessor<'a> {
             }
         }
         Ok(claimed)
+    }
+
+    /// End a bounded-retry message once its delivery window is exhausted.
+    pub async fn expire_p2p_outbox_retry_messages(&mut self, now: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'RetryExhausted', content = X'', lease_until = 0, next_retry_at = 0, \
+                 retry_until = 0, retry_interval_secs = 0, ack_peer_id = '', \
+                 last_error = 'retry window expired without expected ACK', updated_at = ? \
+             WHERE retry_until > 0 AND retry_until <= ? AND state IN ('Pending', 'Processing')",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn schedule_p2p_outbox_retry(
+        &mut self,
+        message_id: &str,
+        next_retry_at: i64,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'Pending', lease_until = 0, next_retry_at = ?, updated_at = ? \
+             WHERE message_id = ? AND state = 'Processing' AND retry_until > 0",
+        )
+        .bind(next_retry_at)
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn acknowledge_p2p_outbox_message(
+        &mut self,
+        message_id: &str,
+        peer_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'Processed', content = X'', lease_until = 0, next_retry_at = 0, updated_at = ? \
+             WHERE message_id = ? AND retry_until > 0 AND ack_peer_id = ? \
+               AND state IN ('Pending', 'Processing')",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(peer_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Stop a local setup notification once a later protocol step makes it
+    /// obsolete and release its potentially large payload immediately.
+    pub async fn cancel_p2p_outbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'Cancelled', content = X'', lease_until = 0, next_retry_at = 0, \
+                 updated_at = ? \
+             WHERE message_id = ? AND state IN ('Pending', 'Processing')",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn complete_p2p_outbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {

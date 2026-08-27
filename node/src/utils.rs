@@ -469,29 +469,38 @@ pub async fn validate_init_graph_base(
         graph.parameters.pubin_disprove_constant,
     )?;
 
-    // 5) Operator stake sanity: verify operator is registered and has enough locked stake
-    let op_pk_bytes = graph.parameters.operator_pubkey.to_bytes();
-    let xonly: [u8; 32] = op_pk_bytes[1..33]
-        .try_into()
-        .map_err(|_| SpecialError::InvalidGraph("invalid operator pubkey".to_string()))?;
-    let operator_addr = goat_client.stake_mana_pubkey_to_address(&xonly).await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to query operator address: {e}"))
-    })?;
-    if operator_addr == [0u8; 20] {
-        bail!(SpecialError::InvalidGraph("operator not registered".to_string()));
-    }
-    let min_stake_amount = goat_client.gateway_get_min_stake_amount().await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to query min stake amount: {e}"))
-    })?;
-    let locked_stake = goat_client.stake_mana_lock_stake_of(&operator_addr).await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to query operator locked stake: {e}"))
-    })?;
-    if locked_stake < min_stake_amount {
-        bail!(SpecialError::InvalidGraph(format!(
-            "insufficient operator stake: locked={locked_stake}, min={min_stake_amount}"
-        )));
-    }
+    // 5) Operator stake sanity: verify operator is registered and has enough locked stake.
+    validate_operator_stake(goat_client, &graph.parameters.operator_pubkey)
+        .await
+        .map_err(|error| SpecialError::InvalidGraph(error.to_string()))?;
 
+    Ok(())
+}
+
+/// Verify the stake conditions required for an operator to create a graph.
+/// This mirrors the Gateway graph-posting requirement and is shared by graph
+/// validation and the early InitGraph admission check.
+pub async fn validate_operator_stake(
+    goat_client: &GOATClient,
+    operator_pubkey: &PublicKey,
+) -> Result<()> {
+    let operator_xonly_pubkey = XOnlyPublicKey::from(*operator_pubkey).serialize();
+    let operator_addr = goat_client
+        .stake_mana_pubkey_to_address(&operator_xonly_pubkey)
+        .await
+        .context("query operator address")?;
+    if operator_addr == [0; 20] {
+        bail!("operator not registered");
+    }
+    let min_stake_amount =
+        goat_client.gateway_get_min_stake_amount().await.context("query minimum operator stake")?;
+    let locked_stake = goat_client
+        .stake_mana_lock_stake_of(&operator_addr)
+        .await
+        .context("query operator locked stake")?;
+    if locked_stake < min_stake_amount {
+        bail!("insufficient operator stake: locked={locked_stake}, min={min_stake_amount}");
+    }
     Ok(())
 }
 
@@ -5902,7 +5911,7 @@ pub(crate) async fn pending_graph_belongs_to_operator(
 pub(crate) async fn save_soldering_proof_payload(
     instance_id: Uuid,
     graph_id: Uuid,
-    verifier_index: usize,
+    candidate_index: usize,
     opened: &[(usize, u64)],
     finalized: &[FinalizedInstanceData],
     soldering: &SolderingData,
@@ -5917,7 +5926,7 @@ pub(crate) async fn save_soldering_proof_payload(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        candidate_index,
         &payload_hash,
     )?;
     let store_mode = if is_soldering_proof_s3_path(&store_base_path) { "s3" } else { "local" };
@@ -5943,7 +5952,7 @@ pub(crate) async fn save_soldering_proof_payload(
         payload_path = %payload_path,
         "saved compact soldering proof to payload store"
     );
-    Ok(SolderingProofReady { instance_id, graph_id, verifier_index, payload_hash, total_len })
+    Ok(SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len })
 }
 
 fn load_babe_setup_state_from_path(path: &Path) -> Result<Option<BabeSetupState>> {
@@ -6107,7 +6116,7 @@ pub(crate) async fn cleanup_babe_setup_states(
                     payload_store,
                     instance_id,
                     graph_id,
-                    ready.verifier_index,
+                    ready.candidate_index,
                     &ready.payload_hash,
                 )?;
                 delete_soldering_proof_store_payload(&payload_path).await?;
@@ -6129,6 +6138,10 @@ pub struct BabeSetupState {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VerifierBabeSetupState {
     pub verifier_pubkey: PublicKey,
+    /// Authenticated operator identity that initiated this setup.
+    pub operator_pubkey: PublicKey,
+    /// Signed operator P2P identity used for directed setup replies and ACKs.
+    pub operator_peer_id: Vec<u8>,
     pub setup_package: CACSetupPackage,
     pub private_state: BabeVerifierPrivateState,
     pub finalized_indices: Vec<usize>,
@@ -6140,7 +6153,8 @@ pub struct OperatorVerifierCandidate {
     pub verifier_peer_id: Vec<u8>,
     pub verifier_pubkey: PublicKey,
     pub setup_package: CACSetupPackage,
-    pub verifier_index: Option<usize>,
+    /// Immutable slot within the candidate pool and proof payload store.
+    pub candidate_index: Option<usize>,
     pub selected_circuit_indexes: Vec<usize>,
     pub gc_data: Option<BitvmGcCircuitData>,
     pub soldering_proof_ready: Option<SolderingProofReady>,
@@ -6148,8 +6162,16 @@ pub struct OperatorVerifierCandidate {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OperatorBabeSetupState {
-    pub frozen_verifier_pubkeys: Option<Vec<PublicKey>>,
+    /// Candidate pool closed before CutCircuits. This is not the final graph
+    /// verifier set; `selected_verifier_pubkeys` is set after proof validation.
+    pub candidate_verifier_pubkeys: Option<Vec<PublicKey>>,
     pub candidates: Vec<OperatorVerifierCandidate>,
+    #[serde(default)]
+    pub candidate_collection_started_at: Option<i64>,
+    #[serde(default)]
+    pub proof_collection_started_at: Option<i64>,
+    #[serde(default)]
+    pub selected_verifier_pubkeys: Option<Vec<PublicKey>>,
     #[serde(default)]
     pub asserted_operator_proof: Option<Vec<u8>>,
 }

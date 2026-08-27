@@ -1,11 +1,13 @@
 use crate::action::*;
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
-    get_soldering_proof_payload_store_path, is_relayer,
+    get_peer_id, get_soldering_proof_payload_store_path, get_verifier_candidate_backup_count,
+    get_verifier_candidate_collection_window_secs, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
+use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::soldering_payload_store::{
     read_soldering_proof_store_payload, soldering_proof_payload_store_path,
@@ -13,7 +15,7 @@ use crate::soldering_payload_store::{
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
 use ark_serialize::CanonicalSerialize;
-use bitcoin::{Amount, OutPoint, Txid, hashes::Hash};
+use bitcoin::{Amount, OutPoint, Txid, hashes::Hash, key::Keypair};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
@@ -39,6 +41,7 @@ use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use goat::wots::{Wots, Wots96};
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use store::localdb::LocalDB;
@@ -140,7 +143,7 @@ pub(crate) fn is_heavy_task_message_type(message_type: &str, actor: &Actor) -> b
 pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) -> Result<()> {
     match task {
         HeavyTask::GenerateVerifierSetup(message) => {
-            handle_init_graph_verifier(context, message.instance_id, message.graph_id).await
+            handle_init_graph_verifier(context, message).await
         }
         HeavyTask::GenerateSolderingProof(message) => {
             handle_cut_circuits_verifier(
@@ -148,7 +151,7 @@ pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) 
                 message.instance_id,
                 message.graph_id,
                 &message.verifier_pubkey,
-                message.verifier_index,
+                message.candidate_index,
                 &message.selected_circuit_indexes,
             )
             .await
@@ -168,7 +171,7 @@ pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) 
                 context,
                 message.instance_id,
                 message.graph_id,
-                message.verifier_index,
+                message.candidate_index,
                 message.payload_hash,
                 message.total_len,
             )
@@ -238,6 +241,37 @@ fn load_or_create_committee_instance_keypair(
 
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
     match (content, &ctx.actor) {
+        (
+            GOATMessageContent::GraphSetupAck(GraphSetupAck {
+                outbox_id,
+                acknowledger_peer_id,
+                ..
+            }),
+            _,
+        ) => {
+            if acknowledger_peer_id != &ctx.from_peer_id.to_string() {
+                tracing::warn!(
+                    outbox_id,
+                    from_peer_id = %ctx.from_peer_id,
+                    acknowledger_peer_id,
+                    "Ignore GraphSetupAck with mismatched source peer"
+                );
+                return Ok(());
+            }
+            let acknowledged = ctx
+                .local_db
+                .acquire()
+                .await?
+                .acknowledge_p2p_outbox_message(outbox_id, acknowledger_peer_id)
+                .await?;
+            tracing::debug!(
+                outbox_id,
+                from_peer_id = %ctx.from_peer_id,
+                acknowledged,
+                "processed GraphSetupAck"
+            );
+            Ok(())
+        }
         (
             GOATMessageContent::PeginRequest(PeginRequest {
                 instance_id,
@@ -740,6 +774,17 @@ fn make_message(ctx: &HandlerContext<'_>, content: &GOATMessageContent) -> GOATM
     GOATMessage::new(ctx.actor.clone(), content.clone())
 }
 
+fn build_signed_init_graph(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_keypair: &Keypair,
+) -> Result<InitGraph> {
+    let operator_peer_id = PeerId::from_str(&get_peer_id())
+        .context("decode local operator peer id for InitGraph")?
+        .to_bytes();
+    Ok(sign_init_graph(instance_id, graph_id, operator_keypair, operator_peer_id))
+}
+
 /// A graph-bearing message has two identity representations: its envelope and
 /// the signed graph parameters. Never use one to read/write local state while
 /// using the other to reconstruct or scan the graph.
@@ -766,9 +811,10 @@ fn message_identity_matches(
     false
 }
 
-/// Freezes the first accepted Verifiers and assigns deterministic graph slots.
+/// Closes a bounded candidate collection window and assigns provisional slots.
+/// Final graph slots are assigned only after valid soldering proofs are collected.
 fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> {
-    if state.frozen_verifier_pubkeys.is_some() {
+    if state.candidate_verifier_pubkeys.is_some() {
         return Ok(());
     }
     if state.candidates.len() < min_required_verifier() {
@@ -784,38 +830,92 @@ fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> 
             bail!("cannot freeze duplicate verifier peer id");
         }
     }
-    state.candidates.truncate(min_required_verifier());
     state.candidates.sort_by_key(|candidate| candidate.verifier_pubkey.to_bytes());
-    for (verifier_index, candidate) in state.candidates.iter_mut().enumerate() {
-        candidate.verifier_index = Some(verifier_index);
+    for (candidate_index, candidate) in state.candidates.iter_mut().enumerate() {
+        candidate.candidate_index = Some(candidate_index);
         candidate.selected_circuit_indexes =
             derive_finalized_indices(&candidate.setup_package, BABE_M_CC)?;
     }
-    state.frozen_verifier_pubkeys =
+    state.candidate_verifier_pubkeys =
         Some(state.candidates.iter().map(|candidate| candidate.verifier_pubkey).collect());
     Ok(())
 }
 
-/// Stores one selected Verifier slot and emits ordered graph data when complete.
+fn seal_selected_verifiers(
+    state: &mut OperatorBabeSetupState,
+    selected_verifier_pubkeys: Vec<PublicKey>,
+) -> Result<()> {
+    if let Some(existing) = &state.selected_verifier_pubkeys {
+        if existing != &selected_verifier_pubkeys {
+            bail!("refuse to replace the sealed verifier selection");
+        }
+        return Ok(());
+    }
+    if selected_verifier_pubkeys.len() != min_required_verifier() {
+        bail!(
+            "selected verifier count {} does not match required {}",
+            selected_verifier_pubkeys.len(),
+            min_required_verifier()
+        );
+    }
+    if selected_verifier_pubkeys.windows(2).any(|pair| pair[0].to_bytes() >= pair[1].to_bytes()) {
+        bail!("selected verifier public keys must be unique and canonically ordered");
+    }
+    if selected_verifier_pubkeys.iter().any(|selected| {
+        !state.candidates.iter().any(|candidate| candidate.verifier_pubkey == *selected)
+    }) {
+        bail!("sealed verifier selection contains a non-candidate public key");
+    }
+    state.selected_verifier_pubkeys = Some(selected_verifier_pubkeys);
+    Ok(())
+}
+
+fn selected_gc_data(state: &OperatorBabeSetupState) -> Result<Vec<BitvmGcCircuitData>> {
+    let selected = state
+        .selected_verifier_pubkeys
+        .as_ref()
+        .ok_or_else(|| anyhow!("verifier selection is not sealed"))?;
+    selected
+        .iter()
+        .map(|verifier_pubkey| {
+            state
+                .candidates
+                .iter()
+                .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+                .and_then(|candidate| candidate.gc_data.clone())
+                .ok_or_else(|| {
+                    anyhow!("missing verified GC data for sealed verifier {verifier_pubkey}")
+                })
+        })
+        .collect()
+}
+
+fn selected_candidate_for_graph_index<'a>(
+    state: &'a OperatorBabeSetupState,
+    verifier_index: usize,
+) -> Result<&'a OperatorVerifierCandidate> {
+    let verifier_pubkey = state
+        .selected_verifier_pubkeys
+        .as_ref()
+        .and_then(|selected| selected.get(verifier_index))
+        .ok_or_else(|| anyhow!("missing sealed verifier slot {verifier_index}"))?;
+    state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+        .ok_or_else(|| anyhow!("missing candidate for sealed verifier slot {verifier_index}"))
+}
+
+/// Stores verified proof data against its immutable candidate slot.
 fn record_candidate_gc_data(
     state: &mut OperatorBabeSetupState,
     verifier_pubkey: PublicKey,
-    verifier_index: usize,
+    candidate_index: usize,
     setup_package: &CACSetupPackage,
     gc_data: BitvmGcCircuitData,
     prover_state: &BabeProverState,
     soldering_proof_ready: SolderingProofReady,
-) -> Result<Option<Vec<BitvmGcCircuitData>>> {
-    let frozen = state
-        .frozen_verifier_pubkeys
-        .as_ref()
-        .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
-    let expected_pubkey = frozen
-        .get(verifier_index)
-        .ok_or_else(|| anyhow!("verifier index {verifier_index} out of frozen slot range"))?;
-    if expected_pubkey != &verifier_pubkey {
-        bail!("verifier public key does not own slot {verifier_index}");
-    }
+) -> Result<()> {
     if gc_data.verifier_pubkey != verifier_pubkey {
         bail!("GC slot owner does not match soldering proof verifier");
     }
@@ -824,8 +924,8 @@ fn record_candidate_gc_data(
         .iter_mut()
         .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.verifier_index != Some(verifier_index) {
-        bail!("candidate verifier index does not match soldering proof slot");
+    if candidate.candidate_index != Some(candidate_index) {
+        bail!("candidate index does not match soldering proof slot");
     }
     if candidate.setup_package != *setup_package {
         bail!("soldering proof setup package does not match selected verifier candidate");
@@ -836,8 +936,8 @@ fn record_candidate_gc_data(
     if candidate.selected_circuit_indexes != prover_state.soldering.finalized_indices {
         bail!("BABE prover state finalized indices do not match selected verifier cut");
     }
-    if soldering_proof_ready.verifier_index != verifier_index {
-        bail!("soldering proof reference verifier index does not match selected verifier slot");
+    if soldering_proof_ready.candidate_index != candidate_index {
+        bail!("soldering proof reference candidate index does not match selected verifier");
     }
     if prover_state.finalized.len() != BABE_M_CC || prover_state.h_msgs.len() != BABE_M_CC {
         bail!("BABE prover state must contain exactly {BABE_M_CC} finalized instances and hashes");
@@ -848,12 +948,12 @@ fn record_candidate_gc_data(
     if let Some(existing) = &candidate.gc_data
         && existing != &gc_data
     {
-        bail!("conflicting GC slot received for selected verifier");
+        bail!("conflicting GC data received for verifier candidate");
     }
     if let Some(existing) = &candidate.soldering_proof_ready
         && existing != &soldering_proof_ready
     {
-        bail!("conflicting soldering proof reference received for selected verifier");
+        bail!("conflicting soldering proof reference received for verifier candidate");
     }
     if candidate.gc_data.is_none() {
         candidate.gc_data = Some(gc_data);
@@ -861,10 +961,7 @@ fn record_candidate_gc_data(
     if candidate.soldering_proof_ready.is_none() {
         candidate.soldering_proof_ready = Some(soldering_proof_ready);
     }
-    if state.candidates.iter().any(|candidate| candidate.gc_data.is_none()) {
-        return Ok(None);
-    }
-    Ok(Some(state.candidates.iter().map(|candidate| candidate.gc_data.clone().unwrap()).collect()))
+    Ok(())
 }
 
 fn build_babe_prover_state(
@@ -1438,8 +1535,17 @@ async fn handle_confirm_instance_operator(
             return Ok(());
         }
         tracing::info!("Resume pending graph setup for {instance_id}, graph_id: {graph_id}");
-        let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+        let message_content = GOATMessageContent::InitGraph(build_signed_init_graph(
+            instance_id,
+            graph_id,
+            &operator_master_key.master_keypair(),
+        )?);
+        enqueue_graph_setup_outbox_message(
+            ctx.local_db,
+            GOATMessage::new(Actor::Verifier, message_content),
+            None,
+        )
+        .await?;
 
         return Ok(());
     }
@@ -1483,26 +1589,74 @@ async fn handle_confirm_instance_operator(
     storage
         .upsert_pending_graph_init(&instance_id, &local_operator_pubkey.to_string(), &graph_id)
         .await?;
-    let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+    let message_content = GOATMessageContent::InitGraph(build_signed_init_graph(
+        instance_id,
+        graph_id,
+        &operator_master_key.master_keypair(),
+    )?);
+    enqueue_graph_setup_outbox_message(
+        ctx.local_db,
+        GOATMessage::new(Actor::Verifier, message_content),
+        None,
+    )
+    .await?;
 
     Ok(())
 }
 
 // Generate garbled circuits and enqueue GenCircuits without blocking the swarm.
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_init_graph_verifier(
-    context: &HeavyTaskContext,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<()> {
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %message.instance_id, graph_id = %message.graph_id))]
+async fn handle_init_graph_verifier(context: &HeavyTaskContext, message: InitGraph) -> Result<()> {
+    let InitGraph { instance_id, graph_id, operator_pubkey, operator_peer_id, .. } = &message;
+    if operator_peer_id != &context.from_peer_id.to_bytes() {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            from_peer_id = %context.from_peer_id,
+            "Ignore InitGraph whose signed operator peer id differs from its P2P source"
+        );
+        return Ok(());
+    }
+    if !verify_init_graph_signature(&message) {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            operator_pubkey = %operator_pubkey,
+            "Ignore InitGraph with invalid operator signature"
+        );
+        return Ok(());
+    }
+    if let Err(error) = validate_operator_stake(&context.goat_client, operator_pubkey).await {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            operator_pubkey = %operator_pubkey,
+            error = %error,
+            "Ignore InitGraph from an operator that does not meet stake requirements"
+        );
+        return Ok(());
+    }
+
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
     let verifier_pubkey = verifier_master_key.master_keypair().public_key().into();
 
-    let saved_verifier_state = load_babe_setup_state(&context.local_db, instance_id, graph_id)?
+    let saved_verifier_state = load_babe_setup_state(&context.local_db, *instance_id, *graph_id)?
         .and_then(|state| state.verifier)
         .filter(|state| state.verifier_pubkey == verifier_pubkey);
     let verifier_state = if let Some(saved) = saved_verifier_state {
+        if saved.operator_pubkey != *operator_pubkey || saved.operator_peer_id != *operator_peer_id
+        {
+            tracing::warn!(
+                instance_id = %instance_id,
+                graph_id = %graph_id,
+                expected_operator_peer = %PeerId::from_bytes(&saved.operator_peer_id)
+                    .map(|peer_id| peer_id.to_string())
+                    .unwrap_or_else(|_| "invalid".to_owned()),
+                from_peer_id = %context.from_peer_id,
+                "Ignore InitGraph with a different authenticated operator identity for an existing verifier setup"
+            );
+            return Ok(());
+        }
         saved
     } else {
         get_babe_gc_asset_paths()?;
@@ -1516,6 +1670,8 @@ async fn handle_init_graph_verifier(
         tracing::info!("Verifier setup done.");
         VerifierBabeSetupState {
             verifier_pubkey,
+            operator_pubkey: *operator_pubkey,
+            operator_peer_id: operator_peer_id.clone(),
             setup_package,
             private_state,
             finalized_indices: vec![],
@@ -1524,23 +1680,23 @@ async fn handle_init_graph_verifier(
     };
 
     let setup_package = verifier_state.setup_package.clone();
-    update_babe_setup_state(&context.local_db, instance_id, graph_id, |state| {
+    let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
+        .map(|peer_id| peer_id.to_string())
+        .context("decode operator peer id saved from InitGraph")?;
+    update_babe_setup_state(&context.local_db, *instance_id, *graph_id, |state| {
         state.verifier = Some(verifier_state);
     })?;
 
-    let gen_circuits = GenCircuits { instance_id, graph_id, verifier_pubkey, setup_package };
-    let outbox_id = format!(
-        "gen-circuits:{}:{}:{}",
-        gen_circuits.instance_id, gen_circuits.graph_id, gen_circuits.verifier_pubkey,
-    );
+    let gen_circuits = GenCircuits {
+        instance_id: *instance_id,
+        graph_id: *graph_id,
+        verifier_pubkey,
+        setup_package,
+    };
     let message = GOATMessage::new(Actor::Operator, GOATMessageContent::GenCircuits(gen_circuits));
-    let serialized = message.serialize_message().await?;
-    context
-        .local_db
-        .acquire()
-        .await?
-        .enqueue_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
-        .await?;
+    let outbox_id =
+        enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
+            .await?;
     tracing::info!(
         event = "verifier_gc_setup",
         outcome = "enqueued",
@@ -1599,12 +1755,15 @@ async fn handle_gen_circuits_operator(
 
     let mut state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?.unwrap_or_default();
     let operator_state = state.operator.get_or_insert_with(|| OperatorBabeSetupState {
-        frozen_verifier_pubkeys: None,
+        candidate_verifier_pubkeys: None,
         candidates: vec![],
+        candidate_collection_started_at: None,
+        proof_collection_started_at: None,
+        selected_verifier_pubkeys: None,
         asserted_operator_proof: None,
     });
 
-    let was_frozen = operator_state.frozen_verifier_pubkeys.is_some();
+    let was_frozen = operator_state.candidate_verifier_pubkeys.is_some();
     if let Some(existing) = operator_state
         .candidates
         .iter()
@@ -1636,49 +1795,74 @@ async fn handle_gen_circuits_operator(
 
         return Ok(());
     } else {
+        if operator_state.candidates.len()
+            >= min_required_verifier().saturating_add(get_verifier_candidate_backup_count())
+        {
+            tracing::debug!(
+                "Ignore GenCircuits for {instance_id}:{graph_id}: candidate collection reached its configured limit"
+            );
+            return Ok(());
+        }
         operator_state.candidates.push(OperatorVerifierCandidate {
             verifier_peer_id,
             verifier_pubkey: *verifier_pubkey,
             setup_package: setup_package.clone(),
-            verifier_index: None,
+            candidate_index: None,
             selected_circuit_indexes: vec![],
             gc_data: None,
             soldering_proof_ready: None,
         });
+        operator_state.candidate_collection_started_at.get_or_insert_with(current_time_secs);
     }
 
-    if operator_state.frozen_verifier_pubkeys.is_none()
-        && operator_state.candidates.len() < min_required_verifier()
-    {
-        save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
-
-        return Ok(());
+    if operator_state.candidate_verifier_pubkeys.is_none() {
+        let started_at =
+            operator_state.candidate_collection_started_at.get_or_insert_with(current_time_secs);
+        let elapsed = current_time_secs() - *started_at;
+        let window = get_verifier_candidate_collection_window_secs();
+        let reached_limit = operator_state.candidates.len()
+            >= min_required_verifier().saturating_add(get_verifier_candidate_backup_count());
+        if operator_state.candidates.len() < min_required_verifier()
+            || (!reached_limit && elapsed < window)
+        {
+            let retry_after_secs = (window - elapsed).max(1);
+            let candidate_count = operator_state.candidates.len();
+            save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+            return Err(retryable_dispatch_error(
+                RetryableDispatchReason::DependencyPending,
+                Some(retry_after_secs),
+                format!(
+                    "collecting verifier candidates: {}/{} received",
+                    candidate_count,
+                    min_required_verifier(),
+                ),
+            ));
+        }
     }
 
-    freeze_operator_candidates(operator_state)?;
-    let cut_candidates = if was_frozen {
-        operator_state
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        operator_state.candidates.clone()
-    };
+    if operator_state.candidate_verifier_pubkeys.is_none() {
+        freeze_operator_candidates(operator_state)?;
+    }
+    let cut_candidates = if was_frozen { Vec::new() } else { operator_state.candidates.clone() };
 
     save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
     for candidate in cut_candidates {
-        let message_content = GOATMessageContent::CutCircuits(CutCircuits {
-            instance_id,
-            graph_id,
-            verifier_pubkey: candidate.verifier_pubkey,
-            verifier_index: candidate.verifier_index.unwrap(),
-            selected_circuit_indexes: candidate.selected_circuit_indexes,
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+        let message = GOATMessage::new(
+            Actor::Verifier,
+            GOATMessageContent::CutCircuits(CutCircuits {
+                instance_id,
+                graph_id,
+                verifier_pubkey: candidate.verifier_pubkey,
+                candidate_index: candidate
+                    .candidate_index
+                    .expect("candidate slot assigned before CutCircuits"),
+                selected_circuit_indexes: candidate.selected_circuit_indexes,
+            }),
+        );
+        let ack_peer_id =
+            PeerId::from_bytes(&candidate.verifier_peer_id).map(|peer_id| peer_id.to_string()).ok();
+        enqueue_graph_setup_outbox_message(ctx.local_db, message, ack_peer_id.as_deref()).await?;
     }
-
     Ok(())
 }
 
@@ -1689,7 +1873,7 @@ async fn handle_cut_circuits_verifier(
     instance_id: Uuid,
     graph_id: Uuid,
     verifier_pubkey: &PublicKey,
-    verifier_index: usize,
+    candidate_index: usize,
     selected_circuit_indexes: &Vec<usize>,
 ) -> Result<()> {
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
@@ -1718,18 +1902,42 @@ async fn handle_cut_circuits_verifier(
 
         return Ok(());
     }
+    if verifier_state.operator_peer_id != context.from_peer_id.to_bytes() {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            from_peer_id = %context.from_peer_id,
+            "Ignore CutCircuits from a peer other than the operator that initiated verifier setup"
+        );
+        return Ok(());
+    }
 
     if let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() {
-        if soldering_proof_ready.verifier_index != verifier_index {
+        if soldering_proof_ready.candidate_index != candidate_index {
             bail!(
-                "CutCircuits verifier index {verifier_index} conflicts with persisted slot {}",
-                soldering_proof_ready.verifier_index
+                "CutCircuits candidate index {candidate_index} conflicts with persisted slot {}",
+                soldering_proof_ready.candidate_index
             );
         }
         if verifier_state.finalized_indices != *selected_circuit_indexes {
             bail!("CutCircuits finalized indices conflict with persisted selection");
         }
-        enqueue_soldering_proof_ready(context, soldering_proof_ready).await?;
+        let message = GOATMessage::new(
+            Actor::Operator,
+            GOATMessageContent::SolderingProofReady(soldering_proof_ready),
+        );
+        let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
+            .map(|peer_id| peer_id.to_string())
+            .context("decode operator peer id saved from InitGraph")?;
+        let outbox_id =
+            enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
+                .await?;
+        tracing::info!(
+            event = "verifier_soldering_proof",
+            outcome = "enqueued",
+            outbox_id,
+            "enqueued SolderingProofReady for swarm publication"
+        );
 
         return Ok(());
     }
@@ -1764,7 +1972,7 @@ async fn handle_cut_circuits_verifier(
     let soldering_proof_ready = save_soldering_proof_payload(
         instance_id,
         graph_id,
-        verifier_index,
+        candidate_index,
         &opened,
         &finalized,
         &soldering,
@@ -1773,42 +1981,27 @@ async fn handle_cut_circuits_verifier(
     verifier_state.finalized_indices = selected_circuit_indexes.clone();
     verifier_state.soldering_proof_ready = Some(soldering_proof_ready.clone());
 
+    let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
+        .map(|peer_id| peer_id.to_string())
+        .context("decode operator peer id saved from InitGraph")?;
     update_babe_setup_state(&context.local_db, instance_id, graph_id, |state| {
         state.verifier = Some(verifier_state);
     })?;
 
-    enqueue_soldering_proof_ready(context, soldering_proof_ready).await?;
-
-    Ok(())
-}
-
-async fn enqueue_soldering_proof_ready(
-    context: &HeavyTaskContext,
-    soldering_proof_ready: SolderingProofReady,
-) -> Result<()> {
-    let outbox_id = format!(
-        "soldering-proof-ready:{}:{}:{}",
-        soldering_proof_ready.graph_id,
-        soldering_proof_ready.verifier_index,
-        hex::encode(soldering_proof_ready.payload_hash),
-    );
     let message = GOATMessage::new(
         Actor::Operator,
         GOATMessageContent::SolderingProofReady(soldering_proof_ready),
     );
-    let serialized = message.serialize_message().await?;
-    context
-        .local_db
-        .acquire()
-        .await?
-        .enqueue_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
-        .await?;
+    let outbox_id =
+        enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
+            .await?;
     tracing::info!(
         event = "verifier_soldering_proof",
         outcome = "enqueued",
         outbox_id,
         "enqueued SolderingProofReady for swarm publication"
     );
+
     Ok(())
 }
 
@@ -1817,7 +2010,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
     context: &HeavyTaskContext,
     instance_id: Uuid,
     graph_id: Uuid,
-    verifier_index: usize,
+    candidate_index: usize,
     payload_hash: [u8; 32],
     total_len: usize,
 ) -> Result<()> {
@@ -1825,7 +2018,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
         bail!("SolderingProofReady total_len must be greater than zero");
     }
     let soldering_proof_ready =
-        SolderingProofReady { instance_id, graph_id, verifier_index, payload_hash, total_len };
+        SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len };
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
     if !pending_graph_belongs_to_operator(
@@ -1858,28 +2051,40 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
             format!("missing operator BABE setup state for pending graph {graph_id}"),
         )
     })?;
-    let frozen = operator_state.frozen_verifier_pubkeys.as_ref().ok_or_else(|| {
+    let frozen = operator_state.candidate_verifier_pubkeys.as_ref().ok_or_else(|| {
         retryable_dispatch_error(
             RetryableDispatchReason::DependencyPending,
             Some(30),
             "operator verifier membership is not frozen",
         )
     })?;
-    let verifier_pubkey = frozen.get(verifier_index).ok_or_else(|| {
-        anyhow!("SolderingProofReady verifier index {verifier_index} out of range")
+    let verifier_pubkey = frozen.get(candidate_index).ok_or_else(|| {
+        anyhow!("SolderingProofReady candidate index {candidate_index} out of range")
     })?;
     let candidate = operator_state
         .candidates
         .iter()
         .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.verifier_index != Some(verifier_index) {
+    if candidate.candidate_index != Some(candidate_index) {
         bail!("selected verifier candidate index does not match SolderingProofReady slot");
+    }
+    if operator_state.selected_verifier_pubkeys.as_ref().is_some_and(|selected| {
+        !selected.iter().any(|selected_pubkey| selected_pubkey == verifier_pubkey)
+    }) {
+        tracing::info!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            candidate_index,
+            verifier_pubkey = %verifier_pubkey,
+            "Ignore late SolderingProofReady from verifier outside the sealed graph selection"
+        );
+        return Ok(());
     }
     let verifier_peer_id = context.from_peer_id.to_bytes();
     if candidate.verifier_peer_id != verifier_peer_id {
         tracing::warn!(
-            "Ignore SolderingProofReady for {instance_id}:{graph_id}: sender {} does not own verifier slot {verifier_index}",
+            "Ignore SolderingProofReady for {instance_id}:{graph_id}: sender {} does not own verifier candidate {candidate_index}",
             context.from_peer_id
         );
         return Ok(());
@@ -1890,14 +2095,14 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        candidate_index,
         &payload_hash,
     )?;
     tracing::info!(
         from_peer_id = %context.from_peer_id,
         instance_id = %instance_id,
         graph_id = %graph_id,
-        verifier_index,
+        candidate_index,
         total_len,
         payload_hash = %soldering_payload_hash_hex(&payload_hash),
         payload_path = %payload_path,
@@ -1909,7 +2114,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
             tracing::error!(
                 instance_id = %instance_id,
                 graph_id = %graph_id,
-                verifier_index,
+                candidate_index,
                 payload_path = %payload_path,
                 error = %err,
                 "failed to read soldering proof payload from store"
@@ -1924,7 +2129,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
     tracing::info!(
         instance_id = %instance_id,
         graph_id = %graph_id,
-        verifier_index,
+        candidate_index,
         bytes = payload.len(),
         total_len,
         payload_hash = %soldering_payload_hash_hex(&payload_hash),
@@ -1941,13 +2146,13 @@ fn decode_soldering_proof_payload(
     soldering_proof_ready: &SolderingProofReady,
     payload: &[u8],
 ) -> Result<CompactSolderingProofPayload> {
-    let SolderingProofReady { instance_id, graph_id, verifier_index, payload_hash, total_len } =
+    let SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len } =
         soldering_proof_ready;
     if payload.len() != *total_len {
         tracing::warn!(
             instance_id = %instance_id,
             graph_id = %graph_id,
-            verifier_index,
+            candidate_index,
             actual_len = payload.len(),
             total_len,
             payload_hash = %soldering_payload_hash_hex(payload_hash),
@@ -1963,7 +2168,7 @@ fn decode_soldering_proof_payload(
         tracing::warn!(
             instance_id = %instance_id,
             graph_id = %graph_id,
-            verifier_index,
+            candidate_index,
             expected_hash = %soldering_payload_hash_hex(payload_hash),
             actual_hash = %soldering_payload_hash_hex(&actual_hash),
             "SolderingProof payload hash mismatch"
@@ -1983,7 +2188,7 @@ pub(crate) async fn handle_soldering_proof_payload_operator(
         event = "operator_soldering_proof",
         stage = "payload_decode",
         outcome = "started",
-        verifier_index = soldering_proof_ready.verifier_index,
+        candidate_index = soldering_proof_ready.candidate_index,
         payload_len = payload.len(),
         "decoding soldering proof payload"
     );
@@ -1992,7 +2197,7 @@ pub(crate) async fn handle_soldering_proof_payload_operator(
         event = "operator_soldering_proof",
         stage = "payload_decode",
         outcome = "completed",
-        verifier_index = soldering_proof_ready.verifier_index,
+        candidate_index = soldering_proof_ready.candidate_index,
         elapsed_ms = decode_started_at.elapsed().as_millis(),
         "decoded soldering proof payload"
     );
@@ -2008,7 +2213,7 @@ async fn handle_compact_soldering_proof_operator(
 ) -> Result<()> {
     let instance_id = soldering_proof_ready.instance_id;
     let graph_id = soldering_proof_ready.graph_id;
-    let verifier_index = soldering_proof_ready.verifier_index;
+    let candidate_index = soldering_proof_ready.candidate_index;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
     if !pending_graph_belongs_to_operator(
@@ -2041,7 +2246,7 @@ async fn handle_compact_soldering_proof_operator(
             format!("missing operator BABE setup state for pending graph {graph_id}"),
         )
     })?;
-    let frozen = operator_state.frozen_verifier_pubkeys.as_ref().ok_or_else(|| {
+    let frozen = operator_state.candidate_verifier_pubkeys.as_ref().ok_or_else(|| {
         retryable_dispatch_error(
             RetryableDispatchReason::DependencyPending,
             Some(30),
@@ -2049,15 +2254,15 @@ async fn handle_compact_soldering_proof_operator(
         )
     })?;
     let verifier_pubkey = *frozen
-        .get(verifier_index)
-        .ok_or_else(|| anyhow!("SolderingProof verifier index {verifier_index} out of range"))?;
+        .get(candidate_index)
+        .ok_or_else(|| anyhow!("SolderingProof candidate index {candidate_index} out of range"))?;
 
     let candidate = operator_state
         .candidates
         .iter()
         .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.verifier_index != Some(verifier_index) {
+    if candidate.candidate_index != Some(candidate_index) {
         bail!("selected verifier candidate index does not match SolderingProof slot");
     }
     let setup_package = candidate.setup_package.clone();
@@ -2067,7 +2272,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "payload_expand",
         outcome = "started",
-        verifier_index,
+        candidate_index,
         "expanding compact soldering proof"
     );
     let (opened, finalized, soldering) = expand_compact_soldering_proof_payload(payload)
@@ -2076,7 +2281,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "payload_expand",
         outcome = "completed",
-        verifier_index,
+        candidate_index,
         opened_instances = opened.len(),
         finalized_instances = finalized.len(),
         elapsed_ms = expand_started_at.elapsed().as_millis(),
@@ -2101,7 +2306,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "setup_verify",
         outcome = "started",
-        verifier_index,
+        candidate_index,
         opened_instances = opened.len(),
         finalized_instances = finalized.len(),
         "verifying verifier soldering proof"
@@ -2124,7 +2329,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "setup_verify",
         outcome = "completed",
-        verifier_index,
+        candidate_index,
         elapsed_ms = verification_started_at.elapsed().as_millis(),
         "verified verifier soldering proof"
     );
@@ -2132,7 +2337,7 @@ async fn handle_compact_soldering_proof_operator(
     tracing::info!(
         event = "operator_graph_creation",
         outcome = "soldering_verified",
-        verifier_index,
+        candidate_index,
         verifier_pubkey = %verifier_pubkey,
         finalized_instances = finalized.len(),
         payload_hash = %hex::encode(soldering_proof_ready.payload_hash),
@@ -2148,7 +2353,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "gc_data_extract",
         outcome = "started",
-        verifier_index,
+        candidate_index,
         "building BABE prover state and extracting GC data"
     );
     let prover_state = build_babe_prover_state(&setup_package, finalized, soldering)?;
@@ -2157,33 +2362,34 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "gc_data_extract",
         outcome = "completed",
-        verifier_index,
+        candidate_index,
         elapsed_ms = gc_data_started_at.elapsed().as_millis(),
         "extracted GC data from soldering proof"
     );
-    let Some(bitvm_gc_circuit_datas) = record_candidate_gc_data(
+    record_candidate_gc_data(
         operator_state,
         verifier_pubkey,
-        verifier_index,
+        candidate_index,
         &setup_package,
         gc_data,
         &prover_state,
         soldering_proof_ready.clone(),
-    )?
-    else {
-        let completed_slots = operator_state
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.gc_data.is_some())
-            .count();
-        let expected_slots = operator_state.candidates.len();
+    )?;
+    let completed_slots =
+        operator_state.candidates.iter().filter(|candidate| candidate.gc_data.is_some()).count();
+    let required_slots = min_required_verifier();
+    let proof_window_started_at =
+        operator_state.proof_collection_started_at.get_or_insert_with(current_time_secs);
+    let elapsed = current_time_secs() - *proof_window_started_at;
+    let collection_window = get_verifier_candidate_collection_window_secs();
+    if completed_slots < required_slots || elapsed < collection_window {
         if let Err(error) = save_babe_setup_state(&context.local_db, instance_id, graph_id, &state)
         {
             tracing::error!(
                 event = "operator_graph_creation",
                 outcome = "failed",
                 stage = "babe_state_persist",
-                verifier_index,
+                candidate_index,
                 error = %error,
                 "failed to persist incomplete operator BABE setup state"
             );
@@ -2192,19 +2398,45 @@ async fn handle_compact_soldering_proof_operator(
         tracing::info!(
             event = "operator_graph_creation",
             outcome = "waiting_for_soldering",
-            verifier_index,
+            candidate_index,
             completed_slots,
-            expected_slots,
-            "persisted verifier soldering proof; waiting for remaining graph slots"
+            required_slots,
+            retry_after_secs = (collection_window - elapsed).max(1),
+            "persisted verified soldering proof; waiting for the proof selection window"
         );
-        return Ok(());
-    };
+        return Err(retryable_dispatch_error(
+            RetryableDispatchReason::DependencyPending,
+            Some((collection_window - elapsed).max(1)),
+            format!("collecting verified soldering proofs: {completed_slots}/{required_slots}"),
+        ));
+    }
+
+    let selected_verifier_pubkeys =
+        if let Some(selected) = &operator_state.selected_verifier_pubkeys {
+            selected.clone()
+        } else {
+            let mut selected = operator_state
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.gc_data.is_some())
+                .map(|candidate| candidate.verifier_pubkey)
+                .collect::<Vec<_>>();
+            selected.sort_by_key(|candidate| candidate.to_bytes());
+            selected.truncate(required_slots);
+            selected
+        };
+    seal_selected_verifiers(operator_state, selected_verifier_pubkeys)?;
+    let bitvm_gc_circuit_datas = selected_gc_data(operator_state)?;
+    let mut obsolete_setup_outbox_ids = vec![format!("init-graph:{graph_id}")];
+    obsolete_setup_outbox_ids.extend(operator_state.candidates.iter().map(|candidate| {
+        format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
+    }));
     if let Err(error) = save_babe_setup_state(&context.local_db, instance_id, graph_id, &state) {
         tracing::error!(
             event = "operator_graph_creation",
             outcome = "failed",
             stage = "babe_state_persist",
-            verifier_index,
+            candidate_index,
             error = %error,
             "failed to persist complete operator BABE setup state"
         );
@@ -2314,6 +2546,11 @@ async fn handle_compact_soldering_proof_operator(
     storage
         .insert_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
         .await?;
+    let mut cancelled_setup_messages = 0;
+    for setup_outbox_id in obsolete_setup_outbox_ids {
+        cancelled_setup_messages +=
+            storage.cancel_p2p_outbox_message(&setup_outbox_id).await? as u64;
+    }
     drop(storage);
     tracing::info!(
         event = "operator_graph_creation",
@@ -2322,6 +2559,7 @@ async fn handle_compact_soldering_proof_operator(
         graph_nonce,
         definition_hash = %definition_hash,
         outbox_id,
+        cancelled_setup_messages,
         "enqueued CreateGraph for swarm publication"
     );
 
@@ -2426,19 +2664,12 @@ async fn handle_create_graph_verifier(
         );
         return Ok(());
     };
-    if soldering_proof_ready.verifier_index != verifier_index {
-        bail!(
-            "CreateGraph verifier index {verifier_index} conflicts with persisted slot {}",
-            soldering_proof_ready.verifier_index
-        );
-    }
-
     let store_base_path = get_soldering_proof_payload_store_path()?;
     let payload_path = soldering_proof_payload_store_path(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        soldering_proof_ready.candidate_index,
         &soldering_proof_ready.payload_hash,
     )?;
     let payload = read_soldering_proof_store_payload(&payload_path)
@@ -2478,15 +2709,25 @@ async fn handle_create_graph_verifier(
     let serialized = message.serialize_message().await?;
     let endorsement_outbox_id =
         format!("verifier-graph-params-endorsement:{graph_id}:{verifier_index}");
-    context
-        .local_db
-        .acquire()
-        .await?
+    let mut storage = context.local_db.acquire().await?;
+    storage
         .enqueue_p2p_outbox_message(
             &endorsement_outbox_id,
             message.content.event_type(),
             &serialized,
         )
+        .await?;
+    let cancelled_gen_circuits = storage
+        .cancel_p2p_outbox_message(&format!(
+            "gen-circuits:{instance_id}:{graph_id}:{local_verifier_pubkey}"
+        ))
+        .await?;
+    let cancelled_soldering_proof = storage
+        .cancel_p2p_outbox_message(&format!(
+            "soldering-proof-ready:{graph_id}:{}:{}",
+            soldering_proof_ready.candidate_index,
+            hex::encode(soldering_proof_ready.payload_hash),
+        ))
         .await?;
 
     tracing::info!(
@@ -2496,6 +2737,8 @@ async fn handle_create_graph_verifier(
         graph_id = %graph_id,
         verifier_index,
         endorsement_outbox_id,
+        cancelled_gen_circuits,
+        cancelled_soldering_proof,
         "validated CreateGraph and enqueued verifier graph params endorsement"
     );
     Ok(())
@@ -5525,21 +5768,12 @@ pub async fn broadcast_verifier_challenge_assert_tx(
         );
         return Ok(None);
     };
-    let Some(soldering_proof_ready) = saved_verifier_state.soldering_proof_ready.as_ref() else {
+    if saved_verifier_state.soldering_proof_ready.is_none() {
         if strict {
             bail!("missing soldering proof reference for {instance_id}:{graph_id}");
         }
         tracing::warn!(
             "Ignore AssertSent for {instance_id}:{graph_id}: missing soldering proof reference"
-        );
-        return Ok(None);
-    };
-    if soldering_proof_ready.verifier_index != verifier_index {
-        if strict {
-            bail!("local setup slot does not match graph owner slot for {instance_id}:{graph_id}");
-        }
-        tracing::warn!(
-            "Ignore AssertSent for {instance_id}:{graph_id}: local setup slot does not match graph owner slot"
         );
         return Ok(None);
     }
@@ -5672,11 +5906,7 @@ async fn handle_challenge_assert_sent_operator(
     let operator_state = setup_state
         .operator
         .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
-    let candidate = operator_state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.verifier_index == Some(verifier_index))
-        .ok_or_else(|| anyhow!("missing BABE prover state for verifier slot {verifier_index}"))?;
+    let candidate = selected_candidate_for_graph_index(&operator_state, verifier_index)?;
     let soldering_proof_ready = candidate.soldering_proof_ready.as_ref().ok_or_else(|| {
         anyhow!("missing soldering proof reference for verifier slot {verifier_index}")
     })?;
@@ -5685,7 +5915,7 @@ async fn handle_challenge_assert_sent_operator(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        soldering_proof_ready.candidate_index,
         &soldering_proof_ready.payload_hash,
     )?;
     let payload = read_soldering_proof_store_payload(&payload_path)
@@ -6531,6 +6761,11 @@ mod tests {
             .unwrap()
     }
 
+    fn second_verifier_pubkey() -> PublicKey {
+        PublicKey::from_str("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+            .unwrap()
+    }
+
     fn gc_submission() -> (CACSetupPackage, BitvmGcCircuitData, BabeProverState) {
         let package = build_setup_package(BABE_M_CC + 1).unwrap();
         let selected = (0..BABE_M_CC).collect::<Vec<_>>();
@@ -6552,7 +6787,7 @@ mod tests {
         SolderingProofReady {
             instance_id: Uuid::nil(),
             graph_id: Uuid::nil(),
-            verifier_index: 0,
+            candidate_index: 0,
             payload_hash: [hash_byte; 32],
             total_len: 1,
         }
@@ -6560,16 +6795,19 @@ mod tests {
 
     fn operator_state(package: CACSetupPackage) -> OperatorBabeSetupState {
         OperatorBabeSetupState {
-            frozen_verifier_pubkeys: Some(vec![verifier_pubkey()]),
+            candidate_verifier_pubkeys: Some(vec![verifier_pubkey()]),
             candidates: vec![OperatorVerifierCandidate {
                 verifier_peer_id: vec![1],
                 verifier_pubkey: verifier_pubkey(),
                 setup_package: package,
-                verifier_index: Some(0),
+                candidate_index: Some(0),
                 selected_circuit_indexes: (0..BABE_M_CC).collect(),
                 gc_data: None,
                 soldering_proof_ready: None,
             }],
+            candidate_collection_started_at: None,
+            proof_collection_started_at: None,
+            selected_verifier_pubkeys: None,
             asserted_operator_proof: None,
         }
     }
@@ -6578,16 +6816,19 @@ mod tests {
     fn freeze_operator_candidate_selects_protocol_finalized_count() {
         let package = build_setup_package(BABE_M_CC + 1).unwrap();
         let mut state = OperatorBabeSetupState {
-            frozen_verifier_pubkeys: None,
+            candidate_verifier_pubkeys: None,
             candidates: vec![OperatorVerifierCandidate {
                 verifier_peer_id: vec![1],
                 verifier_pubkey: verifier_pubkey(),
                 setup_package: package,
-                verifier_index: None,
+                candidate_index: None,
                 selected_circuit_indexes: vec![],
                 gc_data: None,
                 soldering_proof_ready: None,
             }],
+            candidate_collection_started_at: None,
+            proof_collection_started_at: None,
+            selected_verifier_pubkeys: None,
             asserted_operator_proof: None,
         };
 
@@ -6602,7 +6843,7 @@ mod tests {
         let mut state = operator_state(package.clone());
         let soldering_proof_ready = soldering_proof_ready(1);
 
-        let graph_data = record_candidate_gc_data(
+        record_candidate_gc_data(
             &mut state,
             verifier_pubkey(),
             0,
@@ -6611,17 +6852,18 @@ mod tests {
             &prover_state,
             soldering_proof_ready.clone(),
         )
-        .unwrap()
         .unwrap();
 
-        assert_eq!(graph_data.len(), 1);
-        assert_eq!(graph_data[0].final_msg_hashlocks.len(), BABE_M_CC);
+        assert_eq!(
+            state.candidates[0].gc_data.as_ref().unwrap().final_msg_hashlocks.len(),
+            BABE_M_CC
+        );
         assert_eq!(
             state.candidates[0].soldering_proof_ready.as_ref(),
             Some(&soldering_proof_ready)
         );
 
-        let duplicate = record_candidate_gc_data(
+        record_candidate_gc_data(
             &mut state,
             verifier_pubkey(),
             0,
@@ -6630,9 +6872,7 @@ mod tests {
             &prover_state,
             soldering_proof_ready.clone(),
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(duplicate.len(), 1);
 
         let mut conflict = prover_state;
         conflict.h_msgs[0][0] ^= 1;

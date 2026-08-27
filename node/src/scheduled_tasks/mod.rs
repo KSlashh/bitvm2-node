@@ -496,6 +496,7 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::GenCircuits(_) => MessageType::GenCircuits,
         GOATMessageContent::CutCircuits(_) => MessageType::CutCircuits,
         GOATMessageContent::SolderingProofReady(_) => MessageType::SolderingProof,
+        GOATMessageContent::GraphSetupAck(_) => MessageType::None,
         GOATMessageContent::VerifierGraphParamsEndorsement(_) => {
             MessageType::VerifierGraphParamsEndorsement
         }
