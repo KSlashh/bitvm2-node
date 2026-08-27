@@ -5585,33 +5585,86 @@ async fn handle_assert_sent_verifier(
     };
     validate_verifier_slot(&graph, verifier_index)?;
 
-    // check pubin first, if invalid, directly send PubinDisprove without building ChallengeAssert transaction
-    if let Ok(connector_e_input) = graph.watchtower_challenge_init.connector_e_input() {
-        let outpoint = connector_e_input.outpoint;
-        if let Some(commit_pubin_txid) =
-            outpoint_spent_txid(ctx.btc_client, &outpoint.txid, outpoint.vout as u64).await?
-            && let Some(commit_pubin_tx) = ctx.btc_client.get_tx(&commit_pubin_txid).await?
-            && let Some(commit_pubin_txin) = commit_pubin_tx.input.first()
-        {
-            let assert_txin = assert_tx
-                .input
-                .first()
-                .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
-            let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
-            let watchtower_timeout_txids = graph
-                .watchtower_challenge_timeouts
-                .iter()
-                .map(|tx| tx.tx().compute_txid())
-                .collect::<Vec<_>>();
-            let ack_txins = match collect_ack_txins(
-                ctx.btc_client,
-                &wci_txid,
-                &watchtower_timeout_txids,
+    // ChallengeAssert may only be skipped after this graph's commit-pubin is
+    // on-chain and proves consistent with the assert witness. OperatorAssert
+    // can otherwise be broadcast before connector-E is spent.
+    let connector_e_input = graph
+        .watchtower_challenge_init
+        .connector_e_input()
+        .map_err(|error| anyhow!("failed to resolve connector-E input: {error}"))?;
+    let connector_e_outpoint = connector_e_input.outpoint;
+    let Some(connector_e_spent_txid) = outpoint_spent_txid(
+        ctx.btc_client,
+        &connector_e_outpoint.txid,
+        connector_e_outpoint.vout as u64,
+    )
+    .await?
+    else {
+        let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+        let message = make_message(ctx, content);
+        push_local_unhandled_messages_with_reason(
+            ctx.local_db,
+            graph_id,
+            &message,
+            delay_secs as usize,
+            MessageDeferReason::ProtocolInputsPending,
+            "operator commit-pubin is not on chain yet",
+        )
+        .await?;
+        tracing::info!(
+            "Retry AssertSent later for {instance_id}:{graph_id}: operator commit-pubin is not on chain yet"
+        );
+        return Ok(());
+    };
+
+    let mut pubin_consistent = false;
+    if connector_e_spent_txid != graph.operator_commit_timeout.tx().compute_txid() {
+        if !ctx.btc_client.get_tx_status(&connector_e_spent_txid).await?.confirmed {
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+            let message = make_message(ctx, content);
+            push_local_unhandled_messages_with_reason(
+                ctx.local_db,
+                graph_id,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::ProtocolInputsPending,
+                "operator commit-pubin transaction is not confirmed yet",
             )
-            .await
-            {
+            .await?;
+            return Ok(());
+        }
+        let Some(commit_pubin_tx) = ctx.btc_client.get_tx(&connector_e_spent_txid).await? else {
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+            let message = make_message(ctx, content);
+            push_local_unhandled_messages_with_reason(
+                ctx.local_db,
+                graph_id,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::ProtocolInputsPending,
+                "operator commit-pubin transaction is not available yet",
+            )
+            .await?;
+            return Ok(());
+        };
+        let assert_txin = assert_tx
+            .input
+            .first()
+            .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
+        let commit_pubin_txin = commit_pubin_tx
+            .input
+            .first()
+            .ok_or_else(|| anyhow!("operator commit-pubin transaction has no input"))?;
+        let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
+        let watchtower_timeout_txids = graph
+            .watchtower_challenge_timeouts
+            .iter()
+            .map(|tx| tx.tx().compute_txid())
+            .collect::<Vec<_>>();
+        let ack_txins =
+            match collect_ack_txins(ctx.btc_client, &wci_txid, &watchtower_timeout_txids).await {
                 Ok(txins) => txins,
-                Err(e) => {
+                Err(error) => {
                     let delay_secs = avg_block_time_secs(ctx.btc_client.network());
                     let message = make_message(ctx, content);
                     push_local_unhandled_messages_with_reason(
@@ -5620,74 +5673,55 @@ async fn handle_assert_sent_verifier(
                         &message,
                         delay_secs as usize,
                         MessageDeferReason::ProtocolInputsPending,
-                        &format!("operator ACK inputs are not ready: {e}"),
+                        &format!("operator ACK inputs are not ready: {error}"),
                     )
                     .await?;
-                    tracing::info!(
-                        "Retry AssertSent later for {instance_id}:{graph_id}: ACK inputs are not ready: {e}"
-                    );
                     return Ok(());
                 }
             };
-            match validate_pubin_disprove(&graph, commit_pubin_txin, assert_txin, &ack_txins) {
-                Ok(Some((witness_data, _))) => {
-                    // PubinDisprove is not pre-signed, so fund it directly rather
-                    // than relying on CPFP.
-                    let pubin_disprove_tx_total_input_amount = graph
-                        .operator_assert
-                        .connector_d_input()
-                        .map_err(|e| anyhow!("failed to get connector-d input: {e}"))?
-                        .amount;
-                    let pubin_disprove_txin = build_pubin_disprove_txin(&graph, witness_data)?;
-                    let pubin_disprove_tx = bitcoin::Transaction {
-                        version: bitcoin::transaction::Version(2),
-                        lock_time: bitcoin::absolute::LockTime::ZERO,
-                        input: vec![pubin_disprove_txin],
-                        output: vec![
-                            goat::scripts::p2a_output(),
-                            // Keep the transaction above Bitcoin Core's minimum
-                            // non-witness relay size.
-                            bitcoin::TxOut {
-                                value: Amount::ZERO,
-                                script_pubkey: goat::scripts::generate_opreturn_script(
-                                    PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
-                                ),
-                            },
-                        ],
-                    };
-                    let verifier_keypair =
-                        VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
-                    build_sign_and_broadcast_tx(
-                        ctx.btc_client,
-                        verifier_keypair,
-                        pubin_disprove_tx.input,
-                        pubin_disprove_tx_total_input_amount,
-                        pubin_disprove_tx.output,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                Ok(None) => tracing::debug!(
-                    "PubinDisprove invalid for {instance_id}:{graph_id}: operator pubin consistent, proceeding to ChallengeAssert"
-                ),
-                Err(e) => {
-                    let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-                    let message = make_message(ctx, content);
-                    push_local_unhandled_messages_with_reason(
-                        ctx.local_db,
-                        graph_id,
-                        &message,
-                        delay_secs as usize,
-                        MessageDeferReason::ValidationRetry,
-                        &format!("PubinDisprove validation could not complete: {e}"),
-                    )
-                    .await?;
-                    tracing::warn!(
-                        "Retry AssertSent later for {instance_id}:{graph_id}: PubinDisprove check failed: {e}"
-                    );
-                    return Ok(());
-                }
+        match validate_pubin_disprove(&graph, commit_pubin_txin, assert_txin, &ack_txins) {
+            Ok(Some((witness_data, _))) => {
+                // PubinDisprove is not pre-signed, so fund it directly rather
+                // than relying on CPFP.
+                let pubin_disprove_tx_total_input_amount = graph
+                    .operator_assert
+                    .connector_d_input()
+                    .map_err(|e| anyhow!("failed to get connector-d input: {e}"))?
+                    .amount;
+                let pubin_disprove_txin = build_pubin_disprove_txin(&graph, witness_data)?;
+                let pubin_disprove_tx = bitcoin::Transaction {
+                    version: bitcoin::transaction::Version(2),
+                    lock_time: bitcoin::absolute::LockTime::ZERO,
+                    input: vec![pubin_disprove_txin],
+                    output: vec![
+                        goat::scripts::p2a_output(),
+                        // Keep the transaction above Bitcoin Core's minimum
+                        // non-witness relay size.
+                        bitcoin::TxOut {
+                            value: Amount::ZERO,
+                            script_pubkey: goat::scripts::generate_opreturn_script(
+                                PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
+                            ),
+                        },
+                    ],
+                };
+                let verifier_keypair = VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
+                build_sign_and_broadcast_tx(
+                    ctx.btc_client,
+                    verifier_keypair,
+                    pubin_disprove_tx.input,
+                    pubin_disprove_tx_total_input_amount,
+                    pubin_disprove_tx.output,
+                )
+                .await?;
+                return Ok(());
             }
+            Ok(None) => {
+                pubin_consistent = true;
+            }
+            Err(error) => tracing::warn!(
+                "PubinDisprove validation failed for {instance_id}:{graph_id}: {error}; proceeding to ChallengeAssert"
+            ),
         }
     }
 
@@ -5700,7 +5734,7 @@ async fn handle_assert_sent_verifier(
         .map_err(|e| anyhow!("failed to extract operator assert witness: {e}"))?;
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
     let static_input = derive_operator_static_input()?;
-    if assert_witness.verify_groth16_proof(&vk, &[static_input]) {
+    if pubin_consistent && assert_witness.verify_groth16_proof(&vk, &[static_input]) {
         tracing::info!(
             "Skip ChallengeAssert for {instance_id}:{graph_id}: operator assert proof is valid"
         );
@@ -6758,11 +6792,6 @@ mod tests {
 
     fn verifier_pubkey() -> PublicKey {
         PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-            .unwrap()
-    }
-
-    fn second_verifier_pubkey() -> PublicKey {
-        PublicKey::from_str("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
             .unwrap()
     }
 
