@@ -277,7 +277,7 @@ mod tests {
     use prometheus_client::registry::Registry;
     use reqwest::Client;
     use secp256k1::Secp256k1;
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
