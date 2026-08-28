@@ -880,7 +880,18 @@ async fn handle_swap_claim_events<'a>(
         let btc_addr = Address::from_script(
             bitcoin::Script::from_bytes(&claim_data.output_script),
             get_network(),
-        )?;
+        )
+        .map(|address| address.to_string())
+        .unwrap_or_else(|error| {
+            warn!(
+                escrow_hash = %escrow_hash,
+                tx_hash = %event.transaction_hash,
+                output_script = %hex::encode(&claim_data.output_script),
+                %error,
+                "swap claim output script is not a Bitcoin address; storing an empty display address"
+            );
+            String::new()
+        });
         // The claim event is authoritative: it also overrides a locally
         // derived Timeout.
         let transitioned = storage_processor
@@ -889,7 +900,7 @@ async fn handle_swap_claim_events<'a>(
                     .with_status(SwapEscrowStatus::Claim.to_string())
                     .with_claim_tx_hash(event.transaction_hash.clone())
                     .with_claim_btc_txid(claim_data.txid.into())
-                    .with_btc_addr(btc_addr.to_string())
+                    .with_btc_addr(btc_addr)
                     .with_only_if_status_in(vec![
                         SwapEscrowStatus::Initialize.to_string(),
                         SwapEscrowStatus::Timeout.to_string(),
