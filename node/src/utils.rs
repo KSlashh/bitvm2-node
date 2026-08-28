@@ -71,7 +71,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use store::localdb::{GraphQuery, GraphRuntimeUpdate, InstanceQuery, LocalDB, StorageProcessor};
+use store::localdb::{GraphQuery, GraphRuntimeUpdate, LocalDB, StorageProcessor};
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
@@ -114,7 +114,6 @@ use zkm_verifier::{
 };
 
 pub const SELF_SENDER: &str = "self";
-const BRIDGE_OUT_INSTANCE_ID_PREFIX: [u8; 4] = *b"BOID";
 const BABE_SETUP_STATE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn load_committee_instance_keypair(
@@ -130,26 +129,6 @@ pub(crate) fn load_committee_instance_keypair(
             envelope_path.display()
         )
     })
-}
-
-/// Derive the shared bridge-out instance ID from its escrow hash.
-///
-/// Both the RPC tag endpoint and the chain-event watcher must use this ID so
-/// their concurrent create attempts collide on the primary key instead of
-/// creating two rows for one escrow.
-pub(crate) fn bridge_out_instance_id_from_escrow_hash(escrow_hash: &str) -> Uuid {
-    let normalized_escrow_hash = escrow_hash
-        .strip_prefix("0x")
-        .or_else(|| escrow_hash.strip_prefix("0X"))
-        .unwrap_or(escrow_hash);
-    let mut hasher = Sha256::new();
-    hasher.update(b"bridge-out:");
-    hasher.update(normalized_escrow_hash.to_ascii_lowercase().as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[..4].copy_from_slice(&BRIDGE_OUT_INSTANCE_ID_PREFIX);
-    Uuid::from_bytes(bytes)
 }
 
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
@@ -4339,7 +4318,6 @@ pub async fn generate_instance(
 
     Ok(Instance {
         instance_id: params.instance_id,
-        is_bridge_in: true,
         network: get_network().to_string(),
         from_addr,
         to_addr: EvmAddress::from(&params.user_info.depositor_evm_address).to_string(),
@@ -4359,10 +4337,7 @@ pub async fn generate_instance(
         pegin_data_tx_hash: "".to_string(),
         btc_height: 0,
         parameters: None,
-        escrow_hash: None,
-        bridge_out_lock_time: 0,
         post_pegin_txhash: None,
-        bridge_out_amount: "0".to_string(),
         status_updated_at: params.pegin_timestamp,
         created_at: current_time,
         updated_at: current_time,
@@ -5764,21 +5739,6 @@ pub async fn check_bridge_in_uxto_available_or_self_spent(
         }
     }
     Ok(true)
-}
-
-pub(super) async fn find_instances_by_escrow_hash<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    escrow_hash: &str,
-) -> anyhow::Result<Option<Instance>> {
-    let (instances, size) = storage_processor
-        .find_instances(
-            InstanceQuery::default()
-                .with_is_bridge_in(false)
-                .with_escrow_hash(escrow_hash.to_string())
-                .with_order("escrow_hash, created_at ASC".to_string()),
-        )
-        .await?;
-    if size > 0 { Ok(Some(instances[0].clone())) } else { Ok(None) }
 }
 
 /// Computes the graph constant committed by the Operator guest and Connector D.

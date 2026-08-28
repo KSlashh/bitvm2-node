@@ -5,6 +5,7 @@ pub mod handler;
 mod node;
 mod response;
 pub mod routes;
+mod swap;
 pub(super) mod utils;
 pub mod validation;
 
@@ -12,18 +13,17 @@ use crate::env::{get_btc_url_from_env, get_goat_network, get_network, goat_confi
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::cors_config::CorsConfig;
 use crate::rpc_service::handler::{
-    bridge_in_request_tag, bridge_out_init_tag, get_chain_proof_desc, get_debug_message_details,
-    get_debug_status, get_graph, get_graph_debug_messages, get_graph_neighbor_ids, get_graph_tx,
-    get_graph_txn, get_graphs, get_instance, get_instance_debug_messages, get_instance_escrow_data,
-    get_instances, get_instances_overview, get_node, get_nodes, get_nodes_overview,
-    get_operator_proof_desc, get_ready_to_kickoff_graph, get_unsigned_pegin_txn, instance_settings,
-    pegout, send_challenge, send_verifier_challenge,
+    get_chain_proof_desc, get_debug_message_details, get_debug_status, get_graph,
+    get_graph_debug_messages, get_graph_neighbor_ids, get_graph_tx, get_graph_txn, get_graphs,
+    get_instance, get_instance_debug_messages, get_instances, get_instances_overview, get_node,
+    get_nodes, get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph, get_swap,
+    get_swaps, get_unsigned_pegin_txn, instance_settings, pegout, send_challenge,
+    send_verifier_challenge,
 };
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
-use axum::routing::put;
 use axum::{
     Router, middleware,
     routing::{get, post},
@@ -147,13 +147,12 @@ pub async fn serve_with_app_state(
         .route(routes::v1::NODES_BY_ID, get(get_node))
         .route(routes::v1::NODES_OVERVIEW, get(get_nodes_overview))
         .route(routes::v1::INSTANCES_SETTINGS, get(instance_settings))
-        .route(routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG, put(bridge_in_request_tag))
-        .route(routes::v1::INSTANCES_BRIDGE_OUT_INIT_TAG, put(bridge_out_init_tag))
         .route(routes::v1::INSTANCES_BASE, get(get_instances))
         .route(routes::v1::INSTANCES_BY_ID, get(get_instance))
         .route(routes::v1::INSTANCES_OVERVIEW, get(get_instances_overview))
         .route(routes::v1::INSTANCES_UNSIGNED_PEGIN_TXN, get(get_unsigned_pegin_txn))
-        .route(routes::v1::INSTANCES_ESCROW_DATA, get(get_instance_escrow_data))
+        .route(routes::v1::SWAPS_BASE, get(get_swaps))
+        .route(routes::v1::SWAPS_BY_ESCROW_HASH, get(get_swap))
         .route(routes::v1::GRAPHS_BY_ID, get(get_graph))
         .route(routes::v1::GRAPHS_BASE, get(get_graphs))
         .route(routes::v1::GRAPHS_READY_TO_KICKOFF, get(get_ready_to_kickoff_graph))
@@ -607,7 +606,6 @@ mod tests {
         let mut graphs = Vec::<Graph>::new();
         instances.push(Instance {
             instance_id: bridge_in_instance_id,
-            is_bridge_in: true,
             network: get_network().to_string(),
             from_addr: bridge_in_from.clone(),
             to_addr: bridge_in_to.clone(),
@@ -627,10 +625,7 @@ mod tests {
             committees_answers: Default::default(),
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
-            escrow_hash: None,
-            bridge_out_lock_time: 0,
             post_pegin_txhash: None,
-            bridge_out_amount: "0".to_string(),
             status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
@@ -638,7 +633,6 @@ mod tests {
 
         instances.push(Instance {
             instance_id: Uuid::new_v4(),
-            is_bridge_in: true,
             network: get_network().to_string(),
             from_addr: bridge_in_from.clone(),
             to_addr: bridge_in_to.clone(),
@@ -658,11 +652,8 @@ mod tests {
             committees_answers: Default::default(),
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
-            escrow_hash: None,
-            bridge_out_lock_time: 0,
             post_pegin_txhash: None,
             status_updated_at: current_time_secs(),
-            bridge_out_amount: "0".to_string(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
         });
@@ -757,8 +748,6 @@ mod tests {
         ));
         sleep(Duration::from_secs(3)).await;
 
-        let bridge_in_request_tag_id = Uuid::new_v4();
-
         let target_instance_id = bridge_in_instance_id;
         let api_test_items = vec![
             ApiTestItem {
@@ -773,32 +762,6 @@ mod tests {
                         Ok(instances_setting) if instances_setting.bridge_in_amount == BRIDGE_IN_AMOUNTS.to_vec()
                     )
                 })),
-            },
-            ApiTestItem {
-                tag: routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG.to_string(),
-                url: format!("http://{addr}{}", routes::v1::INSTANCES_BRIDGE_IN_REQUEST_TAG),
-                json_payload: Some(json!({
-                    "instance_id": bridge_in_request_tag_id,
-                    "contract_address": "0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f",
-                    "bridge_request_tx_hash":  format!("0x{}", hex::encode(generate_random_bytes(32))),
-                    "from_addr": get_rand_btc_address_p2wpkh(get_network()),
-                    "to_addr": format!("0x{}", hex::encode(generate_random_bytes(20)))
-                })),
-                method: Method::PUT,
-                expe_res: true,
-                resp_validation: None,
-            },
-            ApiTestItem {
-                tag: format!("{} for bridge in request tag", routes::v1::INSTANCES_BY_ID),
-                url: format!(
-                    "http://{addr}{}/{}",
-                    routes::v1::INSTANCES_BASE,
-                    bridge_in_request_tag_id
-                ),
-                json_payload: None,
-                method: Method::GET,
-                expe_res: true,
-                resp_validation: None,
             },
             ApiTestItem {
                 tag: routes::v1::INSTANCES_BY_ID.to_string(),
@@ -824,7 +787,7 @@ mod tests {
             ApiTestItem {
                 tag: format!("{} get instances", routes::v1::INSTANCES_BASE),
                 url: format!(
-                    "http://{addr}{}?is_bridge_in=true&from_addr={}",
+                    "http://{addr}{}?from_addr={}",
                     routes::v1::INSTANCES_BASE,
                     bridge_in_from,
                 ),

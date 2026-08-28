@@ -890,10 +890,10 @@ fn selected_gc_data(state: &OperatorBabeSetupState) -> Result<Vec<BitvmGcCircuit
         .collect()
 }
 
-fn selected_candidate_for_graph_index<'a>(
-    state: &'a OperatorBabeSetupState,
+fn selected_candidate_for_graph_index(
+    state: &OperatorBabeSetupState,
     verifier_index: usize,
-) -> Result<&'a OperatorVerifierCandidate> {
+) -> Result<&OperatorVerifierCandidate> {
     let verifier_pubkey = state
         .selected_verifier_pubkeys
         .as_ref()
