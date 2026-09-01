@@ -227,6 +227,7 @@ pub enum MessageDeferReason {
     RecoveryRepublish,
     PreviousGraphPending,
     CommitteeNoncesPending,
+    CommitteeNonceConsensusPending,
     CommitteeEndorsementsPending,
     BitcoinTransactionPending,
     BitcoinConfirmationPending,
@@ -248,6 +249,7 @@ impl MessageDeferReason {
             Self::RecoveryRepublish => "recovery_republish",
             Self::PreviousGraphPending => "previous_graph_pending",
             Self::CommitteeNoncesPending => "committee_nonces_pending",
+            Self::CommitteeNonceConsensusPending => "committee_nonce_consensus_pending",
             Self::CommitteeEndorsementsPending => "committee_endorsements_pending",
             Self::BitcoinTransactionPending => "bitcoin_transaction_pending",
             Self::BitcoinConfirmationPending => "bitcoin_confirmation_pending",
@@ -276,10 +278,12 @@ pub enum GOATMessageContent {
     GraphSetupAck(GraphSetupAck),
     VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement),
     NonceGeneration(NonceGeneration),
+    AggNonceConsensus(AggNonceConsensus),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
     GraphFinalize(GraphFinalize),
     PeginConfirmNonce(PeginConfirmNonce),
+    PeginConfirmNonceConsensus(PeginConfirmNonceConsensus),
     PeginConfirmPartialSig(PeginConfirmPartialSig),
     PostReady(PostReady),
     KickoffReady(KickoffReady),
@@ -337,10 +341,12 @@ impl GOATMessageContent {
             Self::GraphSetupAck(_) => "GraphSetupAck",
             Self::VerifierGraphParamsEndorsement(_) => "VerifierGraphParamsEndorsement",
             Self::NonceGeneration(_) => "NonceGeneration",
+            Self::AggNonceConsensus(_) => "AggNonceConsensus",
             Self::CommitteePresign(_) => "CommitteePresign",
             Self::EndorseGraph(_) => "EndorseGraph",
             Self::GraphFinalize(_) => "GraphFinalize",
             Self::PeginConfirmNonce(_) => "PeginConfirmNonce",
+            Self::PeginConfirmNonceConsensus(_) => "PeginConfirmNonceConsensus",
             Self::PeginConfirmPartialSig(_) => "PeginConfirmPartialSig",
             Self::PostReady(_) => "PostReady",
             Self::KickoffReady(_) => "KickoffReady",
@@ -382,10 +388,12 @@ impl GOATMessageContent {
             Self::SolderingProofReady(message) => Some(message.graph_id),
             Self::VerifierGraphParamsEndorsement(message) => Some(message.graph_id),
             Self::NonceGeneration(message) => Some(message.graph_id),
+            Self::AggNonceConsensus(message) => Some(message.graph_id),
             Self::CommitteePresign(message) => Some(message.graph_id),
             Self::EndorseGraph(message) => Some(message.graph_id),
             Self::GraphFinalize(message) => Some(message.graph_id),
             Self::PeginConfirmNonce(message) => Some(message.instance_id),
+            Self::PeginConfirmNonceConsensus(message) => Some(message.instance_id),
             Self::PeginConfirmPartialSig(message) => Some(message.instance_id),
             Self::PostReady(message) => Some(message.instance_id),
             _ => None,
@@ -415,10 +423,12 @@ fn is_pegin_message_type(message_type: &str) -> bool {
             | "SolderingProofReady"
             | "VerifierGraphParamsEndorsement"
             | "NonceGeneration"
+            | "AggNonceConsensus"
             | "CommitteePresign"
             | "EndorseGraph"
             | "GraphFinalize"
             | "PeginConfirmNonce"
+            | "PeginConfirmNonceConsensus"
             | "PeginConfirmPartialSig"
             | "PostReady"
     )
@@ -623,6 +633,14 @@ pub struct NonceGeneration {
     pub nonce_sigs: CommitteeNonceSignatures,
 }
 #[derive(Serialize, Deserialize, Clone)]
+pub struct AggNonceConsensus {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub committee_pubkey: PublicKey,
+    pub consensus_hash: [u8; 32],
+    pub signature: SchnorrSignature,
+}
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CommitteePresign {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
@@ -654,6 +672,13 @@ pub struct PeginConfirmNonce {
     pub committee_pubkey: PublicKey,
     pub pub_nonce: PubNonce,
     pub nonce_sig: SchnorrSignature,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PeginConfirmNonceConsensus {
+    pub instance_id: Uuid,
+    pub committee_pubkey: PublicKey,
+    pub consensus_hash: [u8; 32],
+    pub signature: SchnorrSignature,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PeginConfirmPartialSig {

@@ -4197,9 +4197,11 @@ pub fn temp_sqlite_db_path() -> String {
 
 // contract calls
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct InstanceProcessDataItem {
     pub pub_nonce: Option<PubNonce>,
+    pub agg_nonce_consensus_hash: Option<[u8; 32]>,
+    pub agg_nonce_consensus_signature: Option<SchnorrSignature>,
     pub partial_sign: Option<PartialSignature>,
     pub endorse_signature: Vec<u8>,
 }
@@ -4208,6 +4210,8 @@ pub type InstanceProcessDataMap = IndexMap<PublicKey, InstanceProcessDataItem>;
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct GraphProcessDataItem {
     pub committee_pub_nonce: Option<CommitteePubNonces>,
+    pub agg_nonce_consensus_hash: Option<[u8; 32]>,
+    pub agg_nonce_consensus_signature: Option<SchnorrSignature>,
     pub partial_sigs: Option<CommitteePartialSignatures>,
     pub committee_evm_address: Option<EvmAddress>,
     pub endorse_signature: Vec<u8>,
@@ -5072,6 +5076,75 @@ pub async fn get_committee_pub_nonces_for_graph(
         .filter_map(|(k, v)| v.committee_pub_nonce.as_ref().map(|nonce| (*k, nonce.clone())))
         .collect::<Vec<(PublicKey, CommitteePubNonces)>>())
 }
+pub async fn store_committee_agg_nonce_consensus_for_graph(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    committee_pubkey: PublicKey,
+    consensus_hash: [u8; 32],
+    signature: SchnorrSignature,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (is_endorsed, mut process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    if let Some((existing_hash, existing_signature)) = process_data
+        .get(&committee_pubkey)
+        .and_then(|item| item.agg_nonce_consensus_hash.zip(item.agg_nonce_consensus_signature))
+        && (existing_hash != consensus_hash || existing_signature != signature)
+    {
+        tracing::error!(
+            event = "committee_agg_nonce_consensus_conflict",
+            %instance_id,
+            %graph_id,
+            %committee_pubkey,
+            existing_consensus_hash = %hex::encode(existing_hash),
+            existing_signature = %existing_signature,
+            conflicting_consensus_hash = %hex::encode(consensus_hash),
+            conflicting_signature = %signature,
+            "detected conflicting committee agg nonce consensus signatures"
+        );
+        bail!(SpecialError::InvalidGraph(format!(
+            "committee agg nonce consensus changed for graph {graph_id} and committee {committee_pubkey}"
+        )));
+    }
+    process_data
+        .entry(committee_pubkey)
+        .and_modify(|item| {
+            item.agg_nonce_consensus_hash = Some(consensus_hash);
+            item.agg_nonce_consensus_signature = Some(signature);
+        })
+        .or_insert_with(|| GraphProcessDataItem {
+            agg_nonce_consensus_hash: Some(consensus_hash),
+            agg_nonce_consensus_signature: Some(signature),
+            ..Default::default()
+        });
+    upsert_pegin_graph_process_data(
+        &mut storage_processor,
+        graph_id,
+        instance_id,
+        is_endorsed,
+        &process_data,
+    )
+    .await?;
+    Ok(())
+}
+pub async fn get_committee_agg_nonce_consensus_for_graph(
+    local_db: &LocalDB,
+    _instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<Vec<(PublicKey, [u8; 32], SchnorrSignature)>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (_is_endorsed, process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    Ok(process_data
+        .iter()
+        .filter_map(|(pubkey, item)| {
+            item.agg_nonce_consensus_hash
+                .zip(item.agg_nonce_consensus_signature)
+                .map(|(consensus_hash, signature)| (*pubkey, consensus_hash, signature))
+        })
+        .collect())
+}
 pub async fn store_committee_partial_sigs_for_graph(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -5392,8 +5465,7 @@ pub async fn store_committee_pub_nonce_for_instance(
         .and_modify(|v| v.pub_nonce = Some(pub_nonce.clone()))
         .or_insert_with(|| InstanceProcessDataItem {
             pub_nonce: Some(pub_nonce),
-            partial_sign: None,
-            endorse_signature: vec![],
+            ..Default::default()
         });
     upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
     Ok(())
@@ -5420,6 +5492,66 @@ pub async fn get_committee_pub_nonces_for_instance(
         .filter_map(|(k, v)| v.pub_nonce.as_ref().map(|pub_nonce| (*k, pub_nonce.clone())))
         .collect())
 }
+pub async fn store_committee_agg_nonce_consensus_for_instance(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    committee_pubkey: PublicKey,
+    consensus_hash: [u8; 32],
+    signature: SchnorrSignature,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    let mut process_data =
+        find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    if let Some((existing_hash, existing_signature)) = process_data
+        .get(&committee_pubkey)
+        .and_then(|item| item.agg_nonce_consensus_hash.zip(item.agg_nonce_consensus_signature))
+        && (existing_hash != consensus_hash || existing_signature != signature)
+    {
+        tracing::error!(
+            event = "committee_pegin_confirm_nonce_consensus_conflict",
+            %instance_id,
+            %committee_pubkey,
+            existing_consensus_hash = %hex::encode(existing_hash),
+            existing_signature = %existing_signature,
+            conflicting_consensus_hash = %hex::encode(consensus_hash),
+            conflicting_signature = %signature,
+            "detected conflicting committee PeginConfirm nonce consensus signatures"
+        );
+        bail!(SpecialError::InvalidPeginData(format!(
+            "committee PeginConfirm nonce consensus changed for instance {instance_id} and committee {committee_pubkey}"
+        )));
+    }
+    process_data
+        .entry(committee_pubkey)
+        .and_modify(|item| {
+            item.agg_nonce_consensus_hash = Some(consensus_hash);
+            item.agg_nonce_consensus_signature = Some(signature);
+        })
+        .or_insert_with(|| InstanceProcessDataItem {
+            agg_nonce_consensus_hash: Some(consensus_hash),
+            agg_nonce_consensus_signature: Some(signature),
+            ..Default::default()
+        });
+    upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
+    Ok(())
+}
+
+pub async fn get_committee_agg_nonce_consensus_for_instance(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+) -> Result<Vec<(PublicKey, [u8; 32], SchnorrSignature)>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let process_data =
+        find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    Ok(process_data
+        .iter()
+        .filter_map(|(pubkey, item)| {
+            item.agg_nonce_consensus_hash
+                .zip(item.agg_nonce_consensus_signature)
+                .map(|(consensus_hash, signature)| (*pubkey, consensus_hash, signature))
+        })
+        .collect())
+}
 pub async fn store_committee_partial_sig_for_instance(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -5441,9 +5573,8 @@ pub async fn store_committee_partial_sig_for_instance(
         .entry(committee_pubkey)
         .and_modify(|v| v.partial_sign = Some(partial_sigs))
         .or_insert_with(|| InstanceProcessDataItem {
-            pub_nonce: None,
             partial_sign: Some(partial_sigs),
-            endorse_signature: vec![],
+            ..Default::default()
         });
     upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
     Ok(())
@@ -5495,9 +5626,8 @@ pub async fn store_committee_endorse_sig_for_pegin(
         .entry(committee_pubkey)
         .and_modify(|v| v.endorse_signature = endorse_sig.clone())
         .or_insert_with(|| InstanceProcessDataItem {
-            pub_nonce: None,
-            partial_sign: None,
             endorse_signature: endorse_sig,
+            ..Default::default()
         });
     upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
     Ok(())

@@ -1,6 +1,7 @@
 use crate::action::{
     ConfirmInstance, GOATMessage, GOATMessageContent, MessageDeferReason, PeginConfirmNonce,
-    PeginConfirmPartialSig, PeginRequest, PostReady, push_local_unhandled_messages_with_reason,
+    PeginConfirmNonceConsensus, PeginConfirmPartialSig, PeginRequest, PostReady,
+    push_local_unhandled_messages_with_reason,
 };
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_committee_instance_key_delete_timelock_blocks,
@@ -11,9 +12,9 @@ use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::event_watch_task::generate_instance_from_bridge_in_request_event;
 use crate::utils::{
     SELF_SENDER, check_bridge_in_uxto_available_or_self_spent, gen_instance_parameters_local,
-    get_committee_endorse_sigs_for_pegin, get_committee_partial_sig_for_instance,
-    get_committee_pub_nonce_for_instance, load_committee_instance_keypair,
-    store_committee_pub_nonce_for_instance, upsert_message,
+    get_committee_agg_nonce_consensus_for_instance, get_committee_endorse_sigs_for_pegin,
+    get_committee_partial_sig_for_instance, get_committee_pub_nonce_for_instance,
+    load_committee_instance_keypair, store_committee_pub_nonce_for_instance, upsert_message,
 };
 use bitvm_lib::actors::Actor;
 use bitvm_lib::keys::CommitteeMasterKey;
@@ -597,13 +598,8 @@ pub async fn pegin_confirm_recovery_monitor(
             continue;
         }
 
-        let instance_parameters_hash = instance_parameters.parameters_hash()?;
         let (_, derived_pub_nonce, nonce_sig) = committee_master_key
-            .nonce_for_instance_job_with_keypair(
-                instance_id,
-                instance_parameters_hash,
-                instance_keypair,
-            );
+            .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
         let pub_nonce = match get_committee_pub_nonce_for_instance(
             local_db,
             instance_id,
@@ -654,6 +650,37 @@ pub async fn pegin_confirm_recovery_monitor(
             instance_id = %instance_id,
             "queued persisted PeginConfirm nonce for re-publication"
         );
+        if let Some((_, consensus_hash, signature)) =
+            get_committee_agg_nonce_consensus_for_instance(local_db, instance_id)
+                .await?
+                .into_iter()
+                .find(|(pubkey, _, _)| *pubkey == local_committee_pubkey)
+        {
+            let message = GOATMessage::new(
+                Actor::Committee,
+                GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
+                    instance_id,
+                    committee_pubkey: local_committee_pubkey,
+                    consensus_hash,
+                    signature,
+                }),
+            );
+            push_local_unhandled_messages_with_reason(
+                local_db,
+                instance_id,
+                &message,
+                0,
+                MessageDeferReason::RecoveryRepublish,
+                "re-publishing persisted PeginConfirm nonce consensus",
+            )
+            .await?;
+            tracing::info!(
+                event = "pegin_confirm_recovery",
+                action = "republish_nonce_consensus",
+                instance_id = %instance_id,
+                "queued persisted PeginConfirm nonce consensus for re-publication"
+            );
+        }
     }
     Ok(())
 }
