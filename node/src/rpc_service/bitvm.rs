@@ -22,24 +22,6 @@ use strum::{Display, EnumString};
 use tracing::warn;
 use uuid::Uuid;
 
-#[allow(dead_code)]
-pub const WATCHTOWER_CHALLENGE_STEP_INIT: &str = "Watchtower Challenge init";
-#[allow(dead_code)]
-pub const WATCHTOWER_CHALLENGE_STEP_CHALLENGE: &str = "Watchtower Challenge";
-#[allow(dead_code)]
-pub const WATCHTOWER_CHALLENGE_STEP_CHALLENGE_TIMEOUT: &str = "Watchtower Challenge Timeout";
-#[allow(dead_code)]
-pub const WATCHTOWER_CHALLENGE_STEP_ACK: &str = "Operator Challenge ACK";
-#[allow(dead_code)]
-pub const WATCHTOWER_CHALLENGE_STEP_COMMIT_BLOCKHASH: &str = "Operator Commit BlockHash";
-#[allow(dead_code)]
-pub const WATCHTOWER_CHALLENGE_STEP_COMMIT_BLOCKHASH_TIMEOUT: &str =
-    "Operator Commit BlockHash Timeout";
-#[allow(dead_code)]
-pub const ASSERT_STEP_INIT: &str = "Assert init";
-#[allow(dead_code)]
-pub const ASSERT_STEP_COMMIT: &str = "Assert Commit";
-
 const BRIDGE_IN_FAIL_AS_UTXO_BEEN_SPENT: &str = "Your UTXO has already been spent.";
 // const BRIDGE_IN_FAIL_AS_NO_ENOUGH_COMMITTEES: &str = "Unfortunately, no enough committee answered.";
 const BRIDGE_IN_FAIL_AS_PRESIGNED_FAILED: &str = "Unfortunately, the presigned failed.";
