@@ -71,7 +71,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use store::localdb::{GraphQuery, GraphRuntimeUpdate, InstanceQuery, LocalDB, StorageProcessor};
+use store::localdb::{GraphQuery, GraphRuntimeUpdate, LocalDB, StorageProcessor};
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
@@ -114,7 +114,6 @@ use zkm_verifier::{
 };
 
 pub const SELF_SENDER: &str = "self";
-const BRIDGE_OUT_INSTANCE_ID_PREFIX: [u8; 4] = *b"BOID";
 const BABE_SETUP_STATE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn load_committee_instance_keypair(
@@ -130,26 +129,6 @@ pub(crate) fn load_committee_instance_keypair(
             envelope_path.display()
         )
     })
-}
-
-/// Derive the shared bridge-out instance ID from its escrow hash.
-///
-/// Both the RPC tag endpoint and the chain-event watcher must use this ID so
-/// their concurrent create attempts collide on the primary key instead of
-/// creating two rows for one escrow.
-pub(crate) fn bridge_out_instance_id_from_escrow_hash(escrow_hash: &str) -> Uuid {
-    let normalized_escrow_hash = escrow_hash
-        .strip_prefix("0x")
-        .or_else(|| escrow_hash.strip_prefix("0X"))
-        .unwrap_or(escrow_hash);
-    let mut hasher = Sha256::new();
-    hasher.update(b"bridge-out:");
-    hasher.update(normalized_escrow_hash.to_ascii_lowercase().as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[..4].copy_from_slice(&BRIDGE_OUT_INSTANCE_ID_PREFIX);
-    Uuid::from_bytes(bytes)
 }
 
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
@@ -469,29 +448,38 @@ pub async fn validate_init_graph_base(
         graph.parameters.pubin_disprove_constant,
     )?;
 
-    // 5) Operator stake sanity: verify operator is registered and has enough locked stake
-    let op_pk_bytes = graph.parameters.operator_pubkey.to_bytes();
-    let xonly: [u8; 32] = op_pk_bytes[1..33]
-        .try_into()
-        .map_err(|_| SpecialError::InvalidGraph("invalid operator pubkey".to_string()))?;
-    let operator_addr = goat_client.stake_mana_pubkey_to_address(&xonly).await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to query operator address: {e}"))
-    })?;
-    if operator_addr == [0u8; 20] {
-        bail!(SpecialError::InvalidGraph("operator not registered".to_string()));
-    }
-    let min_stake_amount = goat_client.gateway_get_min_stake_amount().await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to query min stake amount: {e}"))
-    })?;
-    let locked_stake = goat_client.stake_mana_lock_stake_of(&operator_addr).await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to query operator locked stake: {e}"))
-    })?;
-    if locked_stake < min_stake_amount {
-        bail!(SpecialError::InvalidGraph(format!(
-            "insufficient operator stake: locked={locked_stake}, min={min_stake_amount}"
-        )));
-    }
+    // 5) Operator stake sanity: verify operator is registered and has enough locked stake.
+    validate_operator_stake(goat_client, &graph.parameters.operator_pubkey)
+        .await
+        .map_err(|error| SpecialError::InvalidGraph(error.to_string()))?;
 
+    Ok(())
+}
+
+/// Verify the stake conditions required for an operator to create a graph.
+/// This mirrors the Gateway graph-posting requirement and is shared by graph
+/// validation and the early InitGraph admission check.
+pub async fn validate_operator_stake(
+    goat_client: &GOATClient,
+    operator_pubkey: &PublicKey,
+) -> Result<()> {
+    let operator_xonly_pubkey = XOnlyPublicKey::from(*operator_pubkey).serialize();
+    let operator_addr = goat_client
+        .stake_mana_pubkey_to_address(&operator_xonly_pubkey)
+        .await
+        .context("query operator address")?;
+    if operator_addr == [0; 20] {
+        bail!("operator not registered");
+    }
+    let min_stake_amount =
+        goat_client.gateway_get_min_stake_amount().await.context("query minimum operator stake")?;
+    let locked_stake = goat_client
+        .stake_mana_lock_stake_of(&operator_addr)
+        .await
+        .context("query operator locked stake")?;
+    if locked_stake < min_stake_amount {
+        bail!("insufficient operator stake: locked={locked_stake}, min={min_stake_amount}");
+    }
     Ok(())
 }
 
@@ -4209,9 +4197,11 @@ pub fn temp_sqlite_db_path() -> String {
 
 // contract calls
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct InstanceProcessDataItem {
     pub pub_nonce: Option<PubNonce>,
+    pub agg_nonce_consensus_hash: Option<[u8; 32]>,
+    pub agg_nonce_consensus_signature: Option<SchnorrSignature>,
     pub partial_sign: Option<PartialSignature>,
     pub endorse_signature: Vec<u8>,
 }
@@ -4220,6 +4210,8 @@ pub type InstanceProcessDataMap = IndexMap<PublicKey, InstanceProcessDataItem>;
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct GraphProcessDataItem {
     pub committee_pub_nonce: Option<CommitteePubNonces>,
+    pub agg_nonce_consensus_hash: Option<[u8; 32]>,
+    pub agg_nonce_consensus_signature: Option<SchnorrSignature>,
     pub partial_sigs: Option<CommitteePartialSignatures>,
     pub committee_evm_address: Option<EvmAddress>,
     pub endorse_signature: Vec<u8>,
@@ -4330,7 +4322,6 @@ pub async fn generate_instance(
 
     Ok(Instance {
         instance_id: params.instance_id,
-        is_bridge_in: true,
         network: get_network().to_string(),
         from_addr,
         to_addr: EvmAddress::from(&params.user_info.depositor_evm_address).to_string(),
@@ -4350,10 +4341,7 @@ pub async fn generate_instance(
         pegin_data_tx_hash: "".to_string(),
         btc_height: 0,
         parameters: None,
-        escrow_hash: None,
-        bridge_out_lock_time: 0,
         post_pegin_txhash: None,
-        bridge_out_amount: "0".to_string(),
         status_updated_at: params.pegin_timestamp,
         created_at: current_time,
         updated_at: current_time,
@@ -5088,6 +5076,75 @@ pub async fn get_committee_pub_nonces_for_graph(
         .filter_map(|(k, v)| v.committee_pub_nonce.as_ref().map(|nonce| (*k, nonce.clone())))
         .collect::<Vec<(PublicKey, CommitteePubNonces)>>())
 }
+pub async fn store_committee_agg_nonce_consensus_for_graph(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    committee_pubkey: PublicKey,
+    consensus_hash: [u8; 32],
+    signature: SchnorrSignature,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (is_endorsed, mut process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    if let Some((existing_hash, existing_signature)) = process_data
+        .get(&committee_pubkey)
+        .and_then(|item| item.agg_nonce_consensus_hash.zip(item.agg_nonce_consensus_signature))
+        && (existing_hash != consensus_hash || existing_signature != signature)
+    {
+        tracing::error!(
+            event = "committee_agg_nonce_consensus_conflict",
+            %instance_id,
+            %graph_id,
+            %committee_pubkey,
+            existing_consensus_hash = %hex::encode(existing_hash),
+            existing_signature = %existing_signature,
+            conflicting_consensus_hash = %hex::encode(consensus_hash),
+            conflicting_signature = %signature,
+            "detected conflicting committee agg nonce consensus signatures"
+        );
+        bail!(SpecialError::InvalidGraph(format!(
+            "committee agg nonce consensus changed for graph {graph_id} and committee {committee_pubkey}"
+        )));
+    }
+    process_data
+        .entry(committee_pubkey)
+        .and_modify(|item| {
+            item.agg_nonce_consensus_hash = Some(consensus_hash);
+            item.agg_nonce_consensus_signature = Some(signature);
+        })
+        .or_insert_with(|| GraphProcessDataItem {
+            agg_nonce_consensus_hash: Some(consensus_hash),
+            agg_nonce_consensus_signature: Some(signature),
+            ..Default::default()
+        });
+    upsert_pegin_graph_process_data(
+        &mut storage_processor,
+        graph_id,
+        instance_id,
+        is_endorsed,
+        &process_data,
+    )
+    .await?;
+    Ok(())
+}
+pub async fn get_committee_agg_nonce_consensus_for_graph(
+    local_db: &LocalDB,
+    _instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<Vec<(PublicKey, [u8; 32], SchnorrSignature)>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let (_is_endorsed, process_data) =
+        find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    Ok(process_data
+        .iter()
+        .filter_map(|(pubkey, item)| {
+            item.agg_nonce_consensus_hash
+                .zip(item.agg_nonce_consensus_signature)
+                .map(|(consensus_hash, signature)| (*pubkey, consensus_hash, signature))
+        })
+        .collect())
+}
 pub async fn store_committee_partial_sigs_for_graph(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -5408,8 +5465,7 @@ pub async fn store_committee_pub_nonce_for_instance(
         .and_modify(|v| v.pub_nonce = Some(pub_nonce.clone()))
         .or_insert_with(|| InstanceProcessDataItem {
             pub_nonce: Some(pub_nonce),
-            partial_sign: None,
-            endorse_signature: vec![],
+            ..Default::default()
         });
     upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
     Ok(())
@@ -5436,6 +5492,66 @@ pub async fn get_committee_pub_nonces_for_instance(
         .filter_map(|(k, v)| v.pub_nonce.as_ref().map(|pub_nonce| (*k, pub_nonce.clone())))
         .collect())
 }
+pub async fn store_committee_agg_nonce_consensus_for_instance(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    committee_pubkey: PublicKey,
+    consensus_hash: [u8; 32],
+    signature: SchnorrSignature,
+) -> Result<()> {
+    let mut storage_processor = local_db.acquire().await?;
+    let mut process_data =
+        find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    if let Some((existing_hash, existing_signature)) = process_data
+        .get(&committee_pubkey)
+        .and_then(|item| item.agg_nonce_consensus_hash.zip(item.agg_nonce_consensus_signature))
+        && (existing_hash != consensus_hash || existing_signature != signature)
+    {
+        tracing::error!(
+            event = "committee_pegin_confirm_nonce_consensus_conflict",
+            %instance_id,
+            %committee_pubkey,
+            existing_consensus_hash = %hex::encode(existing_hash),
+            existing_signature = %existing_signature,
+            conflicting_consensus_hash = %hex::encode(consensus_hash),
+            conflicting_signature = %signature,
+            "detected conflicting committee PeginConfirm nonce consensus signatures"
+        );
+        bail!(SpecialError::InvalidPeginData(format!(
+            "committee PeginConfirm nonce consensus changed for instance {instance_id} and committee {committee_pubkey}"
+        )));
+    }
+    process_data
+        .entry(committee_pubkey)
+        .and_modify(|item| {
+            item.agg_nonce_consensus_hash = Some(consensus_hash);
+            item.agg_nonce_consensus_signature = Some(signature);
+        })
+        .or_insert_with(|| InstanceProcessDataItem {
+            agg_nonce_consensus_hash: Some(consensus_hash),
+            agg_nonce_consensus_signature: Some(signature),
+            ..Default::default()
+        });
+    upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
+    Ok(())
+}
+
+pub async fn get_committee_agg_nonce_consensus_for_instance(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+) -> Result<Vec<(PublicKey, [u8; 32], SchnorrSignature)>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let process_data =
+        find_pegin_instance_process_data(&mut storage_processor, instance_id).await?;
+    Ok(process_data
+        .iter()
+        .filter_map(|(pubkey, item)| {
+            item.agg_nonce_consensus_hash
+                .zip(item.agg_nonce_consensus_signature)
+                .map(|(consensus_hash, signature)| (*pubkey, consensus_hash, signature))
+        })
+        .collect())
+}
 pub async fn store_committee_partial_sig_for_instance(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -5457,9 +5573,8 @@ pub async fn store_committee_partial_sig_for_instance(
         .entry(committee_pubkey)
         .and_modify(|v| v.partial_sign = Some(partial_sigs))
         .or_insert_with(|| InstanceProcessDataItem {
-            pub_nonce: None,
             partial_sign: Some(partial_sigs),
-            endorse_signature: vec![],
+            ..Default::default()
         });
     upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
     Ok(())
@@ -5511,9 +5626,8 @@ pub async fn store_committee_endorse_sig_for_pegin(
         .entry(committee_pubkey)
         .and_modify(|v| v.endorse_signature = endorse_sig.clone())
         .or_insert_with(|| InstanceProcessDataItem {
-            pub_nonce: None,
-            partial_sign: None,
             endorse_signature: endorse_sig,
+            ..Default::default()
         });
     upsert_pegin_instance_process_data(&mut storage_processor, instance_id, &process_data).await?;
     Ok(())
@@ -5757,21 +5871,6 @@ pub async fn check_bridge_in_uxto_available_or_self_spent(
     Ok(true)
 }
 
-pub(super) async fn find_instances_by_escrow_hash<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    escrow_hash: &str,
-) -> anyhow::Result<Option<Instance>> {
-    let (instances, size) = storage_processor
-        .find_instances(
-            InstanceQuery::default()
-                .with_is_bridge_in(false)
-                .with_escrow_hash(escrow_hash.to_string())
-                .with_order("escrow_hash, created_at ASC".to_string()),
-        )
-        .await?;
-    if size > 0 { Ok(Some(instances[0].clone())) } else { Ok(None) }
-}
-
 /// Computes the graph constant committed by the Operator guest and Connector D.
 pub fn get_guest_constant_value(
     graph_id: Uuid,
@@ -5902,7 +6001,7 @@ pub(crate) async fn pending_graph_belongs_to_operator(
 pub(crate) async fn save_soldering_proof_payload(
     instance_id: Uuid,
     graph_id: Uuid,
-    verifier_index: usize,
+    candidate_index: usize,
     opened: &[(usize, u64)],
     finalized: &[FinalizedInstanceData],
     soldering: &SolderingData,
@@ -5917,7 +6016,7 @@ pub(crate) async fn save_soldering_proof_payload(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        candidate_index,
         &payload_hash,
     )?;
     let store_mode = if is_soldering_proof_s3_path(&store_base_path) { "s3" } else { "local" };
@@ -5943,7 +6042,7 @@ pub(crate) async fn save_soldering_proof_payload(
         payload_path = %payload_path,
         "saved compact soldering proof to payload store"
     );
-    Ok(SolderingProofReady { instance_id, graph_id, verifier_index, payload_hash, total_len })
+    Ok(SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len })
 }
 
 fn load_babe_setup_state_from_path(path: &Path) -> Result<Option<BabeSetupState>> {
@@ -6107,7 +6206,7 @@ pub(crate) async fn cleanup_babe_setup_states(
                     payload_store,
                     instance_id,
                     graph_id,
-                    ready.verifier_index,
+                    ready.candidate_index,
                     &ready.payload_hash,
                 )?;
                 delete_soldering_proof_store_payload(&payload_path).await?;
@@ -6129,6 +6228,10 @@ pub struct BabeSetupState {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VerifierBabeSetupState {
     pub verifier_pubkey: PublicKey,
+    /// Authenticated operator identity that initiated this setup.
+    pub operator_pubkey: PublicKey,
+    /// Signed operator P2P identity used for directed setup replies and ACKs.
+    pub operator_peer_id: Vec<u8>,
     pub setup_package: CACSetupPackage,
     pub private_state: BabeVerifierPrivateState,
     pub finalized_indices: Vec<usize>,
@@ -6140,7 +6243,8 @@ pub struct OperatorVerifierCandidate {
     pub verifier_peer_id: Vec<u8>,
     pub verifier_pubkey: PublicKey,
     pub setup_package: CACSetupPackage,
-    pub verifier_index: Option<usize>,
+    /// Immutable slot within the candidate pool and proof payload store.
+    pub candidate_index: Option<usize>,
     pub selected_circuit_indexes: Vec<usize>,
     pub gc_data: Option<BitvmGcCircuitData>,
     pub soldering_proof_ready: Option<SolderingProofReady>,
@@ -6148,8 +6252,16 @@ pub struct OperatorVerifierCandidate {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OperatorBabeSetupState {
-    pub frozen_verifier_pubkeys: Option<Vec<PublicKey>>,
+    /// Candidate pool closed before CutCircuits. This is not the final graph
+    /// verifier set; `selected_verifier_pubkeys` is set after proof validation.
+    pub candidate_verifier_pubkeys: Option<Vec<PublicKey>>,
     pub candidates: Vec<OperatorVerifierCandidate>,
+    #[serde(default)]
+    pub candidate_collection_started_at: Option<i64>,
+    #[serde(default)]
+    pub proof_collection_started_at: Option<i64>,
+    #[serde(default)]
+    pub selected_verifier_pubkeys: Option<Vec<PublicKey>>,
     #[serde(default)]
     pub asserted_operator_proof: Option<Vec<u8>>,
 }

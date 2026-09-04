@@ -554,13 +554,12 @@ fn committee_pre_sign_graph(graph: &mut BitvmGcGraph, keys: &TestKeys) -> Result
 }
 
 fn committee_sign_pegin(graph: &BitvmGcGraph, keys: &TestKeys) -> Result<Transaction> {
-    let parameters_hash = graph.parameters.instance_parameters.parameters_hash()?;
     let instance_id = graph.parameters.instance_parameters.instance_id;
     let mut pub_nonces = Vec::with_capacity(keys.committee.len());
     let mut sec_nonces = Vec::with_capacity(keys.committee.len());
     for keypair in &keys.committee {
         let (sec_nonce, pub_nonce, _) = CommitteeMasterKey::new(*keypair)
-            .nonce_for_instance_job_with_keypair(instance_id, parameters_hash, *keypair);
+            .nonce_for_instance_job_with_keypair(&graph.parameters.instance_parameters, *keypair)?;
         pub_nonces.push(pub_nonce);
         sec_nonces.push(sec_nonce);
     }

@@ -707,7 +707,7 @@ flowchart TB
         IM1["instance_answers_monitor"]
         IM2["instance_window_expiration_monitor"]
         IM3["instance_btc_tx_monitor"]
-        IM4["instance_bridge_out_monitor"]
+        IM4["swap_escrow_timeout_monitor"]
         IM5["instance_committee_key_cleanup_monitor"]
     end
 
@@ -734,7 +734,7 @@ flowchart TB
 | `instance_answers_monitor` | 20s | Track committee responses |
 | `instance_window_expiration_monitor` | 20s | Handle response window timeouts |
 | `instance_btc_tx_monitor` | 20s | Track pegin/confirm/cancel BTC transaction confirmations |
-| `instance_bridge_out_monitor` | 20s | Track bridge-out deadlines and timeout transitions |
+| `swap_escrow_timeout_monitor` | 20s | Mark swap escrows past their refund deadline as timed out |
 | `instance_committee_key_cleanup_monitor` | 20s | Scan `cache/committee-instance-keys/` and delete expired key envelopes after configurable pegin-confirm timelock |
 | `spv_header_hash_update` | Periodic | Update SPV header hashes |
 
@@ -833,7 +833,8 @@ Useful test calls:
 
 ```bash
 curl http://127.0.0.1:18080/v1/nodes/overview
-curl 'http://127.0.0.1:18080/v1/instances?is_bridge_in=true'
+curl http://127.0.0.1:18080/v1/instances
+curl http://127.0.0.1:18080/v1/swaps
 curl http://127.0.0.1:18080/v1/graphs
 ```
 
@@ -914,7 +915,8 @@ Relayer nodes should:
 | `/v1/graphs/:id/tx?tx_name=cur-pre-kickoff.hex` | GET | Get specific transaction hex |
 | `/v1/graphs/ready-to-kickoff` | GET | Get graphs ready for kickoff |
 | `/bridge_in_request` | POST | Initiate Bridge-In request |
-| `/bridge_out_init` | POST | Initiate Bridge-Out request |
+| `/v1/swaps` | GET | List swap bridge-out escrows |
+| `/v1/swaps/:escrow_hash` | GET | Get swap escrow details |
 | `/challenge` | POST | Submit challenge |
 | `/metrics` | GET | Prometheus metrics |
 
