@@ -17,12 +17,12 @@ use crate::rpc_service::handler::{
     get_chain_proof_desc, get_graph, get_graph_neighbor_ids, get_graph_tx, get_graph_txn,
     get_graphs, get_instance, get_instances, get_instances_overview, get_node, get_nodes,
     get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph, get_swap, get_swaps,
-    get_unsigned_pegin_txn, instance_settings, pegout, send_challenge,
+    get_unsigned_pegin_txn, instance_settings, pegout,
 };
 #[cfg(feature = "rpc-debug-endpoints")]
 use crate::rpc_service::handler::{
     get_debug_message_details, get_debug_status, get_graph_debug_messages,
-    get_instance_debug_messages, send_verifier_challenge,
+    get_instance_debug_messages, send_challenge, send_verifier_challenge,
 };
 use anyhow::Context;
 use axum::body::Body;
@@ -172,12 +172,11 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
         .route(routes::v1::DEBUG_INSTANCE_MESSAGES, get(get_instance_debug_messages))
         .route(routes::v1::DEBUG_MESSAGE_DETAILS, get(get_debug_message_details));
 
-    let signed_routes = Router::new()
-        .route(routes::v1::GRAPHS_SEND_CHALLENGE, post(send_challenge))
-        .route(routes::v1::PEGOUT, post(pegout));
+    let signed_routes = Router::new().route(routes::v1::PEGOUT, post(pegout));
 
     #[cfg(feature = "rpc-debug-endpoints")]
     let signed_routes = signed_routes
+        .route(routes::v1::GRAPHS_SEND_CHALLENGE, post(send_challenge))
         .route(routes::v1::GRAPHS_SEND_VERIFIER_CHALLENGE, post(send_verifier_challenge));
 
     let signed_routes = signed_routes

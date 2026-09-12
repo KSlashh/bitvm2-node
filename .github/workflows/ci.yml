@@ -152,7 +152,7 @@ jobs:
         run: sudo apt update && sudo apt install protobuf-compiler
       - run: |
           source ~/.zkm-toolchain/env
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features rpc-debug-endpoints -- -D warnings
   test:
     name: Cargo Test
     needs: tla-plus
@@ -173,4 +173,4 @@ jobs:
         run: |
           set -e
           source ~/.zkm-toolchain/env
-          cargo test -r --all --all-targets
+          cargo test -r --all --all-targets --features rpc-debug-endpoints

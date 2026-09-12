@@ -47,6 +47,7 @@ pub struct InstanceSettingResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[cfg(feature = "rpc-debug-endpoints")]
 pub struct SendChallengeResponse {
     pub challenge_txid: String,
 }
