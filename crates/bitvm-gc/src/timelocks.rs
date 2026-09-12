@@ -155,6 +155,12 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         ("operator_commit", config.operator_commit),
         ("connector_f", config.connector_f),
     ] {
+        const BIP68_BLOCKS_MASK: u32 = 0x0000_ffff;
+        if value & !BIP68_BLOCKS_MASK != 0 {
+            bail!(
+                "timelock_config.{name} must use a BIP68 height-based sequence value, got {value:#010x}"
+            );
+        }
         if value < budget.reaction_blocks {
             bail!(
                 "timelock_config.{name} must be at least {} reaction blocks, got {value}",
