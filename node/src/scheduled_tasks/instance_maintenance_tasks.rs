@@ -186,8 +186,20 @@ pub async fn instance_answers_monitor(
         let mut tx = local_db.start_transaction().await?;
         if let Some(event) = event {
             if is_outside_response_window {
-                if let Some(instance) = discarded_instance {
-                    tx.upsert_instance(&instance).await?;
+                if let Some(instance) = discarded_instance
+                    && !tx.insert_instance_if_absent(&instance).await?
+                    && !tx
+                        .update_instance(
+                            &InstanceUpdate::new_with_instance_id(instance.instance_id)
+                                .with_status(InstanceBridgeInStatus::UserDiscarded.to_string())
+                                .with_only_if_status_in(vec![
+                                    InstanceBridgeInStatus::UserIniting.to_string(),
+                                    InstanceBridgeInStatus::UserInited.to_string(),
+                                ]),
+                        )
+                        .await?
+                {
+                    info!("skip stale UserDiscarded update for instance {}", instance.instance_id);
                 }
             } else {
                 upsert_message(
@@ -497,7 +509,8 @@ pub async fn instance_btc_tx_monitor(
                 update_instance(
                     &mut storage_processor,
                     &InstanceUpdate::new_with_instance_id(instance.instance_id)
-                        .with_status(InstanceBridgeInStatus::UserDiscarded.to_string()),
+                        .with_status(InstanceBridgeInStatus::UserDiscarded.to_string())
+                        .with_only_if_status_in(vec![instance.status.clone()]),
                 )
                 .await?;
             }

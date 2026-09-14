@@ -336,7 +336,7 @@ async fn seed_mock_data(
         tx.upsert_node(&node).await?;
     }
     for instance in [bridge_in_success, bridge_in_pending] {
-        tx.upsert_instance(&instance).await?;
+        tx.insert_instance_if_absent(&instance).await?;
     }
     tx.insert_swap_escrow_if_absent(&swap_escrow).await?;
     for graph in [ready_graph, challenge_graph] {

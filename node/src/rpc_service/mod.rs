@@ -786,7 +786,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let mut tx = local_db.start_transaction().await?;
         for instance in instances {
-            tx.upsert_instance(instance).await?;
+            tx.insert_instance_if_absent(instance).await?;
         }
         for graph in graphs {
             seed_graph_runtime(&mut tx, graph).await?;

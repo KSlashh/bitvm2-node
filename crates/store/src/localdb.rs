@@ -1108,65 +1108,61 @@ impl<'a> StorageProcessor<'a> {
         Ok(counts)
     }
 
-    /// Insert or update an instance
-    ///
-    /// Performs an INSERT OR REPLACE operation on the instance table.
-    /// If an instance with the same instance_id exists, it will be updated.
-    /// If no instance exists, a new one will be created.
+    /// Insert an instance only when its ID is not already present.
     ///
     /// Parameters:
-    /// - instance: The complete instance data to insert or update
+    /// - instance: The complete instance data to insert
     ///
     /// Returns:
-    /// - Ok(true) if the operation affected at least one row
-    /// - Ok(false) if no rows were affected
+    /// - Ok(true) if the instance was inserted
+    /// - Ok(false) if an instance with the same ID already exists
     /// - Err if the operation failed
-    pub async fn upsert_instance(&mut self, instance: &Instance) -> anyhow::Result<bool> {
+    pub async fn insert_instance_if_absent(&mut self, instance: &Instance) -> anyhow::Result<bool> {
         let committees_answers_json = serde_json::to_string(&instance.committees_answers)?;
-        let res = sqlx::query!(
-            "INSERT OR
-            REPLACE INTO instance (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
+        let res = sqlx::query(
+            "INSERT INTO instance (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
                         user_xonly_pubkey, user_change_addr, user_refund_addr, btc_txid, pegin_confirm_txid, pegin_cancel_txid, committees_answers,
                        pegin_data_tx_hash, btc_height, parameters, status_updated_at, post_pegin_txhash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            instance.instance_id,
-            instance.network,
-            instance.from_addr,
-            instance.to_addr,
-            instance.amount,
-            instance.fees,
-            instance.input_utxos,
-            instance.status,
-            instance.goat_tx_hash,
-            instance.goat_tx_height,
-            instance.user_xonly_pubkey,
-            instance.user_change_addr,
-            instance.user_refund_addr,
-            instance.btc_txid,
-            instance.pegin_confirm_txid,
-            instance.pegin_cancel_txid,
-            committees_answers_json,
-            instance.pegin_data_tx_hash,
-            instance.btc_height,
-            instance.parameters,
-            instance.status_updated_at,
-            instance.post_pegin_txhash,
-            instance.created_at,
-            instance.updated_at
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(instance_id) DO NOTHING",
         )
-            .execute(self.conn())
-            .await?;
+        .bind(instance.instance_id)
+        .bind(&instance.network)
+        .bind(&instance.from_addr)
+        .bind(&instance.to_addr)
+        .bind(instance.amount)
+        .bind(instance.fees)
+        .bind(&instance.input_utxos)
+        .bind(&instance.status)
+        .bind(&instance.goat_tx_hash)
+        .bind(instance.goat_tx_height)
+        .bind(instance.user_xonly_pubkey)
+        .bind(&instance.user_change_addr)
+        .bind(&instance.user_refund_addr)
+        .bind(&instance.btc_txid)
+        .bind(&instance.pegin_confirm_txid)
+        .bind(&instance.pegin_cancel_txid)
+        .bind(committees_answers_json)
+        .bind(&instance.pegin_data_tx_hash)
+        .bind(instance.btc_height)
+        .bind(&instance.parameters)
+        .bind(instance.status_updated_at)
+        .bind(&instance.post_pegin_txhash)
+        .bind(instance.created_at)
+        .bind(instance.updated_at)
+        .execute(self.conn())
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
     /// Create a bridge-in instance from a pegin request, or refresh one that
     /// has not moved past the pegin-request stage yet.
     ///
-    /// `PeginRequest` is a re-deliverable P2P message, so `upsert_instance` is
-    /// unsafe here: its `INSERT OR REPLACE` lets a replayed or forged request
-    /// roll a live instance back to its initial row and clear everything the
-    /// later stages wrote. The write is therefore a compare-and-swap over the
-    /// current status, and it only touches the columns a pegin request owns:
+    /// `PeginRequest` is a re-deliverable P2P message, so a full-row replacement
+    /// would let a replayed or forged request roll a live instance back to its
+    /// initial row and clear everything the later stages wrote. The write is
+    /// therefore a compare-and-swap over the current status, and it only touches
+    /// the columns a pegin request owns:
     /// committee answers, instance parameters and the BTC-side fields are never
     /// overwritten. The caller is responsible for passing canonical request
     /// metadata - `goat_tx_hash`/`goat_tx_height` are refreshed from it, so that
@@ -4516,7 +4512,7 @@ mod tests {
         let mut initing = pegin_instance(instance_id, "UserIniting");
         initing.to_addr = "0xuser".to_string();
         initing.from_addr = "bcrt1quser".to_string();
-        assert!(s.upsert_instance(&initing).await.unwrap());
+        assert!(s.insert_instance_if_absent(&initing).await.unwrap());
 
         let mut request = pegin_instance(instance_id, "UserInited");
         request.to_addr = "0xuser".to_string();
@@ -4553,7 +4549,7 @@ mod tests {
         inited.goat_tx_height = 500;
         inited.committees_answers = IndexMap::from([("0xcommittee".to_string(), vec![1u8, 2, 3])]);
         inited.parameters = Some("{}".to_string());
-        assert!(s.upsert_instance(&inited).await.unwrap());
+        assert!(s.insert_instance_if_absent(&inited).await.unwrap());
 
         // A re-delivered request refreshes the row in place; everything the
         // instance accrued after the request must survive it.
@@ -4578,7 +4574,7 @@ mod tests {
         minted.goat_tx_height = 500;
         minted.parameters = Some("{}".to_string());
         minted.post_pegin_txhash = Some("0xmint".to_string());
-        assert!(s.upsert_instance(&minted).await.unwrap());
+        assert!(s.insert_instance_if_absent(&minted).await.unwrap());
 
         // Once the instance moves on, a re-delivered request may not pull it back.
         let replay = pegin_instance(instance_id, "UserInited");
@@ -4593,20 +4589,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upsert_pegin_request_instance_rejects_bridge_out_collision() {
+    async fn test_upsert_pegin_request_instance_rejects_progressed_instance() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
         let instance_id = Uuid::new_v4();
 
-        let bridge_out = pegin_instance(instance_id, "Initialize");
-        assert!(s.upsert_instance(&bridge_out).await.unwrap());
+        let progressed = pegin_instance(instance_id, "CommitteesAnswered");
+        assert!(s.insert_instance_if_absent(&progressed).await.unwrap());
 
         let request = pegin_instance(instance_id, "UserInited");
         assert!(
             !s.upsert_pegin_request_instance(&request, &pegin_request_statuses()).await.unwrap()
         );
         let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
-        assert_eq!(stored.status, "Initialize");
+        assert_eq!(stored.status, "CommitteesAnswered");
     }
 
     #[tokio::test]
