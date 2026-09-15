@@ -90,6 +90,10 @@ pub trait P2pMessageHandler {
         actor: Actor,
         topic: &str,
     ) -> anyhow::Result<()>;
+
+    async fn graceful_shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -212,13 +216,20 @@ impl BitvmNetworkManager {
             select! {
                     _ = cancellation_token.cancelled() => {
                         info!("Swarm received shutdown signal");
+                        msg_handler.graceful_shutdown().await?;
                         return Ok("swarm_shutdown".to_string());
                     }
 
                     _ticker = interval.tick() => {
                         match msg_handler.handle_tick_message(&mut self.swarm, self.peer_id, actor.clone(), TickMessageType::RegularlyAction).await {
                                 Ok(_) => {}
-                                Err(e) => { tracing::error!("Fail to handle tick message {e:?}") }
+                                Err(e) => {
+                                    tracing::error!("Fail to handle tick message {e:?}");
+                                    if cancellation_token.is_cancelled() {
+                                        msg_handler.graceful_shutdown().await?;
+                                        return Err(e);
+                                    }
+                                }
                             }
                         self.refresh_required_topics_health(&actor);
 
@@ -255,7 +266,11 @@ impl BitvmNetworkManager {
                                         data_prefix,
                                         data_starts_with_goatbin,
                                         "Fail to handle p2p message"
-                                    )
+                                    );
+                                    if cancellation_token.is_cancelled() {
+                                        msg_handler.graceful_shutdown().await?;
+                                        return Err(e);
+                                    }
                             }
                         }
                         }

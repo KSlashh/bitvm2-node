@@ -1,1 +1,1 @@
-killall -9 bitvm-noded
+killall -TERM bitvm-noded

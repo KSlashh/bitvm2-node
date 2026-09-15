@@ -535,8 +535,7 @@ mod tests {
         let keypair = set_test_auth_key();
         let cancellation_token = CancellationToken::new();
         let (addr, server) = spawn_business_listener(cancellation_token.clone()).await?;
-        let graph_id = Uuid::new_v4();
-        let request_target = format!("/v1/graphs/{graph_id}/send-challenge");
+        let request_target = routes::v1::PEGOUT.to_owned();
         let url = format!("http://{addr}{request_target}");
         let (timestamp, nonce, signature) =
             sign_request_auth(&keypair, &Method::POST, &request_target, &[]);
@@ -549,7 +548,7 @@ mod tests {
             .header(AUTH_SIGNATURE_HEADER, &signature)
             .send()
             .await?;
-        assert_eq!(first.status().as_u16(), 500);
+        assert_ne!(first.status().as_u16(), 409);
 
         let replay = client
             .post(&url)

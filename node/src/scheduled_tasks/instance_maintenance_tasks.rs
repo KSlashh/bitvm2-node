@@ -1,7 +1,7 @@
 use crate::action::{
     ConfirmInstance, GOATMessage, GOATMessageContent, MessageDeferReason, PeginConfirmNonce,
     PeginConfirmNonceConsensus, PeginConfirmPartialSig, PeginRequest, PostReady,
-    push_local_unhandled_messages_with_reason,
+    RetryableDispatchError, RetryableDispatchReason, push_local_unhandled_messages_with_reason,
 };
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_committee_instance_key_delete_timelock_blocks,
@@ -65,6 +65,34 @@ fn reset_instance_page_state(task_key: &'static str) {
 fn advance_instance_page_state(task_key: &'static str, watermark: i64, last: (i64, Uuid)) {
     let mut state = INSTANCE_PAGE_STATES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     state.insert(task_key, InstancePageState { watermark, cursor: Some(last) });
+}
+
+fn finish_recovery_enqueue(
+    result: anyhow::Result<()>,
+    instance_id: Uuid,
+    action: &'static str,
+) -> anyhow::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause.downcast_ref::<RetryableDispatchError>().is_some_and(|retryable| {
+                    retryable.reason == RetryableDispatchReason::ResourceLocked
+                })
+            }) =>
+        {
+            warn!(
+                event = "pegin_confirm_recovery",
+                outcome = "resource_locked",
+                instance_id = %instance_id,
+                action,
+                error = %error,
+                "skip recovery enqueue while the local message is actively claimed"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn find_one_instance_page(
@@ -593,15 +621,21 @@ pub async fn pegin_confirm_recovery_monitor(
                     endorse_sig,
                 }),
             );
-            push_local_unhandled_messages_with_reason(
-                local_db,
+            if !finish_recovery_enqueue(
+                push_local_unhandled_messages_with_reason(
+                    local_db,
+                    instance_id,
+                    &message,
+                    0,
+                    MessageDeferReason::RecoveryRepublish,
+                    "re-publishing persisted pegin-confirm partial signature",
+                )
+                .await,
                 instance_id,
-                &message,
-                0,
-                MessageDeferReason::RecoveryRepublish,
-                "re-publishing persisted pegin-confirm partial signature",
-            )
-            .await?;
+                "republish_partial_signature",
+            )? {
+                continue;
+            }
             tracing::info!(
                 event = "pegin_confirm_recovery",
                 action = "republish_partial_signature",
@@ -648,15 +682,21 @@ pub async fn pegin_confirm_recovery_monitor(
                 nonce_sig,
             }),
         );
-        push_local_unhandled_messages_with_reason(
-            local_db,
+        if !finish_recovery_enqueue(
+            push_local_unhandled_messages_with_reason(
+                local_db,
+                instance_id,
+                &message,
+                0,
+                MessageDeferReason::RecoveryRepublish,
+                "re-publishing persisted pegin-confirm nonce",
+            )
+            .await,
             instance_id,
-            &message,
-            0,
-            MessageDeferReason::RecoveryRepublish,
-            "re-publishing persisted pegin-confirm nonce",
-        )
-        .await?;
+            "republish_nonce",
+        )? {
+            continue;
+        }
         tracing::info!(
             event = "pegin_confirm_recovery",
             action = "republish_nonce",
@@ -678,15 +718,21 @@ pub async fn pegin_confirm_recovery_monitor(
                     signature,
                 }),
             );
-            push_local_unhandled_messages_with_reason(
-                local_db,
+            if !finish_recovery_enqueue(
+                push_local_unhandled_messages_with_reason(
+                    local_db,
+                    instance_id,
+                    &message,
+                    0,
+                    MessageDeferReason::RecoveryRepublish,
+                    "re-publishing persisted PeginConfirm nonce consensus",
+                )
+                .await,
                 instance_id,
-                &message,
-                0,
-                MessageDeferReason::RecoveryRepublish,
-                "re-publishing persisted PeginConfirm nonce consensus",
-            )
-            .await?;
+                "republish_nonce_consensus",
+            )? {
+                continue;
+            }
             tracing::info!(
                 event = "pegin_confirm_recovery",
                 action = "republish_nonce_consensus",

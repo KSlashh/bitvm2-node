@@ -544,8 +544,15 @@ pub struct GraphBtcTxVoutMonitor {
 #[derive(Clone, Debug, Display, EnumString)]
 pub enum MessageState {
     Pending,
+    /// Claimed by a worker and currently being dispatched. A row left in this
+    /// state past its `lock_time_until` means the attempt never finished, which
+    /// is charged as an abandon rather than a retry.
+    Processing,
     Processed,
     Failed,
+    /// Repeated claims expired without reporting an outcome. Kept separate
+    /// from deterministic handler failures so operators can inspect/requeue it.
+    Quarantined,
     Expired,
     Cancelled,
 }
@@ -562,6 +569,14 @@ pub struct Message {
     pub message_version: i64,
     pub weight: i64,
     pub lock_time_until: i64,
+    /// Dispatch attempts that ended in a handler `Err` and were rescheduled.
+    /// Observability only; this counter never retires a message.
+    pub attempt_count: i64,
+    /// Claims whose previous attempt never reported an outcome, i.e. the worker
+    /// panicked or the process died mid-dispatch. Incremented when an expired
+    /// `Processing` lease is reclaimed.
+    pub abandon_count: i64,
+    pub last_error: Option<String>,
     pub created_at: i64,
 }
 
@@ -569,8 +584,8 @@ pub struct Message {
 ///
 /// Unlike `Message`, which is used for locally generated compensation work,
 /// this row retains the original sender and is consumed before dispatching the
-/// external message. Processed content is cleared, while failed content is
-/// retained for manual requeue and later TTL cleanup.
+/// external message. Processed/failed content is cleared; quarantined content is
+/// retained temporarily so an operator can inspect or manually requeue it.
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct P2pInboxMessage {
     pub message_id: String,
@@ -582,6 +597,8 @@ pub struct P2pInboxMessage {
     pub content_size: i64,
     pub state: String,
     pub attempt_count: i64,
+    /// Claims whose attempt never reported an outcome. See `Message::abandon_count`.
+    pub abandon_count: i64,
     pub next_retry_at: i64,
     pub lease_until: i64,
     pub lease_token: String,

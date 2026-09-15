@@ -3,7 +3,7 @@
 #![allow(clippy::collapsible_else_if)]
 
 use crate::env::{
-    get_local_node_info, get_p2p_graph_setup_retry_interval_secs,
+    MESSAGE_EXPIRE_TIME, get_local_node_info, get_p2p_graph_setup_retry_interval_secs,
     get_p2p_graph_setup_retry_window_secs, get_p2p_inbox_batch_size, get_p2p_outbox_batch_size,
 };
 use crate::handle::{
@@ -27,6 +27,7 @@ use client::{
     btc_chain::{BTCClient, BtcRpcTimeoutError},
     goat_chain::GOATClient,
 };
+use futures::FutureExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
@@ -56,6 +57,91 @@ const P2P_INBOX_LEASE_SECS: i64 = 5 * 60;
 const P2P_INBOX_LEASE_RENEW_INTERVAL_SECS: u64 = 60;
 const P2P_INBOX_ENQUEUE_ATTEMPTS: usize = 3;
 
+/// Budget for claims that never reported an outcome. Small on purpose: reaching
+/// this means the node went down mid-dispatch more than once on the same
+/// payload, which is the signature of a message that reproducibly kills it.
+const QUEUE_MAX_ABANDONS: i64 = 3;
+/// How long a claimed local message stays claimed before another tick may take
+/// it over. Heavy work is routed through the durable P2P inbox instead, so local
+/// handlers are expected to be short.
+const LOCAL_MESSAGE_LEASE_SECS: i64 = 10 * 60;
+/// Backoff applied to a local message whose handler returned a non-transient error.
+const LOCAL_MESSAGE_RETRY_DELAY_SECS: i64 = 600;
+const LOCAL_MESSAGE_BATCH_SIZE: i64 = 50;
+/// A dispatch future erased behind a box to keep the enclosing task's state
+/// machine reasonably small.
+type BoxedDispatch<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
+
+enum DispatchExecution<T> {
+    Completed(T),
+    Shutdown,
+    Panicked(String),
+}
+
+struct LocalMessageClaim {
+    message_id: String,
+    message_version: i64,
+}
+
+tokio::task_local! {
+    static ACTIVE_LOCAL_MESSAGE_CLAIM: LocalMessageClaim;
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+/// Catch only at the worker-supervisor boundary. A panic is returned separately
+/// so the caller can record an abandon and stop the node; it is never converted
+/// into an ordinary handler error or followed by more business work.
+async fn supervise_dispatch<F, T>(future: F, shutdown: &CancellationToken) -> DispatchExecution<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match std::panic::AssertUnwindSafe(async {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            result = future => Some(result),
+        }
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(Some(result)) => DispatchExecution::Completed(result),
+        Ok(None) => DispatchExecution::Shutdown,
+        Err(payload) => DispatchExecution::Panicked(panic_payload_message(payload.as_ref())),
+    }
+}
+
+/// Log a per-message bookkeeping failure without aborting the rest of the batch.
+///
+/// Propagating here used to abandon every message still claimed in the batch.
+/// Those rows stay `Processing` until their lease lapses and are then charged an
+/// abandon they never earned — so one transient storage blip could push a whole
+/// batch of healthy messages toward quarantine.
+fn log_queue_bookkeeping_failure(
+    queue: &'static str,
+    message_id: &str,
+    operation: &str,
+    error: &anyhow::Error,
+) {
+    tracing::error!(
+        event = queue,
+        outcome = "bookkeeping_failed",
+        message_id,
+        operation,
+        error = %error,
+        "failed to persist a message outcome; leaving it claimed for its lease to lapse"
+    );
+}
+
 /// Delivery semantics for externally received P2P messages.
 ///
 /// Protocol-state messages remain durable. Ephemeral messages carry
@@ -77,6 +163,17 @@ static ACTIVE_HEAVY_TASK: LazyLock<Mutex<Option<ActiveHeavyTask>>> =
 struct HeavyTaskPermit {
     message_id: String,
     lease_token: String,
+}
+
+/// Ensure a panicking background task cannot leave its detached lease renewer
+/// running forever. Once renewal stops, the durable row becomes claimable and
+/// the unfinished execution is counted as an abandon.
+struct LeaseRenewalGuard(CancellationToken);
+
+impl Drop for LeaseRenewalGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl Drop for HeavyTaskPermit {
@@ -1063,6 +1160,90 @@ fn log_stale_p2p_inbox_lease(message_id: &str, lease_token: &str, operation: &st
     );
 }
 
+async fn fail_p2p_inbox_without_aborting_batch(
+    local_db: &LocalDB,
+    message_id: &str,
+    lease_token: &str,
+    error: &str,
+) {
+    let result = async {
+        let mut storage = local_db.acquire().await?;
+        storage.fail_p2p_inbox_message(message_id, lease_token, error).await
+    }
+    .await;
+    match result {
+        Ok(true) => {}
+        Ok(false) => log_stale_p2p_inbox_lease(message_id, lease_token, "fail"),
+        Err(error) => log_queue_bookkeeping_failure("p2p_inbox", message_id, "fail", &error),
+    }
+}
+
+async fn defer_p2p_inbox_without_aborting_batch(
+    local_db: &LocalDB,
+    message_id: &str,
+    lease_token: &str,
+    next_retry_at: i64,
+    reason: &str,
+) {
+    let result = async {
+        let mut storage = local_db.acquire().await?;
+        storage.defer_p2p_inbox_message(message_id, lease_token, next_retry_at, reason).await
+    }
+    .await;
+    match result {
+        Ok(true) => {}
+        Ok(false) => log_stale_p2p_inbox_lease(message_id, lease_token, "defer"),
+        Err(error) => log_queue_bookkeeping_failure("p2p_inbox", message_id, "defer", &error),
+    }
+}
+
+async fn abandon_p2p_inbox_after_panic(
+    local_db: &LocalDB,
+    message_id: &str,
+    lease_token: &str,
+    detail: &str,
+) {
+    let error = format!("handler panicked: {detail}");
+    let result = async {
+        let mut storage = local_db.acquire().await?;
+        storage.abandon_p2p_inbox_message(message_id, lease_token, &error).await
+    }
+    .await;
+    match result {
+        Ok(true) => {}
+        Ok(false) => log_stale_p2p_inbox_lease(message_id, lease_token, "abandon"),
+        Err(error) => log_queue_bookkeeping_failure("p2p_inbox", message_id, "abandon", &error),
+    }
+}
+
+async fn abandon_local_message_after_panic(
+    local_db: &LocalDB,
+    message_id: &str,
+    message_version: i64,
+    detail: &str,
+) {
+    let error = format!("handler panicked: {detail}");
+    let result = async {
+        let mut storage = local_db.acquire().await?;
+        storage.abandon_local_message(message_id, message_version, &error).await
+    }
+    .await;
+    match result {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            event = "local_message_queue",
+            outcome = "stale_claim",
+            message_id,
+            message_version,
+            operation = "abandon",
+            "ignored local message update from a stale claim"
+        ),
+        Err(error) => {
+            log_queue_bookkeeping_failure("local_message_queue", message_id, "abandon", &error)
+        }
+    }
+}
+
 async fn renew_p2p_inbox_lease_until_cancelled(
     local_db: LocalDB,
     message_id: String,
@@ -1117,36 +1298,57 @@ async fn handle_p2p_inbox_messages(
     soldering_builder: &Option<Arc<BabeBundleBuilder>>,
     actor: Actor,
     metrics_state: &MetricsState,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let now = current_time_secs();
     let active_heavy_task_ids = active_heavy_task_message_ids();
     let mut storage = local_db.start_immediate_transaction().await?;
+    // Quarantine rows whose dispatch repeatedly failed to report any outcome.
+    // Returned retryable errors do not consume this budget.
+    let quarantined = storage.quarantine_p2p_inbox_messages(now, QUEUE_MAX_ABANDONS).await?;
+    // Bound terminal metadata and the temporary payload retained for manual
+    // inspection of quarantined rows.
+    let purged = storage.purge_terminal_p2p_inbox_messages(now - MESSAGE_EXPIRE_TIME).await?;
     let messages = storage
         .claim_p2p_inbox_messages(
             now,
             now + P2P_INBOX_LEASE_SECS,
             get_p2p_inbox_batch_size(),
+            QUEUE_MAX_ABANDONS,
             &active_heavy_task_ids,
         )
         .await?;
     storage.commit().await?;
 
+    if quarantined > 0 {
+        tracing::warn!(
+            event = "p2p_inbox",
+            outcome = "quarantined",
+            quarantined,
+            max_abandons = QUEUE_MAX_ABANDONS,
+            "quarantined inbox messages that repeatedly abandoned their lease"
+        );
+    }
+    if purged > 0 {
+        tracing::info!(
+            event = "p2p_inbox",
+            outcome = "purged",
+            purged,
+            "removed terminal inbox rows past their retention window"
+        );
+    }
+
     for message in messages {
         let from_peer_id = match PeerId::from_str(&message.from_peer) {
             Ok(peer_id) => peer_id,
             Err(error) => {
-                let updated = local_db
-                    .acquire()
-                    .await?
-                    .fail_p2p_inbox_message(
-                        &message.message_id,
-                        &message.lease_token,
-                        &format!("invalid stored source peer: {error}"),
-                    )
-                    .await?;
-                if !updated {
-                    log_stale_p2p_inbox_lease(&message.message_id, &message.lease_token, "fail");
-                }
+                fail_p2p_inbox_without_aborting_batch(
+                    local_db,
+                    &message.message_id,
+                    &message.lease_token,
+                    &format!("invalid stored source peer: {error}"),
+                )
+                .await;
                 continue;
             }
         };
@@ -1155,38 +1357,24 @@ async fn handle_p2p_inbox_messages(
             let decoded = match GOATMessage::deserialize_message(&message.content).await {
                 Ok(message) => message,
                 Err(error) => {
-                    let updated = local_db
-                        .acquire()
-                        .await?
-                        .fail_p2p_inbox_message(
-                            &message.message_id,
-                            &message.lease_token,
-                            &error.to_string(),
-                        )
-                        .await?;
-                    if !updated {
-                        log_stale_p2p_inbox_lease(
-                            &message.message_id,
-                            &message.lease_token,
-                            "fail",
-                        );
-                    }
+                    fail_p2p_inbox_without_aborting_batch(
+                        local_db,
+                        &message.message_id,
+                        &message.lease_token,
+                        &error.to_string(),
+                    )
+                    .await;
                     continue;
                 }
             };
             let Some(task) = heavy_task_from_content(decoded.content(), &actor) else {
-                let updated = local_db
-                    .acquire()
-                    .await?
-                    .fail_p2p_inbox_message(
-                        &message.message_id,
-                        &message.lease_token,
-                        &format!("inbox message type does not match {} content", message.msg_type),
-                    )
-                    .await?;
-                if !updated {
-                    log_stale_p2p_inbox_lease(&message.message_id, &message.lease_token, "fail");
-                }
+                fail_p2p_inbox_without_aborting_batch(
+                    local_db,
+                    &message.message_id,
+                    &message.lease_token,
+                    &format!("inbox message type does not match {} content", message.msg_type),
+                )
+                .await;
                 continue;
             };
             Some(task)
@@ -1208,19 +1396,14 @@ async fn handle_p2p_inbox_messages(
             let graph_id = heavy_task.graph_id();
             let Some(permit) = try_acquire_heavy_task_permit(&message_id, &lease_token) else {
                 let retry_after_secs = 5;
-                let updated = local_db
-                    .acquire()
-                    .await?
-                    .defer_p2p_inbox_message(
-                        &message_id,
-                        &lease_token,
-                        current_time_secs() + retry_after_secs,
-                        RetryableDispatchReason::ResourceLocked.code(),
-                    )
-                    .await?;
-                if !updated {
-                    log_stale_p2p_inbox_lease(&message.message_id, &message.lease_token, "defer");
-                }
+                defer_p2p_inbox_without_aborting_batch(
+                    &local_db,
+                    &message_id,
+                    &lease_token,
+                    current_time_secs() + retry_after_secs,
+                    RetryableDispatchReason::ResourceLocked.code(),
+                )
+                .await;
                 tracing::debug!(
                     event = "p2p_inbox",
                     outcome = "deferred",
@@ -1232,9 +1415,11 @@ async fn handle_p2p_inbox_messages(
                 );
                 continue;
             };
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let lease_cancellation = CancellationToken::new();
+                let _lease_guard = LeaseRenewalGuard(lease_cancellation.clone());
                 let lease_renewal = tokio::spawn(renew_p2p_inbox_lease_until_cancelled(
                     local_db.clone(),
                     message_id.clone(),
@@ -1249,7 +1434,8 @@ async fn handle_p2p_inbox_messages(
                     metrics_state: metrics_state.clone(),
                     from_peer_id,
                 };
-                let result = run_heavy_task(&context, heavy_task).await;
+                let execution =
+                    supervise_dispatch(run_heavy_task(&context, heavy_task), &shutdown).await;
                 lease_cancellation.cancel();
                 let lease_is_current = match lease_renewal.await {
                     Ok(lease_is_current) => lease_is_current,
@@ -1258,25 +1444,62 @@ async fn handle_p2p_inbox_messages(
                         false
                     }
                 };
-                if !lease_is_current {
-                    return;
-                }
-                metrics_state.record_message_dispatch(
-                    task_type,
-                    if result.is_ok() { "success" } else { "failed" },
-                );
-                if let Err(error) = finish_p2p_inbox_attempt(
-                    &local_db,
-                    &metrics_state,
-                    &message_id,
-                    &lease_token,
-                    task_type,
-                    attempt_count,
-                    result,
-                )
-                .await
-                {
-                    tracing::error!(error = %error, message_id, "failed to persist heavy task result");
+                match execution {
+                    DispatchExecution::Completed(result) => {
+                        if !lease_is_current {
+                            return;
+                        }
+                        metrics_state.record_message_dispatch(
+                            task_type,
+                            if result.is_ok() { "success" } else { "failed" },
+                        );
+                        if let Err(error) = finish_p2p_inbox_attempt(
+                            &local_db,
+                            &metrics_state,
+                            &message_id,
+                            &lease_token,
+                            task_type,
+                            attempt_count,
+                            result,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %error, message_id, "failed to persist heavy task result");
+                        }
+                    }
+                    DispatchExecution::Shutdown => {
+                        if lease_is_current {
+                            defer_p2p_inbox_without_aborting_batch(
+                                &local_db,
+                                &message_id,
+                                &lease_token,
+                                current_time_secs(),
+                                "graceful_shutdown",
+                            )
+                            .await;
+                        }
+                    }
+                    DispatchExecution::Panicked(detail) => {
+                        metrics_state.record_message_dispatch(task_type, "failed");
+                        tracing::error!(
+                            event = "heavy_task_panic",
+                            outcome = "node_shutdown",
+                            message_id,
+                            graph_id = %graph_id,
+                            message_type = task_type,
+                            task_kind,
+                            detail,
+                            "heavy task panicked; recorded an abandon and stopping the node"
+                        );
+                        abandon_p2p_inbox_after_panic(
+                            &local_db,
+                            &message_id,
+                            &lease_token,
+                            &detail,
+                        )
+                        .await;
+                        shutdown.cancel();
+                    }
                 }
             });
             tracing::info!(
@@ -1293,23 +1516,20 @@ async fn handle_p2p_inbox_messages(
         let raw_message_id = match hex::decode(&message.message_id) {
             Ok(message_id) => MessageId(message_id),
             Err(error) => {
-                let updated = local_db
-                    .acquire()
-                    .await?
-                    .fail_p2p_inbox_message(
-                        &message.message_id,
-                        &message.lease_token,
-                        &format!("invalid stored message id: {error}"),
-                    )
-                    .await?;
-                if !updated {
-                    log_stale_p2p_inbox_lease(&message.message_id, &message.lease_token, "fail");
-                }
+                fail_p2p_inbox_without_aborting_batch(
+                    local_db,
+                    &message.message_id,
+                    &message.lease_token,
+                    &format!("invalid stored message id: {error}"),
+                )
+                .await;
                 continue;
             }
         };
 
-        let result = recv_and_dispatch(
+        // Keep the deeply nested dispatch future out of the enclosing task's
+        // inline state machine.
+        let dispatch: BoxedDispatch<'_> = Box::pin(recv_and_dispatch(
             swarm,
             local_db,
             btc_client,
@@ -1321,78 +1541,56 @@ async fn handle_p2p_inbox_messages(
             raw_message_id,
             &message.content,
             metrics_state,
-        )
-        .await;
-
-        let mut storage = local_db.acquire().await?;
-        match result {
-            Ok(()) => {
-                if !storage
-                    .complete_p2p_inbox_message(&message.message_id, &message.lease_token)
-                    .await?
-                {
-                    log_stale_p2p_inbox_lease(
-                        &message.message_id,
-                        &message.lease_token,
-                        "complete",
-                    );
-                }
+        ));
+        let result = match supervise_dispatch(dispatch, shutdown).await {
+            DispatchExecution::Completed(result) => result,
+            DispatchExecution::Shutdown => {
+                defer_p2p_inbox_without_aborting_batch(
+                    local_db,
+                    &message.message_id,
+                    &message.lease_token,
+                    current_time_secs(),
+                    "graceful_shutdown",
+                )
+                .await;
+                return Ok(());
             }
-            Err(error) => {
-                let Some((reason, requested_retry_after_secs)) =
-                    p2p_retryable_dispatch_error(&error)
-                else {
-                    if !storage
-                        .fail_p2p_inbox_message(
-                            &message.message_id,
-                            &message.lease_token,
-                            &error.to_string(),
-                        )
-                        .await?
-                    {
-                        log_stale_p2p_inbox_lease(
-                            &message.message_id,
-                            &message.lease_token,
-                            "fail",
-                        );
-                    }
-                    tracing::warn!(
-                        event = "p2p_inbox",
-                        outcome = "failed",
-                        message_id = %message.message_id,
-                        message_type = %message.msg_type,
-                        attempt_count = message.attempt_count,
-                        error = %error,
-                        "cached P2P message failed permanently"
-                    );
-                    continue;
-                };
-                let retry_after_secs = requested_retry_after_secs
-                    .unwrap_or_else(|| p2p_retry_delay_secs(message.attempt_count));
-                if !storage
-                    .retry_p2p_inbox_message(
-                        &message.message_id,
-                        &message.lease_token,
-                        current_time_secs() + retry_after_secs,
-                        &error.to_string(),
-                    )
-                    .await?
-                {
-                    log_stale_p2p_inbox_lease(&message.message_id, &message.lease_token, "retry");
-                }
-                metrics_state.record_message_retry();
-                tracing::warn!(
-                    event = "p2p_inbox",
-                    outcome = "deferred",
-                    reason = reason.code(),
+            DispatchExecution::Panicked(detail) => {
+                tracing::error!(
+                    event = "p2p_dispatch_panic",
+                    outcome = "node_shutdown",
                     message_id = %message.message_id,
                     message_type = %message.msg_type,
-                    attempt_count = message.attempt_count,
-                    retry_after_secs,
-                    error = %error,
-                    "deferred cached P2P message for retry"
+                    detail,
+                    "P2P message handler panicked; recorded an abandon and stopping the node"
                 );
+                abandon_p2p_inbox_after_panic(
+                    local_db,
+                    &message.message_id,
+                    &message.lease_token,
+                    &detail,
+                )
+                .await;
+                shutdown.cancel();
+                bail!("P2P message handler panicked: {detail}");
             }
+        };
+        metrics_state.record_message_dispatch(
+            &message.msg_type,
+            if result.is_ok() { "success" } else { "failed" },
+        );
+        if let Err(error) = finish_p2p_inbox_attempt(
+            local_db,
+            metrics_state,
+            &message.message_id,
+            &message.lease_token,
+            &message.msg_type,
+            message.attempt_count,
+            result,
+        )
+        .await
+        {
+            log_queue_bookkeeping_failure("p2p_inbox", &message.message_id, "finish", &error);
         }
     }
     Ok(())
@@ -1423,6 +1621,15 @@ async fn finish_p2p_inbox_attempt(
                 {
                     log_stale_p2p_inbox_lease(message_id, lease_token, "fail");
                 }
+                tracing::warn!(
+                    event = "p2p_inbox",
+                    outcome = "failed",
+                    message_id,
+                    message_type,
+                    attempt_count,
+                    error = %error,
+                    "cached P2P message failed permanently"
+                );
                 return Ok(());
             };
             let retry_after_secs =
@@ -1554,6 +1761,7 @@ pub async fn handle_self_p2p_msg(
     id: MessageId,
     message: &[u8],
     metrics_state: &MetricsState,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     if id != GOATMessage::default_message_id() {
         tracing::warn!(
@@ -1575,42 +1783,105 @@ pub async fn handle_self_p2p_msg(
         "received local queue trigger"
     );
 
-    let messages =
-        pop_batch_local_unhandle_msg(local_db, actor.clone(), current_time_secs(), 0, 50).await?;
+    let (messages, quarantined) = claim_batch_local_msg(
+        local_db,
+        LOCAL_MESSAGE_LEASE_SECS,
+        QUEUE_MAX_ABANDONS,
+        LOCAL_MESSAGE_BATCH_SIZE,
+    )
+    .await?;
+    if quarantined > 0 {
+        tracing::warn!(
+            event = "local_message_queue",
+            outcome = "quarantined",
+            quarantined,
+            max_abandons = QUEUE_MAX_ABANDONS,
+            "retired local messages that kept failing to report an outcome"
+        );
+    }
     tracing::info!(
         event = "local_message_queue",
         outcome = "batch_loaded",
         role = %actor,
         batch_size = messages.len(),
-        "loaded pending local messages"
+        "claimed pending local messages"
     );
     for message in messages {
         let queue_wait_secs = current_time_secs().saturating_sub(message.created_at);
         let started_at = Instant::now();
-        match recv_and_dispatch(
-            swarm,
-            local_db,
-            btc_client,
-            goat_client,
-            http_client,
-            soldering_builder,
-            actor.clone(),
-            from_peer_id,
-            id.clone(),
-            &message.content,
-            metrics_state,
-        )
-        .await
-        {
+        let claim = LocalMessageClaim {
+            message_id: message.message_id.clone(),
+            message_version: message.message_version,
+        };
+        let dispatch: BoxedDispatch<'_> = Box::pin(ACTIVE_LOCAL_MESSAGE_CLAIM.scope(
+            claim,
+            recv_and_dispatch(
+                swarm,
+                local_db,
+                btc_client,
+                goat_client,
+                http_client,
+                soldering_builder,
+                actor.clone(),
+                from_peer_id,
+                id.clone(),
+                &message.content,
+                metrics_state,
+            ),
+        ));
+        let result = match supervise_dispatch(dispatch, shutdown).await {
+            DispatchExecution::Completed(result) => result,
+            DispatchExecution::Shutdown => return Ok(()),
+            DispatchExecution::Panicked(detail) => {
+                tracing::error!(
+                    event = "local_message_dispatch_panic",
+                    outcome = "node_shutdown",
+                    queued_message_id = %message.message_id,
+                    business_id = %message.business_id,
+                    message_type = %message.msg_type,
+                    detail,
+                    "local message handler panicked; recorded an abandon and stopping the node"
+                );
+                abandon_local_message_after_panic(
+                    local_db,
+                    &message.message_id,
+                    message.message_version,
+                    &detail,
+                )
+                .await;
+                shutdown.cancel();
+                bail!("local message handler panicked: {detail}");
+            }
+        };
+        match result {
             Ok(_) => {
-                let mut storage_processor = local_db.acquire().await?;
-                let state_updated = storage_processor
-                    .update_messages_state(
-                        &message.message_id,
-                        message.message_version,
-                        MessageState::Processed.to_string(),
-                    )
-                    .await?;
+                let mut storage_processor = match local_db.acquire().await {
+                    Ok(storage_processor) => storage_processor,
+                    Err(error) => {
+                        log_queue_bookkeeping_failure(
+                            "local_message_queue",
+                            &message.message_id,
+                            "acquire",
+                            &error,
+                        );
+                        continue;
+                    }
+                };
+                let state_updated = match storage_processor
+                    .complete_local_message(&message.message_id, message.message_version)
+                    .await
+                {
+                    Ok(state_updated) => state_updated,
+                    Err(error) => {
+                        log_queue_bookkeeping_failure(
+                            "local_message_queue",
+                            &message.message_id,
+                            "complete",
+                            &error,
+                        );
+                        continue;
+                    }
+                };
                 if state_updated {
                     tracing::info!(
                         event = "local_message_queue",
@@ -1624,42 +1895,63 @@ pub async fn handle_self_p2p_msg(
                         "processed local message"
                     );
                 } else {
-                    tracing::warn!(
-                        event = "local_message_queue",
-                        outcome = "state_update_conflict",
-                        role = %actor,
-                        business_id = %message.business_id,
-                        queued_message_id = %message.message_id,
-                        message_type = %message.msg_type,
-                        queue_wait_secs,
-                        elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "local message handler completed but its processed state was not persisted"
-                    );
+                    let current_state = storage_processor
+                        .find_messages_by_id(&message.message_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|message| message.state);
+                    if current_state.as_deref() == Some("Pending") {
+                        tracing::debug!(
+                            event = "local_message_queue",
+                            outcome = "self_deferred",
+                            role = %actor,
+                            business_id = %message.business_id,
+                            queued_message_id = %message.message_id,
+                            message_type = %message.msg_type,
+                            queue_wait_secs,
+                            elapsed_ms = started_at.elapsed().as_millis() as u64,
+                            "local message handler rescheduled its own queue entry"
+                        );
+                    } else {
+                        tracing::warn!(
+                            event = "local_message_queue",
+                            outcome = "state_update_conflict",
+                            role = %actor,
+                            business_id = %message.business_id,
+                            queued_message_id = %message.message_id,
+                            message_type = %message.msg_type,
+                            current_state = ?current_state,
+                            queue_wait_secs,
+                            elapsed_ms = started_at.elapsed().as_millis() as u64,
+                            "local message handler completed but its processed state was not persisted"
+                        );
+                    }
                 }
             }
             Err(err) => {
-                let lock_time: i64 = if is_retryable_sqlite_error(&err)
-                    && is_pegin_message_type(&message.msg_type)
-                {
-                    TRANSIENT_PEGIN_RETRY_DELAY_SECS as i64
-                } else {
-                    600
+                let is_transient = is_retryable_sqlite_error(&err);
+                let requested_retry_delay =
+                    p2p_retryable_dispatch_error(&err).and_then(|(_, delay)| delay);
+                let lock_time: i64 = requested_retry_delay.unwrap_or_else(|| {
+                    if is_transient && is_pegin_message_type(&message.msg_type) {
+                        TRANSIENT_PEGIN_RETRY_DELAY_SECS as i64
+                    } else {
+                        LOCAL_MESSAGE_RETRY_DELAY_SECS
+                    }
+                });
+                let mut storage_processor = match local_db.acquire().await {
+                    Ok(storage_processor) => storage_processor,
+                    Err(error) => {
+                        log_queue_bookkeeping_failure(
+                            "local_message_queue",
+                            &message.message_id,
+                            "acquire",
+                            &error,
+                        );
+                        continue;
+                    }
                 };
-                metrics_state.record_message_retry();
-                tracing::warn!(
-                    event = "local_message_queue",
-                    outcome = "deferred",
-                    role = %actor,
-                    business_id = %message.business_id,
-                    queued_message_id = %message.message_id,
-                    message_type = %message.msg_type,
-                    retry_after_secs = lock_time,
-                    queue_wait_secs,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    error = %err,
-                    "failed to process local message; deferred for retry"
-                );
-                let mut storage_processor = local_db.acquire().await?;
                 if let Err(reason_error) = storage_processor
                     .upsert_message_debug_reason(
                         &message.message_id,
@@ -1676,18 +1968,61 @@ pub async fn handle_self_p2p_msg(
                         "failed to persist local message debug reason"
                     );
                 }
-                storage_processor
-                    .update_messages_lock_time_until(
+                let deferred = storage_processor
+                    .defer_local_message(
                         &message.message_id,
                         message.message_version,
                         current_time_secs() + lock_time,
+                        &err.to_string(),
                     )
-                    .await?;
+                    .await;
+                match deferred {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            event = "local_message_queue",
+                            outcome = "stale_claim",
+                            queued_message_id = %message.message_id,
+                            message_version = message.message_version,
+                            operation = "defer",
+                            "ignored local message update from a stale claim"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log_queue_bookkeeping_failure(
+                            "local_message_queue",
+                            &message.message_id,
+                            "defer",
+                            &error,
+                        );
+                        continue;
+                    }
+                }
+                metrics_state.record_message_retry();
+                tracing::warn!(
+                    event = "local_message_queue",
+                    outcome = "deferred",
+                    role = %actor,
+                    business_id = %message.business_id,
+                    queued_message_id = %message.message_id,
+                    message_type = %message.msg_type,
+                    retry_after_secs = lock_time,
+                    attempt_count = message.attempt_count + 1,
+                    queue_wait_secs,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %err,
+                    "failed to process local message; deferred for retry"
+                );
             }
         }
     }
-    handle_p2p_outbox_messages(swarm, local_db).await?;
-    handle_p2p_inbox_messages(
+    // The three queues share a tick but must not share a failure: propagating
+    // here would let one stalled queue starve the other two every tick.
+    if let Err(error) = handle_p2p_outbox_messages(swarm, local_db).await {
+        tracing::error!(error = %error, "failed to drain the durable P2P outbox");
+    }
+    if let Err(error) = handle_p2p_inbox_messages(
         swarm,
         local_db,
         btc_client,
@@ -1696,8 +2031,15 @@ pub async fn handle_self_p2p_msg(
         soldering_builder,
         actor,
         metrics_state,
+        shutdown,
     )
-    .await?;
+    .await
+    {
+        tracing::error!(error = %error, "failed to drain the durable P2P inbox");
+        if shutdown.is_cancelled() {
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -1936,36 +2278,83 @@ pub async fn push_local_unhandled_messages_with_reason(
     reason: MessageDeferReason,
     reason_detail: &str,
 ) -> Result<()> {
-    let mut storage_processor = local_db.acquire().await?;
+    let mut storage_processor = local_db.start_immediate_transaction().await?;
     let actor = message.actor.clone();
     let content: GOATMessageContent = message.content().clone();
-    upsert_message(
-        &mut storage_processor,
-        true,
-        business_id,
-        None,
-        SELF_SENDER.to_string(),
-        actor,
-        content,
-        0,
-        delay_secs as i64,
-    )
-    .await?;
-    let persist_result = match storage_processor
-        .find_message_by_business_id(&business_id, message.content.event_type())
-        .await
+    let message_type = message.content.event_type();
+    let target_message_id = generate_message_id(business_id, message_type.to_owned(), None);
+    let active_claim = ACTIVE_LOCAL_MESSAGE_CLAIM
+        .try_with(|claim| (claim.message_id.clone(), claim.message_version))
+        .ok();
+    let claimed_message = if let Some((message_id, _)) = active_claim.as_ref() {
+        storage_processor.find_messages_by_id(message_id).await?
+    } else {
+        None
+    };
+    let owns_requeued_message = claimed_message.as_ref().is_some_and(|existing| {
+        active_claim.as_ref().is_some_and(|(message_id, message_version)| {
+            existing.message_id == message_id.as_str()
+                && existing.message_version == *message_version
+                && existing.business_id == business_id
+                && existing.msg_type == message_type
+        })
+    });
+    let self_deferred = if let Some(existing) = claimed_message.as_ref()
+        && existing.state == MessageState::Processing.to_string()
+        && owns_requeued_message
     {
-        Ok(Some(queued_message)) => {
+        storage_processor
+            .defer_local_message(
+                &existing.message_id,
+                existing.message_version,
+                current_time_secs() + delay_secs as i64,
+                reason_detail,
+            )
+            .await?
+    } else {
+        false
+    };
+    if !self_deferred {
+        let upserted = upsert_message(
+            &mut storage_processor,
+            true,
+            business_id,
+            None,
+            SELF_SENDER.to_string(),
+            actor,
+            content,
+            0,
+            delay_secs as i64,
+        )
+        .await?;
+        if !upserted {
+            let current = storage_processor.find_messages_by_id(&target_message_id).await?;
+            if current
+                .as_ref()
+                .is_some_and(|message| message.state == MessageState::Processing.to_string())
+            {
+                return Err(retryable_dispatch_error(
+                    RetryableDispatchReason::ResourceLocked,
+                    Some(delay_secs.max(1) as i64),
+                    format!(
+                        "local message {business_id}:{message_type} is owned by another active claim"
+                    ),
+                ));
+            }
+        }
+    }
+    let queued_message_id = if self_deferred {
+        claimed_message.as_ref().map(|message| message.message_id.as_str())
+    } else {
+        Some(target_message_id.as_str())
+    };
+    let persist_result = match queued_message_id {
+        Some(message_id) => {
             storage_processor
-                .upsert_message_debug_reason(
-                    &queued_message.message_id,
-                    reason.code(),
-                    reason_detail,
-                )
+                .upsert_message_debug_reason(message_id, reason.code(), reason_detail)
                 .await
         }
-        Ok(None) => Ok(()),
-        Err(error) => Err(error),
+        None => Ok(()),
     };
     if let Err(error) = persist_result {
         tracing::warn!(
@@ -1975,6 +2364,7 @@ pub async fn push_local_unhandled_messages_with_reason(
             "failed to persist local message defer reason"
         );
     }
+    storage_processor.commit().await?;
     if delay_secs > 0
         && let Some(metrics_state) = crate::metrics_service::node_metrics_state()
     {
@@ -2092,5 +2482,162 @@ mod tests {
         assert!(!object.contains_key("payload"));
         assert!(!object.contains_key("setup_package"));
         assert!(!object.contains_key("verifier_pubkey"));
+    }
+
+    #[tokio::test]
+    async fn genuine_transient_errors_are_still_retryable() {
+        let error = anyhow!("database is locked");
+        assert!(
+            p2p_retryable_dispatch_error(&error).is_some(),
+            "a real SQLite-busy error must remain retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_supervisor_distinguishes_shutdown_and_panic() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(matches!(
+            supervise_dispatch(std::future::pending::<()>(), &shutdown).await,
+            DispatchExecution::Shutdown
+        ));
+
+        let running = CancellationToken::new();
+        let result = supervise_dispatch(
+            async {
+                panic!("poison message");
+            },
+            &running,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            DispatchExecution::Panicked(detail) if detail == "poison message"
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_owner_requeue_reports_processing_conflict() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let business_id = Uuid::new_v4();
+        let message = GOATMessage::new(Actor::Operator, GOATMessageContent::Tick);
+        push_local_unhandled_messages_with_reason(
+            &local_db,
+            business_id,
+            &message,
+            0,
+            MessageDeferReason::HandlerError,
+            "initial",
+        )
+        .await
+        .unwrap();
+
+        let claimed = {
+            let mut storage = local_db.acquire().await.unwrap();
+            storage
+                .claim_local_messages(
+                    current_time_secs() + 1,
+                    current_time_secs() + 300,
+                    0,
+                    1,
+                    QUEUE_MAX_ABANDONS,
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(claimed.len(), 1);
+
+        let error = push_local_unhandled_messages_with_reason(
+            &local_db,
+            business_id,
+            &message,
+            30,
+            MessageDeferReason::HandlerError,
+            "retry",
+        )
+        .await
+        .unwrap_err();
+        let retryable = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<RetryableDispatchError>())
+            .expect("Processing conflict must be retryable");
+        assert_eq!(retryable.reason, RetryableDispatchReason::ResourceLocked);
+        assert_eq!(retryable.retry_after_secs, Some(30));
+
+        let mut storage = local_db.acquire().await.unwrap();
+        let stored = storage.find_messages_by_id(&claimed[0].message_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, MessageState::Processing.to_string());
+        assert_eq!(stored.message_version, claimed[0].message_version);
+    }
+
+    #[tokio::test]
+    async fn owner_requeue_uses_exact_subtyped_message_id() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let business_id = Uuid::new_v4();
+        let message = GOATMessage::new(Actor::Operator, GOATMessageContent::Tick);
+        let subtyped_message_id = generate_message_id(
+            business_id,
+            message.content.event_type().to_owned(),
+            Some("7".to_owned()),
+        );
+        {
+            let mut storage = local_db.acquire().await.unwrap();
+            assert!(
+                upsert_message(
+                    &mut storage,
+                    false,
+                    business_id,
+                    Some("7".to_owned()),
+                    SELF_SENDER.to_owned(),
+                    message.actor.clone(),
+                    message.content.clone(),
+                    0,
+                    0,
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let claimed = {
+            let mut storage = local_db.acquire().await.unwrap();
+            storage
+                .claim_local_messages(
+                    current_time_secs() + 1,
+                    current_time_secs() + 300,
+                    0,
+                    1,
+                    QUEUE_MAX_ABANDONS,
+                )
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        assert_eq!(claimed.message_id, subtyped_message_id);
+
+        ACTIVE_LOCAL_MESSAGE_CLAIM
+            .scope(
+                LocalMessageClaim {
+                    message_id: claimed.message_id.clone(),
+                    message_version: claimed.message_version,
+                },
+                push_local_unhandled_messages_with_reason(
+                    &local_db,
+                    business_id,
+                    &message,
+                    30,
+                    MessageDeferReason::HandlerError,
+                    "retry subtyped message",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut storage = local_db.acquire().await.unwrap();
+        let stored = storage.find_messages_by_id(&subtyped_message_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, MessageState::Pending.to_string());
+        let base_message_id =
+            generate_message_id(business_id, message.content.event_type().to_owned(), None);
+        assert!(storage.find_messages_by_id(&base_message_id).await.unwrap().is_none());
     }
 }

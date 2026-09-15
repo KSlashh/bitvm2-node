@@ -45,8 +45,8 @@ use store::localdb::{
 };
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, GraphStatusSource,
-    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, MessageState, SwapEscrow,
-    SwapEscrowStatus, WatchContract, WatchContractStatus, normalize_escrow_hash,
+    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, SwapEscrow, SwapEscrowStatus,
+    WatchContract, WatchContractStatus, normalize_escrow_hash,
 };
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -568,14 +568,7 @@ async fn handle_withdraw_paths_events<'a>(
         if is_new_event {
             add_node_reward(storage_processor, &goat_addr.unwrap(), reward_add).await?;
         }
-        storage_processor
-            .update_messages_state_by_business_id(
-                &graph_id,
-                None,
-                MessageState::Pending.to_string(),
-                MessageState::Cancelled.to_string(),
-            )
-            .await?;
+        storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
     }
     Ok(())
 }
@@ -655,14 +648,7 @@ async fn handle_withdraw_disproved_events<'a>(
             )
             .await?;
         }
-        storage_processor
-            .update_messages_state_by_business_id(
-                &graph_id,
-                None,
-                MessageState::Pending.to_string(),
-                MessageState::Cancelled.to_string(),
-            )
-            .await?;
+        storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
     }
     Ok(())
 }

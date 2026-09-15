@@ -210,6 +210,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         soldering_builder: matches!(actor, Actor::Verifier | Actor::Operator)
             .then(|| Arc::new(BabeBundleBuilder::new())),
         metrics_state: metrics_state.clone(),
+        shutdown_token: cancellation_token.clone(),
     };
 
     tracing::info!(
@@ -513,7 +514,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "all node background tasks have been started"
     );
 
-    tokio::select! {
+    let fatal_error = tokio::select! {
         (result, index, remaining_handles) = future::select_all(task_handles) => {
             let task_name = task_names[index];
             // Log the specific failure
@@ -581,9 +582,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // Handle panic propagation
             if let Err(join_error) = result && join_error.is_panic() {
-                    std::panic::resume_unwind(join_error.into_panic());
-
+                std::panic::resume_unwind(join_error.into_panic());
             }
+            Some(anyhow::anyhow!("core task {task_name} stopped: {failure_reason}"))
         }
         _ = shutdown_signal() => {
             tracing::info!(
@@ -603,7 +604,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 outcome = "completed",
                 "node graceful shutdown completed"
             );
+            None
         }
+    };
+
+    if let Some(error) = fatal_error {
+        return Err(error.into());
     }
 
     Ok(())

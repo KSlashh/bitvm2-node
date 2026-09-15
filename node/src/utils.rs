@@ -3751,7 +3751,11 @@ pub async fn outpoint_spent_txin(
     }
 }
 
-fn generate_message_id(business_id: Uuid, msg_type: String, sub_type: Option<String>) -> String {
+pub(crate) fn generate_message_id(
+    business_id: Uuid,
+    msg_type: String,
+    sub_type: Option<String>,
+) -> String {
     match sub_type {
         Some(sub_type) => {
             format!("{business_id}_{msg_type}_{sub_type}")
@@ -3771,7 +3775,7 @@ pub async fn upsert_message(
     message_content: GOATMessageContent,
     weight: i64,
     lock_time: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let message = GOATMessage::new(actor.clone(), message_content.clone());
     let msg_type = get_goat_message_content_type(&message_content);
     let message_id = generate_message_id(business_id, msg_type.to_string().clone(), sub_type);
@@ -3783,7 +3787,7 @@ pub async fn upsert_message(
             notify_to_cancel_proof_task(storage_processor, business_id, cancel_msg_type).await?;
         }
 
-        storage_processor
+        return storage_processor
             .upsert_message(Message {
                 message_id,
                 business_id,
@@ -3795,14 +3799,17 @@ pub async fn upsert_message(
                 lock_time_until: current_time_secs() + lock_time,
                 state: MessageState::Pending.to_string(),
                 message_version: 0,
+                attempt_count: 0,
+                abandon_count: 0,
+                last_error: None,
                 created_at: 0,
             })
-            .await?;
+            .await;
     } else {
         info!("{message_id} is already created for create action");
     }
 
-    Ok(())
+    Ok(false)
 }
 
 pub async fn notify_to_cancel_proof_task(
@@ -3831,7 +3838,7 @@ pub async fn notify_to_cancel_proof_task(
         storage_processor.find_message_by_business_id(&business_id, &msg_type.to_string()).await?
         && let Some(graph) = storage_processor.find_graph(&business_id).await?
     {
-        if MessageState::Pending.to_string() != message.state {
+        if !matches!(message.state.as_str(), "Pending" | "Processing") {
             warn!(
                 "message {business_id}, msg_type: {msg_type} no need to cancel.as state is {}",
                 message.state
@@ -3873,12 +3880,7 @@ pub async fn notify_to_cancel_proof_task(
         if notify_result {
             // cancel unfinished p2p message; when notify success!
             storage_processor
-                .update_messages_state_by_business_id(
-                    &business_id,
-                    Some(msg_type.to_string()),
-                    MessageState::Pending.to_string(),
-                    MessageState::Cancelled.to_string(),
-                )
+                .cancel_messages_by_business_id(&business_id, Some(msg_type.to_string()))
                 .await?;
         }
     } else {
@@ -4230,29 +4232,34 @@ pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
     (false, None)
 }
 
-pub async fn pop_batch_local_unhandle_msg(
+/// Claim a batch of local messages for dispatch, retiring exhausted ones first.
+///
+/// Returns `(claimed, quarantined)`. Unlike the select-only pop this replaces,
+/// every returned message carries a durable claim, so an attempt that never
+/// reports an outcome is visible to the next tick instead of replaying forever.
+pub async fn claim_batch_local_msg(
     local_db: &LocalDB,
-    _actor: Actor,
-    lock_time_until: i64,
-    offset: i64,
+    lease_secs: i64,
+    max_abandons: i64,
     limit: i64,
-) -> Result<Vec<Message>> {
+) -> Result<(Vec<Message>, u64)> {
     let mut tx = local_db.start_transaction().await?;
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    tx.set_messages_expired(current_time - MESSAGE_EXPIRE_TIME).await?;
-    tx.delete_old_messages(current_time - MESSAGE_EXPIRE_TIME).await?;
+    let expired_before = current_time - MESSAGE_EXPIRE_TIME;
+    tx.set_messages_expired(expired_before).await?;
+    tx.delete_old_messages(expired_before).await?;
+    let quarantined = tx.quarantine_local_messages(current_time, max_abandons).await?;
     let messages = tx
-        .filter_messages(
-            MessageState::Pending.to_string(),
-            0,
-            lock_time_until,
-            current_time - MESSAGE_EXPIRE_TIME,
+        .claim_local_messages(
+            current_time,
+            current_time + lease_secs,
+            expired_before,
             limit,
-            offset,
+            max_abandons,
         )
         .await?;
     tx.commit().await?;
-    Ok(messages)
+    Ok((messages, quarantined))
 }
 
 pub async fn operator_scan_ready_proof(
@@ -5852,14 +5859,7 @@ pub(crate) async fn obsolete_graph(
     // `None` means no message-type filter: cancel every durable pending message
     // for this terminal graph so stale retries cannot consume queue capacity or
     // trigger a later graph action.
-    storage_processor
-        .update_messages_state_by_business_id(
-            &graph_id,
-            None,
-            MessageState::Pending.to_string(),
-            MessageState::Cancelled.to_string(),
-        )
-        .await?;
+    storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
     Ok(true)
 }
 

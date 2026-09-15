@@ -13,6 +13,7 @@ use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
 use std::sync::Arc;
 use store::localdb::LocalDB;
+use tokio_util::sync::CancellationToken;
 
 pub struct BitvmNodeProcessor {
     pub local_db: LocalDB,
@@ -21,6 +22,7 @@ pub struct BitvmNodeProcessor {
     pub http_client: HttpAsyncClient,
     pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
     pub metrics_state: MetricsState,
+    pub shutdown_token: CancellationToken,
 }
 impl P2pMessageHandler for BitvmNodeProcessor {
     async fn recv_and_dispatch(
@@ -84,6 +86,7 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                     GOATMessage::default_message_id(),
                     &tick_data,
                     &self.metrics_state,
+                    &self.shutdown_token,
                 )
                 .await
             }
@@ -105,6 +108,21 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn graceful_shutdown(&self) -> anyhow::Result<()> {
+        let mut storage = self.local_db.start_immediate_transaction().await?;
+        let local_released = storage.release_processing_local_messages().await?;
+        let inbox_released = storage.release_processing_p2p_inbox_messages().await?;
+        storage.commit().await?;
+        tracing::info!(
+            event = "message_queue_shutdown",
+            outcome = "claims_released",
+            local_released,
+            inbox_released,
+            "released active queue claims without charging abandon counters"
+        );
         Ok(())
     }
 }

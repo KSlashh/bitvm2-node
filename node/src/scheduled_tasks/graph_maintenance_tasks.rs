@@ -303,6 +303,7 @@ async fn enqueue_kickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::Resu
         0,
     )
     .await
+    .map(|_| ())
 }
 
 async fn enqueue_prekickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::Result<()> {
@@ -322,6 +323,7 @@ async fn enqueue_prekickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::R
         0,
     )
     .await
+    .map(|_| ())
 }
 
 fn is_kickoff_pending_status(status: &str) -> bool {
