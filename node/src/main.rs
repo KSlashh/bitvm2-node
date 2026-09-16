@@ -13,7 +13,7 @@ use libp2p::PeerId;
 use libp2p_metrics::Registry;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
@@ -25,6 +25,7 @@ use bitvm_noded::{
 };
 
 use anyhow::Result;
+use bitvm_noded::action::reclaim_stale_queue_claims;
 use bitvm_noded::metrics_service::{MetricsState, set_node_metrics_state};
 use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
 use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
@@ -196,6 +197,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let _node_span_guard = node_span.enter();
     let local_db = store::create_local_db(&opt.db_path).await;
+    // Claims left by a previous process are provably abandoned: charge and
+    // release them before any dispatcher can wait on their leases.
+    let (reclaimed_local, reclaimed_inbox) = reclaim_stale_queue_claims(&local_db).await?;
+    if reclaimed_local + reclaimed_inbox > 0 {
+        tracing::warn!(
+            event = "message_queue_startup",
+            outcome = "claims_reclaimed",
+            reclaimed_local,
+            reclaimed_inbox,
+            "reclaimed queue claims left behind by a previous process"
+        );
+    }
     let metric_registry = Arc::new(Mutex::new(metric_registry));
     let metrics_state = MetricsState::new(metric_registry);
     set_node_metrics_state(metrics_state.clone());
@@ -514,8 +527,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "all node background tasks have been started"
     );
 
+    let mut core_tasks = future::select_all(task_handles);
     let fatal_error = tokio::select! {
-        (result, index, remaining_handles) = future::select_all(task_handles) => {
+        (result, index, remaining_handles) = &mut core_tasks => {
             let task_name = task_names[index];
             // Log the specific failure
             let failure_reason = match &result {
@@ -564,14 +578,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "triggering node shutdown after background task result"
             );
 
-            // Initiate graceful shutdown
+            // Initiate graceful shutdown and let the tasks release their queue
+            // claims; anything still running after the grace period is aborted.
             cancellation_token.cancel();
-
-            // Wait a moment for graceful shutdown, then force abort remaining tasks
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            // Force abort any tasks that didn't respond to cancellation
-            remaining_handles.into_iter().for_each(|handle| handle.abort());
+            wait_for_task_shutdown(remaining_handles).await;
 
             tracing::info!(
                 event = "service_shutdown",
@@ -595,9 +605,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "received shutdown signal; initiating graceful shutdown"
             );
             cancellation_token.cancel();
-
-            // Give tasks some time to shutdown gracefully
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            wait_for_task_shutdown(core_tasks.into_inner()).await;
             tracing::info!(
                 event = "service_shutdown",
                 service = "bitvm-noded",
@@ -613,6 +621,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+/// Upper bound on how long shutdown waits for the background tasks to exit on
+/// their own before aborting them.
+const SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// Wait for the background tasks to exit after cancellation.
+///
+/// The swarm task releases the queue claims of in-flight messages during this
+/// window. A fixed two-second sleep was not enough for that release when a
+/// heavy task still held the SQLite write lock, which left the rows to be
+/// reclaimed and charged as abandoned on the next start.
+async fn wait_for_task_shutdown(mut handles: Vec<JoinHandle<Result<String, String>>>) {
+    let started_at = Instant::now();
+    let joined = tokio::time::timeout(
+        Duration::from_secs(SHUTDOWN_GRACE_SECS),
+        future::join_all(handles.iter_mut()),
+    )
+    .await;
+    match joined {
+        Ok(_) => tracing::info!(
+            event = "service_shutdown",
+            outcome = "tasks_exited",
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "all node background tasks exited"
+        ),
+        Err(_) => {
+            tracing::warn!(
+                event = "service_shutdown",
+                outcome = "grace_period_exceeded",
+                grace_secs = SHUTDOWN_GRACE_SECS,
+                "aborting node background tasks that did not exit within the grace period"
+            );
+            for handle in &handles {
+                handle.abort();
+            }
+        }
+    }
 }
 
 /// Listen for shutdown signals (Ctrl+C, SIGTERM, etc.)

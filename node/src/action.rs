@@ -70,6 +70,10 @@ const LOCAL_MESSAGE_LEASE_SECS: i64 = 10 * 60;
 /// Backoff applied to a local message whose handler returned a non-transient error.
 const LOCAL_MESSAGE_RETRY_DELAY_SECS: i64 = 600;
 const LOCAL_MESSAGE_BATCH_SIZE: i64 = 50;
+/// Delay applied per recorded abandon before a payload may run again, so a
+/// supervisor restart after a panic or an unclean exit does not replay it at
+/// full speed.
+const QUEUE_ABANDON_BACKOFF_SECS: i64 = 60;
 /// A dispatch future erased behind a box to keep the enclosing task's state
 /// machine reasonably small.
 type BoxedDispatch<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
@@ -384,7 +388,7 @@ impl BusinessRef {
     fn key_part(self) -> String {
         match self {
             Self::Instance { instance_id } => format!("instance:{instance_id}"),
-            Self::Graph { instance_id, graph_id } => format!("graph:{instance_id}:{graph_id}"),
+            Self::Graph { graph_id, .. } => format!("graph:{graph_id}"),
             Self::Unscoped => "unscoped".to_owned(),
         }
     }
@@ -1293,7 +1297,15 @@ async fn abandon_p2p_inbox_after_panic(
     let error = format!("handler panicked: {detail}");
     let result = async {
         let mut storage = local_db.acquire().await?;
-        storage.abandon_p2p_inbox_message(message_id, lease_token, &error).await
+        storage
+            .abandon_p2p_inbox_message(
+                message_id,
+                lease_token,
+                current_time_secs(),
+                QUEUE_ABANDON_BACKOFF_SECS,
+                &error,
+            )
+            .await
     }
     .await;
     match result {
@@ -1312,7 +1324,15 @@ async fn abandon_local_message_after_panic(
     let error = format!("handler panicked: {detail}");
     let result = async {
         let mut storage = local_db.acquire().await?;
-        storage.abandon_local_message(message_id, message_version, &error).await
+        storage
+            .abandon_local_message(
+                message_id,
+                message_version,
+                current_time_secs(),
+                QUEUE_ABANDON_BACKOFF_SECS,
+                &error,
+            )
+            .await
     }
     .await;
     match result {
@@ -1329,6 +1349,105 @@ async fn abandon_local_message_after_panic(
             log_queue_bookkeeping_failure("local_message_queue", message_id, "abandon", &error)
         }
     }
+}
+
+/// Claim one listed inbox row immediately before dispatching it.
+///
+/// `None` means the row is no longer claimable or the claim could not be
+/// persisted; either way it is skipped this tick and listed again on the next.
+async fn claim_p2p_inbox_candidate(
+    local_db: &LocalDB,
+    message_id: &str,
+) -> Option<P2pInboxMessage> {
+    let now = current_time_secs();
+    let result = async {
+        let mut storage = local_db.acquire().await?;
+        storage.claim_p2p_inbox_message(message_id, now, now + P2P_INBOX_LEASE_SECS).await
+    }
+    .await;
+    match result {
+        Ok(Some(message)) => Some(message),
+        Ok(None) => {
+            tracing::debug!(
+                event = "p2p_inbox",
+                outcome = "claim_skipped",
+                message_id,
+                "listed inbox message is no longer claimable"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                event = "p2p_inbox",
+                outcome = "claim_failed",
+                message_id,
+                error = %error,
+                "failed to claim a listed inbox message; it stays queued for the next tick"
+            );
+            None
+        }
+    }
+}
+
+/// Claim one listed local message immediately before dispatching it. See
+/// [`claim_p2p_inbox_candidate`].
+async fn claim_local_candidate(
+    local_db: &LocalDB,
+    candidate: &store::Message,
+) -> Option<store::Message> {
+    let now = current_time_secs();
+    let result = async {
+        let mut storage = local_db.acquire().await?;
+        storage
+            .claim_local_message(
+                &candidate.message_id,
+                candidate.message_version,
+                now,
+                now + LOCAL_MESSAGE_LEASE_SECS,
+            )
+            .await
+    }
+    .await;
+    match result {
+        Ok(Some(message)) => Some(message),
+        Ok(None) => {
+            tracing::debug!(
+                event = "local_message_queue",
+                outcome = "claim_skipped",
+                queued_message_id = %candidate.message_id,
+                message_version = candidate.message_version,
+                "listed local message is no longer claimable"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                event = "local_message_queue",
+                outcome = "claim_failed",
+                queued_message_id = %candidate.message_id,
+                error = %error,
+                "failed to claim a listed local message; it stays queued for the next tick"
+            );
+            None
+        }
+    }
+}
+
+/// Charge and release every queue claim left behind by a previous process.
+///
+/// Run once at startup, before any dispatcher starts. The database is
+/// process-local, so a `Processing` row at this point is an attempt that never
+/// reported an outcome. Waiting for its lease to lapse instead kept the row
+/// locked for minutes while every producer touching it backed off with
+/// ResourceLocked; a graceful shutdown never leaves such rows behind.
+pub async fn reclaim_stale_queue_claims(local_db: &LocalDB) -> Result<(u64, u64)> {
+    let now = current_time_secs();
+    let mut storage = local_db.start_immediate_transaction().await?;
+    let local = storage.reclaim_processing_local_messages(now, QUEUE_ABANDON_BACKOFF_SECS).await?;
+    let inbox =
+        storage.reclaim_processing_p2p_inbox_messages(now, QUEUE_ABANDON_BACKOFF_SECS).await?;
+    storage.commit().await?;
+    Ok((local, inbox))
 }
 
 async fn renew_p2p_inbox_lease_until_cancelled(
@@ -1396,10 +1515,11 @@ async fn handle_p2p_inbox_messages(
     // Bound terminal metadata and the temporary payload retained for manual
     // inspection of quarantined rows.
     let purged = storage.purge_terminal_p2p_inbox_messages(now - MESSAGE_EXPIRE_TIME).await?;
-    let messages = storage
-        .claim_p2p_inbox_messages(
+    // Only list here. Each row is claimed right before its own dispatch so a
+    // crash mid-dispatch is charged to that row alone.
+    let candidates = storage
+        .list_claimable_p2p_inbox_messages(
             now,
-            now + P2P_INBOX_LEASE_SECS,
             get_p2p_inbox_batch_size(),
             QUEUE_MAX_ABANDONS,
             &active_heavy_task_ids,
@@ -1425,7 +1545,10 @@ async fn handle_p2p_inbox_messages(
         );
     }
 
-    for message in messages {
+    for candidate in candidates {
+        let Some(message) = claim_p2p_inbox_candidate(local_db, &candidate.message_id).await else {
+            continue;
+        };
         let from_peer_id = match PeerId::from_str(&message.from_peer) {
             Ok(peer_id) => peer_id,
             Err(error) => {
@@ -1856,13 +1979,8 @@ pub async fn handle_self_p2p_msg(
         "received local queue trigger"
     );
 
-    let (messages, quarantined) = claim_batch_local_msg(
-        local_db,
-        LOCAL_MESSAGE_LEASE_SECS,
-        QUEUE_MAX_ABANDONS,
-        LOCAL_MESSAGE_BATCH_SIZE,
-    )
-    .await?;
+    let (candidates, quarantined) =
+        list_batch_local_msg(local_db, QUEUE_MAX_ABANDONS, LOCAL_MESSAGE_BATCH_SIZE).await?;
     if quarantined > 0 {
         tracing::warn!(
             event = "local_message_queue",
@@ -1874,12 +1992,18 @@ pub async fn handle_self_p2p_msg(
     }
     tracing::info!(
         event = "local_message_queue",
-        outcome = "batch_loaded",
+        outcome = "batch_listed",
         role = %actor,
-        batch_size = messages.len(),
-        "claimed pending local messages"
+        batch_size = candidates.len(),
+        "listed claimable local messages"
     );
-    for message in messages {
+    for candidate in candidates {
+        // Claim right before dispatch so a crash mid-dispatch is charged to
+        // this row alone, and so a producer that re-armed the row since it was
+        // listed wins: the stale version is skipped until the next tick.
+        let Some(message) = claim_local_candidate(local_db, &candidate).await else {
+            continue;
+        };
         let queue_wait_secs = current_time_secs().saturating_sub(message.created_at);
         let started_at = Instant::now();
         let claim = LocalMessageClaim {
@@ -1968,37 +2092,56 @@ pub async fn handle_self_p2p_msg(
                         "processed local message"
                     );
                 } else {
-                    let current_state = storage_processor
-                        .find_messages_by_id(&message.message_id)
+                    // A row that is Pending under our claim version was
+                    // rescheduled by the handler itself. Only now, after the
+                    // handler returned, is that a reported outcome, so only now
+                    // does its consecutive-abandon counter reset.
+                    match storage_processor
+                        .confirm_local_message_self_defer(
+                            &message.message_id,
+                            message.message_version,
+                        )
                         .await
-                        .ok()
-                        .flatten()
-                        .map(|message| message.state);
-                    if current_state.as_deref() == Some("Pending") {
-                        tracing::debug!(
-                            event = "local_message_queue",
-                            outcome = "self_deferred",
-                            role = %actor,
-                            business_id = %message.business_id,
-                            queued_message_id = %message.message_id,
-                            message_type = %message.msg_type,
-                            queue_wait_secs,
-                            elapsed_ms = started_at.elapsed().as_millis() as u64,
-                            "local message handler rescheduled its own queue entry"
-                        );
-                    } else {
-                        tracing::warn!(
-                            event = "local_message_queue",
-                            outcome = "state_update_conflict",
-                            role = %actor,
-                            business_id = %message.business_id,
-                            queued_message_id = %message.message_id,
-                            message_type = %message.msg_type,
-                            current_state = ?current_state,
-                            queue_wait_secs,
-                            elapsed_ms = started_at.elapsed().as_millis() as u64,
-                            "local message handler completed but its processed state was not persisted"
-                        );
+                    {
+                        Ok(true) => {
+                            tracing::debug!(
+                                event = "local_message_queue",
+                                outcome = "self_deferred",
+                                role = %actor,
+                                business_id = %message.business_id,
+                                queued_message_id = %message.message_id,
+                                message_type = %message.msg_type,
+                                queue_wait_secs,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                "local message handler rescheduled its own queue entry"
+                            );
+                        }
+                        Ok(false) => {
+                            let current_state = storage_processor
+                                .find_messages_by_id(&message.message_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|message| message.state);
+                            tracing::warn!(
+                                event = "local_message_queue",
+                                outcome = "state_update_conflict",
+                                role = %actor,
+                                business_id = %message.business_id,
+                                queued_message_id = %message.message_id,
+                                message_type = %message.msg_type,
+                                current_state = ?current_state,
+                                queue_wait_secs,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                "local message handler completed but its processed state was not persisted"
+                            );
+                        }
+                        Err(error) => log_queue_bookkeeping_failure(
+                            "local_message_queue",
+                            &message.message_id,
+                            "confirm_self_defer",
+                            &error,
+                        ),
                     }
                 }
             }
@@ -2054,14 +2197,37 @@ pub async fn handle_self_p2p_msg(
                 match deferred {
                     Ok(true) => {}
                     Ok(false) => {
-                        tracing::warn!(
-                            event = "local_message_queue",
-                            outcome = "stale_claim",
-                            queued_message_id = %message.message_id,
-                            message_version = message.message_version,
-                            operation = "defer",
-                            "ignored local message update from a stale claim"
-                        );
+                        // The handler may have rescheduled its own row before
+                        // returning the error; that is still a reported outcome.
+                        match storage_processor
+                            .confirm_local_message_self_defer(
+                                &message.message_id,
+                                message.message_version,
+                            )
+                            .await
+                        {
+                            Ok(true) => tracing::debug!(
+                                event = "local_message_queue",
+                                outcome = "self_deferred",
+                                queued_message_id = %message.message_id,
+                                error = %err,
+                                "local message handler rescheduled its own queue entry before failing"
+                            ),
+                            Ok(false) => tracing::warn!(
+                                event = "local_message_queue",
+                                outcome = "stale_claim",
+                                queued_message_id = %message.message_id,
+                                message_version = message.message_version,
+                                operation = "defer",
+                                "ignored local message update from a stale claim"
+                            ),
+                            Err(error) => log_queue_bookkeeping_failure(
+                                "local_message_queue",
+                                &message.message_id,
+                                "confirm_self_defer",
+                                &error,
+                            ),
+                        }
                         continue;
                     }
                     Err(error) => {
@@ -2380,7 +2546,7 @@ pub async fn push_local_unhandled_messages_with_reason(
         && owns_requeued_message
     {
         storage_processor
-            .defer_local_message(
+            .self_defer_local_message(
                 &existing.message_id,
                 existing.message_version,
                 current_time_secs() + delay_secs as i64,
@@ -2688,6 +2854,42 @@ mod tests {
         };
         assert_eq!(claimed.message_id, message_id);
 
+        // Two earlier attempts died mid-dispatch; the row carries their abandons
+        // into this claim, and the handler's own reschedule must not erase them.
+        {
+            let mut storage = local_db.acquire().await.unwrap();
+            for _ in 0..2 {
+                assert!(
+                    storage
+                        .abandon_local_message(
+                            &message_id,
+                            claimed.message_version,
+                            current_time_secs(),
+                            0,
+                            "died mid-dispatch",
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+        let claimed = {
+            let mut storage = local_db.acquire().await.unwrap();
+            storage
+                .claim_local_messages(
+                    current_time_secs() + 301,
+                    current_time_secs() + 600,
+                    0,
+                    1,
+                    QUEUE_MAX_ABANDONS,
+                )
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        assert_eq!(claimed.abandon_count, 2);
+
         ACTIVE_LOCAL_MESSAGE_CLAIM
             .scope(
                 LocalMessageClaim {
@@ -2708,5 +2910,18 @@ mod tests {
         let mut storage = local_db.acquire().await.unwrap();
         let stored = storage.find_messages_by_id(&message_id).await.unwrap().unwrap();
         assert_eq!(stored.state, MessageState::Pending.to_string());
+        assert_eq!(stored.abandon_count, 2, "a self-defer must keep the abandon count");
+
+        // The dispatcher confirms the self-defer once the handler has returned.
+        assert!(
+            storage
+                .confirm_local_message_self_defer(&message_id, claimed.message_version)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            storage.find_messages_by_id(&message_id).await.unwrap().unwrap().abandon_count,
+            0
+        );
     }
 }

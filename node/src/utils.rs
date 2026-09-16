@@ -4209,14 +4209,14 @@ pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
     (false, None)
 }
 
-/// Claim a batch of local messages for dispatch, retiring exhausted ones first.
+/// Sweep the local queue and list the messages the dispatcher may attempt now.
 ///
-/// Returns `(claimed, quarantined)`. Unlike the select-only pop this replaces,
-/// every returned message carries a durable claim, so an attempt that never
-/// reports an outcome is visible to the next tick instead of replaying forever.
-pub async fn claim_batch_local_msg(
+/// Returns `(candidates, quarantined)`. Nothing returned here is claimed yet:
+/// the dispatcher claims each row immediately before dispatching it, so a
+/// crash mid-dispatch is charged to that one row rather than to the whole
+/// batch. Expired rows are retired and exhausted rows quarantined first.
+pub async fn list_batch_local_msg(
     local_db: &LocalDB,
-    lease_secs: i64,
     max_abandons: i64,
     limit: i64,
 ) -> Result<(Vec<Message>, u64)> {
@@ -4226,15 +4226,8 @@ pub async fn claim_batch_local_msg(
     tx.set_messages_expired(expired_before).await?;
     tx.delete_old_messages(expired_before).await?;
     let quarantined = tx.quarantine_local_messages(current_time, max_abandons).await?;
-    let messages = tx
-        .claim_local_messages(
-            current_time,
-            current_time + lease_secs,
-            expired_before,
-            limit,
-            max_abandons,
-        )
-        .await?;
+    let messages =
+        tx.list_claimable_local_messages(current_time, expired_before, limit, max_abandons).await?;
     tx.commit().await?;
     Ok((messages, quarantined))
 }

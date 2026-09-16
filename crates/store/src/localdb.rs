@@ -2,11 +2,11 @@ use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
     BridgeOutGlobalStats, EventWatchMetricsSnapshot, GoatTxRecord, Graph, GraphBtcTxVoutMonitor,
     GraphRawData, GraphStatus, GraphStatusSource, GraphStatusTransitionOutcome, Instance,
-    LongRunningTaskProof, Message, MessageDebugOverview, MessageDebugReason, MessageState,
-    MetricsStateCount, Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof,
-    P2pInboxMessage, P2pOutboxMessage, PeginGraphProcessData, PeginInstanceProcessData,
-    PendingGraphInit, SequencerSetHashChange, SequencerSetScanState, SerializableTxid, SwapEscrow,
-    SwapEscrowStatus, WatchContract, WatchtowerProof,
+    LongRunningTaskProof, Message, MessageDebugOverview, MessageDebugReason, MetricsStateCount,
+    Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof, P2pInboxMessage,
+    P2pOutboxMessage, PeginGraphProcessData, PeginInstanceProcessData, PendingGraphInit,
+    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, SwapEscrow, SwapEscrowStatus,
+    WatchContract, WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -27,6 +27,11 @@ fn get_current_timestamp_secs() -> i64 {
 const MESSAGE_COLUMNS: &str = "message_id, business_id, from_peer, actor, msg_type, content, \
      message_version, state, weight, lock_time_until, attempt_count, abandon_count, last_error, \
      created_at";
+
+/// Columns every `p2p_inbox` SELECT must fetch.
+const P2P_INBOX_COLUMNS: &str = "message_id, business_id, actor, from_peer, msg_type, content, \
+     content_size, state, attempt_count, abandon_count, next_retry_at, lease_until, lease_token, \
+     last_error, created_at, updated_at";
 
 fn message_from_row(row: &SqliteRow) -> Result<Message, sqlx::Error> {
     Ok(Message {
@@ -2370,18 +2375,16 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected())
     }
 
-    /// Claim a batch of local messages for dispatch.
+    /// Rows the local dispatcher may attempt right now, oldest first.
     ///
-    /// This replaces the previous select-only pop, which wrote nothing before
-    /// handing work to the dispatcher. Without a durable claim, a handler that
-    /// panicked left the row `Pending` with its lock untouched, so the very next
-    /// tick re-read it and panicked again — a crash loop with no backoff at all.
-    /// Charging the claim up front means the record survives an abort or a kill,
-    /// not just an unwinding panic.
-    pub async fn claim_local_messages(
+    /// Nothing is written here: the dispatcher claims each row with
+    /// [`Self::claim_local_message`] immediately before dispatching it. Claiming
+    /// a whole batch up front meant that an abort or kill mid-dispatch charged
+    /// an unfinished attempt to every row in the batch, so healthy messages
+    /// followed the poison message into quarantine.
+    pub async fn list_claimable_local_messages(
         &mut self,
         now: i64,
-        lease_until: i64,
         expired: i64,
         limit: i64,
         max_abandons: i64,
@@ -2401,35 +2404,75 @@ impl<'a> StorageProcessor<'a> {
         .bind(limit)
         .fetch_all(self.conn())
         .await?;
+        rows.iter().map(message_from_row).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 
-        let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut message = message_from_row(&row)?;
-            let was_abandoned = message.state == MessageState::Processing.to_string();
-            // `message_version` is deliberately left alone: callers guard their
-            // completion writes with the version they were handed, and bumping
-            // it here would make every one of those writes miss.
-            let result = sqlx::query(
-                "UPDATE message \
-                 SET state = 'Processing', \
-                     abandon_count = abandon_count + ?, \
-                     lock_time_until = ?, updated_at = ? \
-                 WHERE message_id = ? AND message_version = ? \
-                   AND state IN ('Pending', 'Processing') \
-                   AND lock_time_until <= ?",
-            )
-            .bind(i64::from(was_abandoned))
-            .bind(lease_until)
-            .bind(now)
-            .bind(&message.message_id)
-            .bind(message.message_version)
-            .bind(now)
-            .execute(self.conn())
-            .await?;
-            if result.rows_affected() > 0 {
-                message.state = MessageState::Processing.to_string();
-                message.abandon_count += i64::from(was_abandoned);
-                message.lock_time_until = lease_until;
+    /// Claim exactly one local message for dispatch.
+    ///
+    /// Without a durable claim, a handler that panicked left the row `Pending`
+    /// with its lock untouched, so the very next tick re-read it and panicked
+    /// again with no backoff at all. Charging the claim before dispatch means
+    /// the record survives an abort or a kill, not just an unwinding panic.
+    ///
+    /// Re-claiming a row that is still `Processing` means the previous attempt
+    /// never reported an outcome, which is charged as an abandon.
+    /// `message_version` is deliberately left alone: callers guard their
+    /// completion writes with the version they were handed, and bumping it here
+    /// would make every one of those writes miss. Returns `None` when the row
+    /// is no longer claimable: cancelled, re-armed under a new version, or
+    /// locked since it was listed.
+    pub async fn claim_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        now: i64,
+        lease_until: i64,
+    ) -> anyhow::Result<Option<Message>> {
+        let row = sqlx::query(&format!(
+            "UPDATE message \
+             SET state = 'Processing', \
+                 abandon_count = abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END, \
+                 lock_time_until = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? \
+               AND state IN ('Pending', 'Processing') \
+               AND lock_time_until <= ? \
+             RETURNING {MESSAGE_COLUMNS}"
+        ))
+        .bind(lease_until)
+        .bind(now)
+        .bind(message_id)
+        .bind(message_version)
+        .bind(now)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.map(|row| message_from_row(&row)).transpose()?)
+    }
+
+    /// List and claim up to `limit` rows in one call.
+    ///
+    /// Production dispatchers claim one row at a time; this convenience exists
+    /// for tests and tooling that need a whole batch held under a lease.
+    pub async fn claim_local_messages(
+        &mut self,
+        now: i64,
+        lease_until: i64,
+        expired: i64,
+        limit: i64,
+        max_abandons: i64,
+    ) -> anyhow::Result<Vec<Message>> {
+        let candidates =
+            self.list_claimable_local_messages(now, expired, limit, max_abandons).await?;
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(message) = self
+                .claim_local_message(
+                    &candidate.message_id,
+                    candidate.message_version,
+                    now,
+                    lease_until,
+                )
+                .await?
+            {
                 claimed.push(message);
             }
         }
@@ -2439,7 +2482,9 @@ impl<'a> StorageProcessor<'a> {
     /// Record a failed dispatch attempt and reschedule it with backoff.
     ///
     /// `attempt_count` is observability only. Only an unfinished claim increments
-    /// `abandon_count` and contributes to quarantine.
+    /// `abandon_count` and contributes to quarantine. This is for a handler
+    /// error reported to the dispatcher, which is a completed attempt; a handler
+    /// rescheduling its own row uses [`Self::self_defer_local_message`].
     pub async fn defer_local_message(
         &mut self,
         message_id: &str,
@@ -2463,22 +2508,89 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Reschedule the row a handler is currently running, at that handler's
+    /// own request.
+    ///
+    /// Unlike [`Self::defer_local_message`], the consecutive-abandon counter is
+    /// left untouched: the handler is still running and may yet panic, and
+    /// resetting here let a handler that reschedules itself and then panics
+    /// start every round from zero, so it never reached quarantine. The
+    /// dispatcher resets the counter with
+    /// [`Self::confirm_local_message_self_defer`] once the handler returned.
+    pub async fn self_defer_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        lock_time_until: i64,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', attempt_count = attempt_count + 1, \
+                 lock_time_until = ?, last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Processing'",
+        )
+        .bind(lock_time_until)
+        .bind(reason.chars().take(1024).collect::<String>())
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Acknowledge a self-deferred row once its handler has returned.
+    ///
+    /// Only at this point is the attempt known to have reported an outcome, so
+    /// only here does the consecutive-abandon counter reset. Returns `false`
+    /// when the row is not `Pending` under this claim version, which means it
+    /// was not self-deferred by the caller.
+    pub async fn confirm_local_message_self_defer(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message SET abandon_count = 0, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Pending'",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Record a handler panic before shutting down the process. Unlike a normal
-    /// defer, this increments the consecutive unfinished-attempt counter.
+    /// defer, this increments the consecutive unfinished-attempt counter and
+    /// pushes the next attempt out by `backoff_secs` per recorded abandon, so a
+    /// supervisor restart cannot replay the payload at full speed.
+    ///
+    /// A handler may reschedule its own row and then panic, leaving the row
+    /// `Pending` already. The version guard still identifies the claim, so the
+    /// abandon is charged either way and the longer of the two delays wins.
     pub async fn abandon_local_message(
         &mut self,
         message_id: &str,
         message_version: i64,
+        now: i64,
+        backoff_secs: i64,
         error: &str,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE message \
              SET state = 'Pending', abandon_count = abandon_count + 1, \
-                 lock_time_until = 0, last_error = ?, updated_at = ? \
-             WHERE message_id = ? AND message_version = ? AND state = 'Processing'",
+                 lock_time_until = MAX(lock_time_until, ? + ? * (abandon_count + 1)), \
+                 last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? \
+               AND state IN ('Processing', 'Pending')",
         )
+        .bind(now)
+        .bind(backoff_secs)
         .bind(error.chars().take(1024).collect::<String>())
-        .bind(get_current_timestamp_secs())
+        .bind(now)
         .bind(message_id)
         .bind(message_version)
         .execute(self.conn())
@@ -2517,6 +2629,34 @@ impl<'a> StorageProcessor<'a> {
              WHERE state = 'Processing'",
         )
         .bind(get_current_timestamp_secs())
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Startup sweep for claims left behind by a process that no longer exists.
+    ///
+    /// The database is process-local, so at startup every `Processing` row is
+    /// an attempt that never reported an outcome. Charging it now, rather than
+    /// when the lease lapses, keeps the row from sitting locked for the whole
+    /// lease while every producer that touches it backs off with
+    /// ResourceLocked. The same per-abandon backoff as a panic applies.
+    pub async fn reclaim_processing_local_messages(
+        &mut self,
+        now: i64,
+        backoff_secs: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', abandon_count = abandon_count + 1, \
+                 lock_time_until = ? + ? * (abandon_count + 1), \
+                 last_error = 'reclaimed at startup: previous process exited mid-dispatch', \
+                 updated_at = ? \
+             WHERE state = 'Processing'",
+        )
+        .bind(now)
+        .bind(backoff_secs)
+        .bind(now)
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected())
@@ -2767,10 +2907,12 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected())
     }
 
-    pub async fn claim_p2p_inbox_messages(
+    /// Inbox rows the dispatcher may attempt right now, oldest first. Nothing
+    /// is written; see [`Self::list_claimable_local_messages`] for why rows are
+    /// claimed one at a time instead of as a batch.
+    pub async fn list_claimable_p2p_inbox_messages(
         &mut self,
         now: i64,
-        lease_until: i64,
         limit: i64,
         max_abandons: i64,
         excluded_message_ids: &[String],
@@ -2781,8 +2923,7 @@ impl<'a> StorageProcessor<'a> {
             format!(" AND message_id NOT IN ({})", create_place_holders(excluded_message_ids))
         };
         let query = format!(
-            "SELECT message_id, business_id, actor, from_peer, msg_type, content, content_size, \
-                    state, attempt_count, abandon_count, next_retry_at, lease_until, lease_token, last_error, created_at, updated_at \
+            "SELECT {P2P_INBOX_COLUMNS} \
              FROM p2p_inbox \
              WHERE ((state = 'Pending' AND next_retry_at <= ?) \
                 OR (state = 'Processing' AND lease_until <= ?)) \
@@ -2795,42 +2936,65 @@ impl<'a> StorageProcessor<'a> {
             query = query.bind(message_id);
         }
         let rows = query.bind(limit).fetch_all(self.conn()).await?;
+        rows.iter()
+            .map(p2p_inbox_message_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 
-        let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut message = p2p_inbox_message_from_row(&row)?;
-            // Re-claiming a row that is still `Processing` means the previous
-            // attempt never reported an outcome: the worker panicked, the
-            // process died, or it hung past the lease. That is charged
-            // separately from an ordinary handler error so that a transient
-            // outage cannot push healthy messages toward quarantine.
-            let was_abandoned = message.state == "Processing";
-            let lease_token = Uuid::new_v4().to_string();
-            let result = sqlx::query(
-                "UPDATE p2p_inbox \
-                 SET state = 'Processing', attempt_count = attempt_count + 1, \
-                     abandon_count = abandon_count + ?, \
-                     lease_until = ?, lease_token = ?, updated_at = ? \
-                 WHERE message_id = ? \
-                   AND ((state = 'Pending' AND next_retry_at <= ?) \
-                     OR (state = 'Processing' AND lease_until <= ?))",
-            )
-            .bind(i64::from(was_abandoned))
-            .bind(lease_until)
-            .bind(&lease_token)
-            .bind(now)
-            .bind(&message.message_id)
-            .bind(now)
-            .bind(now)
-            .execute(self.conn())
+    /// Claim exactly one inbox row under a fresh lease token.
+    ///
+    /// Re-claiming a row that is still `Processing` means the previous attempt
+    /// never reported an outcome: the worker panicked, the process died, or it
+    /// hung past the lease. That is charged separately from an ordinary handler
+    /// error so that a transient outage cannot push healthy messages toward
+    /// quarantine. Returns `None` when the row is no longer claimable.
+    pub async fn claim_p2p_inbox_message(
+        &mut self,
+        message_id: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> anyhow::Result<Option<P2pInboxMessage>> {
+        let lease_token = Uuid::new_v4().to_string();
+        let row = sqlx::query(&format!(
+            "UPDATE p2p_inbox \
+             SET state = 'Processing', attempt_count = attempt_count + 1, \
+                 abandon_count = abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END, \
+                 lease_until = ?, lease_token = ?, updated_at = ? \
+             WHERE message_id = ? \
+               AND ((state = 'Pending' AND next_retry_at <= ?) \
+                 OR (state = 'Processing' AND lease_until <= ?)) \
+             RETURNING {P2P_INBOX_COLUMNS}"
+        ))
+        .bind(lease_until)
+        .bind(&lease_token)
+        .bind(now)
+        .bind(message_id)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.map(|row| p2p_inbox_message_from_row(&row)).transpose()?)
+    }
+
+    /// List and claim up to `limit` inbox rows in one call. Production
+    /// dispatchers claim one row at a time; this is for tests and tooling.
+    pub async fn claim_p2p_inbox_messages(
+        &mut self,
+        now: i64,
+        lease_until: i64,
+        limit: i64,
+        max_abandons: i64,
+        excluded_message_ids: &[String],
+    ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        let candidates = self
+            .list_claimable_p2p_inbox_messages(now, limit, max_abandons, excluded_message_ids)
             .await?;
-            if result.rows_affected() > 0 {
-                message.state = "Processing".to_owned();
-                message.attempt_count += 1;
-                message.abandon_count += i64::from(was_abandoned);
-                message.lease_until = lease_until;
-                message.lease_token = lease_token;
-                message.updated_at = now;
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(message) =
+                self.claim_p2p_inbox_message(&candidate.message_id, now, lease_until).await?
+            {
                 claimed.push(message);
             }
         }
@@ -2880,20 +3044,27 @@ impl<'a> StorageProcessor<'a> {
     }
 
     /// Record a panic from the current lease before terminating the process.
+    /// The next attempt is pushed out by `backoff_secs` per recorded abandon so
+    /// a supervisor restart cannot replay the payload at full speed.
     pub async fn abandon_p2p_inbox_message(
         &mut self,
         message_id: &str,
         lease_token: &str,
+        now: i64,
+        backoff_secs: i64,
         error: &str,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE p2p_inbox \
              SET state = 'Pending', abandon_count = abandon_count + 1, lease_until = 0, \
-                 lease_token = '', next_retry_at = 0, last_error = ?, updated_at = ? \
+                 lease_token = '', next_retry_at = ? + ? * (abandon_count + 1), \
+                 last_error = ?, updated_at = ? \
              WHERE message_id = ? AND state = 'Processing' AND lease_token = ?",
         )
+        .bind(now)
+        .bind(backoff_secs)
         .bind(error.chars().take(1024).collect::<String>())
-        .bind(get_current_timestamp_secs())
+        .bind(now)
         .bind(message_id)
         .bind(lease_token)
         .execute(self.conn())
@@ -2995,6 +3166,29 @@ impl<'a> StorageProcessor<'a> {
              WHERE state = 'Processing'",
         )
         .bind(get_current_timestamp_secs())
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Startup sweep for inbox claims left behind by a process that no longer
+    /// exists. See [`Self::reclaim_processing_local_messages`].
+    pub async fn reclaim_processing_p2p_inbox_messages(
+        &mut self,
+        now: i64,
+        backoff_secs: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox \
+             SET state = 'Pending', abandon_count = abandon_count + 1, lease_until = 0, \
+                 lease_token = '', next_retry_at = ? + ? * (abandon_count + 1), \
+                 last_error = 'reclaimed at startup: previous process exited mid-dispatch', \
+                 updated_at = ? \
+             WHERE state = 'Processing'",
+        )
+        .bind(now)
+        .bind(backoff_secs)
+        .bind(now)
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected())
@@ -4401,6 +4595,7 @@ pub async fn create_local_db(db_path: &str) -> LocalDB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MessageState;
 
     async fn setup_db() -> LocalDB {
         create_local_db("sqlite::memory:").await
@@ -4723,9 +4918,14 @@ mod tests {
         .unwrap();
         let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
         assert!(
-            s.defer_local_message("self-defer-1", claimed[0].message_version, 150, "not ready")
-                .await
-                .unwrap()
+            s.self_defer_local_message(
+                "self-defer-1",
+                claimed[0].message_version,
+                150,
+                "not ready"
+            )
+            .await
+            .unwrap()
         );
         assert!(
             !s.complete_local_message("self-defer-1", claimed[0].message_version).await.unwrap()
@@ -5057,6 +5257,276 @@ mod tests {
             .unwrap();
         assert_eq!(row.get::<String, _>("state"), "Quarantined");
         assert_eq!(row.get::<Vec<u8>, _>("content"), vec![1, 2]);
+    }
+
+    /// Rows are claimed one at a time immediately before dispatch, so an abort
+    /// mid-dispatch charges only the row that was actually running.
+    #[tokio::test]
+    async fn local_claims_are_taken_per_message_not_per_batch() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        for (message_id, created_at) in [("first", 10), ("second", 20)] {
+            sqlx::query(
+                "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+                 VALUES (?, ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, ?, ?)",
+            )
+            .bind(message_id)
+            .bind(business_id)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+
+        let candidates = s.list_claimable_local_messages(100, 0, 10, 3).await.unwrap();
+        assert_eq!(
+            candidates.iter().map(|message| message.message_id.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(
+            candidates.iter().all(|message| message.state == "Pending"),
+            "listing must not write"
+        );
+
+        let claimed = s
+            .claim_local_message("first", candidates[0].message_version, 100, 200)
+            .await
+            .unwrap()
+            .expect("first claim");
+        assert_eq!(claimed.state, "Processing");
+        assert_eq!(claimed.lock_time_until, 200);
+        assert_eq!(s.find_messages_by_id("second").await.unwrap().unwrap().state, "Pending");
+
+        // Inside the lease the same row is not claimable again.
+        assert!(
+            s.claim_local_message("first", claimed.message_version, 150, 250)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A row re-armed under a new version since it was listed is skipped too.
+        assert!(
+            s.claim_local_message("second", candidates[1].message_version + 1, 100, 200)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Once the lease lapses, the reclaim charges the unfinished attempt.
+        let reclaimed = s
+            .claim_local_message("first", claimed.message_version, 300, 400)
+            .await
+            .unwrap()
+            .expect("reclaim");
+        assert_eq!(reclaimed.abandon_count, 1);
+    }
+
+    #[tokio::test]
+    async fn inbox_claims_are_taken_per_message_not_per_batch() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for message_id in ["inbox-first", "inbox-second"] {
+            let message = P2pInboxMessage {
+                message_id: message_id.to_owned(),
+                actor: "Operator".to_owned(),
+                from_peer: "peer".to_owned(),
+                msg_type: "CreateGraph".to_owned(),
+                content: vec![1],
+                content_size: 1,
+                ..Default::default()
+            };
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        }
+        let candidates = s.list_claimable_p2p_inbox_messages(100, 10, 3, &[]).await.unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|message| message.state == "Pending" && message.lease_token.is_empty()),
+            "listing must not write"
+        );
+
+        let claimed =
+            s.claim_p2p_inbox_message("inbox-first", 100, 200).await.unwrap().expect("claim");
+        assert_eq!(claimed.state, "Processing");
+        assert_eq!(claimed.attempt_count, 1);
+        assert_eq!(claimed.lease_until, 200);
+        assert!(!claimed.lease_token.is_empty());
+        assert!(s.claim_p2p_inbox_message("inbox-first", 150, 250).await.unwrap().is_none());
+        let second = sqlx::query("SELECT state FROM p2p_inbox WHERE message_id = 'inbox-second'")
+            .fetch_one(s.conn())
+            .await
+            .unwrap();
+        assert_eq!(second.get::<String, _>("state"), "Pending");
+    }
+
+    /// An unclean exit leaves claims behind. At startup they are provably
+    /// abandoned, so they are charged and released immediately with a backoff
+    /// instead of sitting locked until the lease lapses.
+    #[tokio::test]
+    async fn startup_reclaim_charges_abandon_and_applies_backoff() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES ('startup-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        let inbox = P2pInboxMessage {
+            message_id: "startup-inbox".to_owned(),
+            actor: "Operator".to_owned(),
+            from_peer: "peer".to_owned(),
+            msg_type: "CreateGraph".to_owned(),
+            content: vec![1],
+            content_size: 1,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&inbox).await.unwrap());
+        assert_eq!(s.claim_local_messages(100, 700, 0, 10, 3).await.unwrap().len(), 1);
+        assert_eq!(s.claim_p2p_inbox_messages(100, 400, 10, 3, &[]).await.unwrap().len(), 1);
+
+        assert_eq!(s.reclaim_processing_local_messages(1000, 60).await.unwrap(), 1);
+        assert_eq!(s.reclaim_processing_p2p_inbox_messages(1000, 60).await.unwrap(), 1);
+
+        let local = s.find_messages_by_id("startup-local").await.unwrap().unwrap();
+        assert_eq!(local.state, "Pending");
+        assert_eq!(local.abandon_count, 1);
+        assert_eq!(local.lock_time_until, 1060, "the first abandon backs off by one interval");
+        let inbox_row = sqlx::query(
+            "SELECT state, abandon_count, next_retry_at, lease_token FROM p2p_inbox WHERE message_id = 'startup-inbox'",
+        )
+        .fetch_one(s.conn())
+        .await
+        .unwrap();
+        assert_eq!(inbox_row.get::<String, _>("state"), "Pending");
+        assert_eq!(inbox_row.get::<i64, _>("abandon_count"), 1);
+        assert_eq!(inbox_row.get::<i64, _>("next_retry_at"), 1060);
+        assert!(inbox_row.get::<String, _>("lease_token").is_empty());
+
+        // Nothing is claimable until the backoff has passed.
+        assert!(s.list_claimable_local_messages(1030, 0, 10, 3).await.unwrap().is_empty());
+        assert_eq!(s.list_claimable_local_messages(1060, 0, 10, 3).await.unwrap().len(), 1);
+        assert!(s.list_claimable_p2p_inbox_messages(1030, 10, 3, &[]).await.unwrap().is_empty());
+        assert_eq!(s.list_claimable_p2p_inbox_messages(1060, 10, 3, &[]).await.unwrap().len(), 1);
+    }
+
+    /// A handler that reschedules its own row and then panics must accumulate
+    /// abandons across restarts. The self-defer must not reset the counter,
+    /// because the handler is still running when it happens; only the
+    /// dispatcher's confirmation after a normal return may reset it.
+    #[tokio::test]
+    async fn panic_after_self_defer_accumulates_abandons_until_quarantine() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES ('panic-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+
+        let mut now = 100;
+        for round in 1..=3 {
+            // The row is Pending, so the restart's reclaim sweep leaves it alone
+            // and the next tick claims it without a charge.
+            let candidate = s.find_messages_by_id("panic-local").await.unwrap().unwrap();
+            let claimed = s
+                .claim_local_message("panic-local", candidate.message_version, now, now + 600)
+                .await
+                .unwrap()
+                .expect("claim");
+            assert_eq!(claimed.abandon_count, round - 1);
+            // The handler reschedules itself, then panics.
+            assert!(
+                s.self_defer_local_message(
+                    "panic-local",
+                    claimed.message_version,
+                    now + 5,
+                    "not ready"
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                s.abandon_local_message(
+                    "panic-local",
+                    claimed.message_version,
+                    now,
+                    60,
+                    "panicked"
+                )
+                .await
+                .unwrap()
+            );
+            let row = s.find_messages_by_id("panic-local").await.unwrap().unwrap();
+            assert_eq!(row.state, "Pending");
+            assert_eq!(row.abandon_count, round, "round {round} adds to the preserved count");
+            assert_eq!(row.lock_time_until, now + 60 * round, "backoff grows with the count");
+            now = row.lock_time_until + 1;
+        }
+
+        // The sweep on the next tick retires it instead of dispatching again.
+        assert_eq!(s.quarantine_local_messages(now, 3).await.unwrap(), 1);
+        assert_eq!(
+            s.find_messages_by_id("panic-local").await.unwrap().unwrap().state,
+            "Quarantined"
+        );
+    }
+
+    /// A self-defer is only a reported outcome once the handler has returned,
+    /// so the counter survives the self-defer and resets on confirmation.
+    #[tokio::test]
+    async fn self_defer_keeps_abandons_until_the_dispatcher_confirms_it() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, abandon_count, created_at, updated_at) \
+             VALUES ('confirm-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 2, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        let candidate = s.find_messages_by_id("confirm-local").await.unwrap().unwrap();
+        let claimed = s
+            .claim_local_message("confirm-local", candidate.message_version, 100, 700)
+            .await
+            .unwrap()
+            .expect("claim");
+        assert_eq!(claimed.abandon_count, 2, "a claim from Pending is not charged");
+
+        assert!(
+            s.self_defer_local_message("confirm-local", claimed.message_version, 150, "not ready")
+                .await
+                .unwrap()
+        );
+        let row = s.find_messages_by_id("confirm-local").await.unwrap().unwrap();
+        assert_eq!(row.state, "Pending");
+        assert_eq!(row.attempt_count, 1);
+        assert_eq!(row.abandon_count, 2, "the self-defer must not reset the counter");
+
+        // The dispatcher confirms once the handler returned normally.
+        assert!(
+            s.confirm_local_message_self_defer("confirm-local", claimed.message_version)
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.find_messages_by_id("confirm-local").await.unwrap().unwrap().abandon_count, 0);
+        // A different claim generation, or a row that is not Pending, is not confirmed.
+        assert!(
+            !s.confirm_local_message_self_defer("confirm-local", claimed.message_version + 1)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ fn expand_message_business_ref(input: DeriveInput) -> Result<proc_macro2::TokenS
 }
 
 fn expand_variant(variant: &Variant) -> Result<proc_macro2::TokenStream> {
-    let scope = business_ref_scope(&variant.attrs)?;
+    let scope = business_ref_scope(variant)?;
     let variant_name = &variant.ident;
 
     match scope.as_str() {
@@ -83,12 +83,16 @@ fn tuple_payload_binding(variant: &Variant) -> Result<Ident> {
     }
 }
 
-fn business_ref_scope(attributes: &[Attribute]) -> Result<String> {
-    let mut matching =
-        attributes.iter().filter(|attribute| attribute.path().is_ident("business_ref"));
+fn business_ref_scope(variant: &Variant) -> Result<String> {
+    let mut matching = variant
+        .attrs
+        .iter()
+        .filter(|attribute: &&Attribute| attribute.path().is_ident("business_ref"));
     let Some(attribute) = matching.next() else {
+        // Point at the offending variant rather than the derive site, so the
+        // compiler error names the variant that lacks an attribute.
         return Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
+            variant.ident.span(),
             "each message variant must declare #[business_ref(graph)], #[business_ref(instance)], or #[business_ref(unscoped)]",
         ));
     };

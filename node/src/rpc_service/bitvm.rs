@@ -659,6 +659,22 @@ trait DisplayStatusConvert {
     fn parse_display_status(ori_status: &str) -> Vec<String>;
 }
 
+/// Map a status that is not a display alias onto the stored lifecycle status.
+///
+/// An empty filter means "no status filter" downstream, so an unknown status
+/// name must not collapse into an empty list: that turned a stale or mistyped
+/// status into a full listing. It matches nothing instead. Only an empty
+/// parameter still means "no filter".
+fn raw_status_filter<S: FromStr + std::fmt::Display>(ori_status: &str) -> Vec<String> {
+    if ori_status.trim().is_empty() {
+        return vec![];
+    }
+    match S::from_str(ori_status) {
+        Ok(status) => vec![status.to_string()],
+        Err(_) => vec![ori_status.to_owned()],
+    }
+}
+
 impl DisplayStatusConvert for Graph {
     fn convert_to_display_status(&self) -> String {
         match GraphStatus::from_str(&self.status) {
@@ -682,9 +698,7 @@ impl DisplayStatusConvert for Graph {
             Ok(GraphDisplayStatus::OperatorKickOffing) => {
                 vec![GraphStatus::OperatorDataPushed.to_string()]
             }
-            Err(_) => {
-                GraphStatus::from_str(ori_status).map(|v| vec![v.to_string()]).unwrap_or_default()
-            }
+            Err(_) => raw_status_filter::<GraphStatus>(ori_status),
         }
     }
 }
@@ -746,9 +760,7 @@ impl DisplayStatusConvert for Instance {
                 InstanceBridgeInStatus::NoEnoughCommitteesAnswered.to_string(),
                 InstanceBridgeInStatus::UserDiscarded.to_string(),
             ],
-            Err(_) => InstanceBridgeInStatus::from_str(ori_status)
-                .map(|v| vec![v.to_string()])
-                .unwrap_or_default(),
+            Err(_) => raw_status_filter::<InstanceBridgeInStatus>(ori_status),
         }
     }
 }
