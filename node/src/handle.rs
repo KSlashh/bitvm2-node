@@ -95,15 +95,6 @@ impl HeavyTask {
         }
     }
 
-    pub(crate) fn message_type(&self) -> &'static str {
-        match self {
-            Self::GenerateVerifierSetup(_) => "InitGraph",
-            Self::GenerateSolderingProof(_) => "CutCircuits",
-            Self::ValidateVerifierGraph(_) => "CreateGraph",
-            Self::VerifySolderingProof(_) => "SolderingProofReady",
-        }
-    }
-
     pub(crate) fn graph_id(&self) -> Uuid {
         match self {
             Self::GenerateVerifierSetup(message) => message.graph_id,
@@ -133,15 +124,6 @@ pub(crate) fn heavy_task_from_content(
         }
         _ => None,
     }
-}
-
-pub(crate) fn is_heavy_task_message_type(message_type: &str, actor: &Actor) -> bool {
-    matches!(
-        (message_type, actor),
-        ("SolderingProofReady", Actor::Operator)
-            | ("InitGraph" | "CutCircuits", Actor::Verifier)
-            | ("CreateGraph", Actor::Verifier)
-    )
 }
 
 pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) -> Result<()> {
@@ -1544,7 +1526,6 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
     else {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             &retry_message,
             60,
             MessageDeferReason::PreviousGraphPending,
@@ -1573,7 +1554,6 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
         }
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             &retry_message,
             60,
             MessageDeferReason::PreviousGraphPending,
@@ -1591,7 +1571,6 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
 
     push_local_unhandled_messages_with_reason(
         ctx.local_db,
-        instance_id,
         &retry_message,
         60,
         MessageDeferReason::PreviousGraphPending,
@@ -3195,7 +3174,6 @@ async fn handle_create_graph_committee(
                     let message = make_message(ctx, content);
                     push_local_unhandled_messages_with_reason(
                         ctx.local_db,
-                        graph_id,
                         &message,
                         60,
                         MessageDeferReason::PreviousGraphPending,
@@ -3211,7 +3189,6 @@ async fn handle_create_graph_committee(
                     let message = make_message(ctx, content);
                     push_local_unhandled_messages_with_reason(
                         ctx.local_db,
-                        graph_id,
                         &message,
                         60,
                         MessageDeferReason::PreviousGraphPending,
@@ -3228,7 +3205,6 @@ async fn handle_create_graph_committee(
                 let message = make_message(ctx, content);
                 push_local_unhandled_messages_with_reason(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     60,
                     MessageDeferReason::PreviousGraphPending,
@@ -3439,7 +3415,6 @@ async fn handle_agg_nonce_consensus_committee(
     else {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -3597,7 +3572,6 @@ async fn validate_committee_presign_for_graph(
     if pub_nonces_unchecked.len() != committee_pubkeys.len() {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -4362,7 +4336,6 @@ async fn handle_pegin_confirm_nonce_consensus_committee(
     else {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -4434,7 +4407,6 @@ async fn handle_pegin_confirm_partial_sig_committee(
     if pub_nonces_unchecked.len() != committee_pubkeys.len() {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -4490,7 +4462,6 @@ async fn handle_pegin_confirm_partial_sig_committee(
     {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             &message,
             30,
             MessageDeferReason::CommitteeNonceConsensusPending,
@@ -4538,7 +4509,6 @@ async fn handle_pegin_confirm_partial_sig_committee(
         Err(e) => {
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                instance_id,
                 &message,
                 30,
                 MessageDeferReason::ValidationRetry,
@@ -4602,7 +4572,6 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                 );
                 push_local_unhandled_messages_with_reason(
                     ctx.local_db,
-                    instance_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::BitcoinTransactionPending,
@@ -4628,7 +4597,6 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
             );
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                instance_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::CommitteeEndorsementsPending,
@@ -4651,7 +4619,6 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                 );
                 push_local_unhandled_messages_with_reason(
                     ctx.local_db,
-                    instance_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::BitcoinConfirmationPending,
@@ -4674,7 +4641,6 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
             );
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                instance_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::GoatSpvPending,
@@ -4735,7 +4701,6 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
         );
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::CommitteeEndorsementsPending,
@@ -4866,7 +4831,6 @@ async fn handle_kickoff_ready_operator(
             let delay_secs = min_pegout_time_secs * nonce_interval;
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::PreviousGraphPending,
@@ -4882,7 +4846,6 @@ async fn handle_kickoff_ready_operator(
             let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 blocks
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::ChainStatePending,
@@ -4907,7 +4870,6 @@ async fn handle_kickoff_ready_operator(
                 let delay_secs = min_pegout_time_secs * nonce_interval;
                 push_local_unhandled_messages_with_reason(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::PreviousGraphPending,
@@ -4923,7 +4885,6 @@ async fn handle_kickoff_ready_operator(
                 let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 blocks
                 push_local_unhandled_messages_with_reason(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::ChainStatePending,
@@ -4983,7 +4944,6 @@ async fn handle_kickoff_sent_committee(
             let message = make_message(ctx, content);
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -5003,7 +4963,6 @@ async fn handle_kickoff_sent_committee(
         let message = make_message(ctx, content);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -5077,7 +5036,6 @@ async fn handle_kickoff_sent_verifier(
                 * (kickoff_height - goat_confirmed_btc_height) as u64;
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::GoatSpvPending,
@@ -5402,7 +5360,6 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
             );
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 wait_secs,
                 MessageDeferReason::ProofPending,
@@ -5721,7 +5678,6 @@ async fn handle_operator_commit_pubin_ready_operator(
             );
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 wait_secs,
                 MessageDeferReason::ProtocolInputsPending,
@@ -5746,7 +5702,6 @@ async fn handle_operator_commit_pubin_ready_operator(
                 );
                 push_local_unhandled_messages_with_reason(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     wait_secs,
                     MessageDeferReason::ProtocolInputsPending,
@@ -5877,7 +5832,6 @@ async fn handle_assert_ready_operator(
         );
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             wait_secs,
             MessageDeferReason::ProofPending,
@@ -6042,7 +5996,6 @@ async fn handle_assert_sent_verifier(
         let message = make_message(ctx, content);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::ProtocolInputsPending,
@@ -6062,7 +6015,6 @@ async fn handle_assert_sent_verifier(
             let message = make_message(ctx, content);
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::ProtocolInputsPending,
@@ -6076,7 +6028,6 @@ async fn handle_assert_sent_verifier(
             let message = make_message(ctx, content);
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::ProtocolInputsPending,
@@ -6107,7 +6058,6 @@ async fn handle_assert_sent_verifier(
                     let message = make_message(ctx, content);
                     push_local_unhandled_messages_with_reason(
                         ctx.local_db,
-                        graph_id,
                         &message,
                         delay_secs as usize,
                         MessageDeferReason::ProtocolInputsPending,
@@ -6318,7 +6268,6 @@ async fn handle_challenge_assert_sent_operator(
         let message = make_message(ctx, content);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::BitcoinTransactionPending,
@@ -6486,7 +6435,6 @@ async fn handle_wrongly_challenge_timeout_verifier(
     if ctx.btc_client.get_tx(&challenge_assert_txid).await?.is_none() {
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::BitcoinTransactionPending,
@@ -6509,7 +6457,6 @@ async fn handle_wrongly_challenge_timeout_verifier(
         None => {
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -6534,7 +6481,6 @@ async fn handle_wrongly_challenge_timeout_verifier(
             avg_block_time_secs(ctx.btc_client.network()) * (disprove_height - bitcoin_height);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             retry_secs as usize,
             MessageDeferReason::TimelockPending,
@@ -6635,7 +6581,6 @@ async fn handle_disprove_sent_committee(
             let delay_secs = avg_block_time_secs(ctx.btc_client.network());
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -6654,7 +6599,6 @@ async fn handle_disprove_sent_committee(
             * (challenge_finish_height - goat_confirmed_height);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -6802,7 +6746,6 @@ async fn handle_take1_sent_committee(
         let delay_secs = avg_block_time_secs(ctx.btc_client.network()) * 6; // wait for 6 blocks
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::WithdrawKickoffPending,
@@ -6826,7 +6769,6 @@ async fn handle_take1_sent_committee(
             let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 block
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -6845,7 +6787,6 @@ async fn handle_take1_sent_committee(
             avg_block_time_secs(ctx.btc_client.network()) * (take1_height - goat_confirmed_height);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -7017,7 +6958,6 @@ async fn handle_take2_sent_committee(
         let delay_secs = avg_block_time_secs(ctx.btc_client.network()) * 6; // wait for 6 blocks
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::WithdrawKickoffPending,
@@ -7041,7 +6981,6 @@ async fn handle_take2_sent_committee(
             let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 block
             push_local_unhandled_messages_with_reason(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -7060,7 +6999,6 @@ async fn handle_take2_sent_committee(
             avg_block_time_secs(ctx.btc_client.network()) * (take2_height - goat_confirmed_height);
         push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,

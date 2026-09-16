@@ -76,6 +76,7 @@ rand = { workspace = true }
 base64 = { workspace = true }
 dotenv = { workspace = true }
 strum = { workspace = true }
+node-macros = { path = "../crates/node-macros" }
 tendermint = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }

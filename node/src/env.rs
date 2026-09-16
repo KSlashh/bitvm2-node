@@ -108,10 +108,9 @@ pub const ENV_SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK: &str =
 pub const ENV_COSMOS_RPC_URL: &str = "COSMOS_RPC_URL";
 pub const DEFAULT_COSMOS_RPC_URL: &str = "https://rpc.testnet3.goat.network/goat-rpc";
 
-// fee estimate
-// TODO: more precise fee estimation
-pub const CHEKSIG_P2WSH_INPUT_VBYTES: u64 = 100;
-pub const CHEKSIG_P2TR_INPUT_VBYTES: u64 = 100;
+// Conservative fee-reserve estimates, not exact serialized transaction sizes.
+pub const CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE: u64 = 100;
+pub const CHECKSIG_P2TR_INPUT_VBYTES_ESTIMATE: u64 = 100;
 pub const P2WSH_OUTPUT_VBYTES: u64 = 50;
 pub const P2TR_OUTPUT_VBYTES: u64 = 50;
 pub const P2A_OUTPUT_VBYTES: u64 = 50;
@@ -125,8 +124,6 @@ pub const MIN_SATKE_AMOUNT: u64 = 4_000_000; // 0.04 BTC
 pub const MIN_CHALLENGE_AMOUNT: u64 = 1_000_000; // 0.01 BTC
 pub const STAKE_RATE: u64 = 0; // 0%
 pub const CHALLENGE_RATE: u64 = 0; // 0%
-
-pub const RATE_MULTIPLIER: u64 = 10000;
 
 const COMMITTEE_MEMBER_NUMBER: usize = 2;
 
@@ -143,8 +140,6 @@ pub const SYNC_GRAPH_MAX_WAIT_SECS: u64 = 30;
 
 // use to judge load history event thread is dead
 pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 600;
-
-pub const GATEWAY_RATE_MULTIPLIER: u64 = 10000;
 
 pub const HEARTBEAT_INTERVAL_SECOND: u64 = 60 * 5;
 pub const REGULAR_TASK_INTERVAL_SECOND: u64 = 20;
@@ -639,8 +634,16 @@ pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
+pub const fn actor_needs_soldering_builder(actor: &Actor) -> bool {
+    matches!(actor, Actor::Verifier | Actor::Operator)
+}
+
+pub const fn actor_runs_babe_setup_state_cleanup(actor: &Actor) -> bool {
+    actor_needs_soldering_builder(actor)
+}
+
 pub fn validate_soldering_proof_payload_store_config(actor: &Actor) -> anyhow::Result<()> {
-    if matches!(actor, Actor::Verifier | Actor::Operator | Actor::All) {
+    if actor_needs_soldering_builder(actor) {
         get_soldering_proof_payload_store_path()
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!("{err}; required for actor {actor}"))
@@ -772,7 +775,7 @@ mod tests {
 
         assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_err());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Operator).is_err());
-        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_err());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Committee).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Watchtower).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Publisher).is_ok());

@@ -1315,29 +1315,6 @@ impl<'a> StorageProcessor<'a> {
             count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_instances"),
         ))
     }
-    /// Get network type by instance ID
-    ///
-    /// Retrieves the network type (e.g., "mainnet", "testnet") for a specific instance.
-    ///
-    /// Parameters:
-    /// - instance_id: The UUID of the instance
-    ///
-    /// Returns:
-    /// - Ok(network_string) if the instance was found
-    /// - Ok("") if no instance with the given ID exists
-    /// - Err if the query failed
-    pub async fn get_network_by_instance(&mut self, instance_id: &Uuid) -> anyhow::Result<String> {
-        if let Some(raw) =
-            sqlx::query!(r#"SELECT network FROM instance WHERE instance_id = ?"#, instance_id)
-                .fetch_optional(self.conn())
-                .await?
-        {
-            Ok(raw.network)
-        } else {
-            Ok("".to_string())
-        }
-    }
-
     /// Insert a swap escrow only when its escrow hash is not already present.
     ///
     /// The chain-event watcher is the sole writer for Initialize records;
@@ -1476,28 +1453,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row.rows_affected())
     }
 
-    /// Update instance status
-    ///
-    /// A concise method specifically for updating instance status
-    pub async fn update_instance_status(
-        &mut self,
-        instance_id: &Uuid,
-        new_status: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET status = ?, status_updated_at = ?, updated_at = ? WHERE instance_id = ?",
-            new_status,
-            current_time,
-            current_time,
-            instance_id
-        )
-            .execute(self.conn())
-            .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
     /// Transition an instance only when it is still in the expected status.
     pub async fn update_instance_status_if_current(
         &mut self,
@@ -1514,48 +1469,6 @@ impl<'a> StorageProcessor<'a> {
             current_time,
             instance_id,
             current_status,
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Update instance pegin confirmation information
-    ///
-    /// Method specifically for updating pegin confirmation transaction ID and fee
-    pub async fn update_instance_pegin_confirm(
-        &mut self,
-        instance_id: &Uuid,
-        pegin_confirm_txid: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET pegin_confirm_txid = ?, updated_at = ? WHERE instance_id = ?",
-            pegin_confirm_txid,
-            current_time,
-            instance_id
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Update instance pegin data transaction ID
-    ///
-    /// Method specifically for updating pegin data transaction ID
-    pub async fn update_instance_pegin_data_txid(
-        &mut self,
-        instance_id: &Uuid,
-        pegin_data_tx_hash: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET pegin_data_tx_hash = ?, updated_at = ? WHERE instance_id = ?",
-            pegin_data_tx_hash,
-            current_time,
-            instance_id
         )
         .execute(self.conn())
         .await?;
@@ -1605,72 +1518,6 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    /// Remove a committee answer from an instance
-    ///
-    /// This method removes a specific committee's answer from the committees_answers HashMap.
-    pub async fn remove_instance_committee_answer(
-        &mut self,
-        instance_id: &Uuid,
-        committee: &str,
-    ) -> anyhow::Result<bool> {
-        // JSON merge-patch removes object members with a null value, so this
-        // stays atomic with concurrent single-answer additions.
-        let committee_patch =
-            serde_json::json!({ (committee): serde_json::Value::Null }).to_string();
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query(
-            "UPDATE instance \
-             SET committees_answers = json_patch(COALESCE(committees_answers, '{}'), json(?)), \
-                 updated_at = ? \
-             WHERE instance_id = ?",
-        )
-        .bind(committee_patch)
-        .bind(current_time)
-        .bind(instance_id)
-        .execute(self.conn())
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Get committees answers for an instance
-    ///
-    /// Returns the committees_answers HashMap for a specific instance.
-    pub async fn get_instance_committees_answers(
-        &mut self,
-        instance_id: &Uuid,
-    ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
-        let current_instance = self.find_instance(instance_id).await?;
-        if let Some(instance) = current_instance {
-            Ok(Some(instance.committees_answers))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Replace the complete committee-answer map.
-    ///
-    /// Callers that add a single answer should use
-    /// `update_instance_committee_answer` instead, which merges atomically.
-    pub async fn update_instance_committees_answers_map(
-        &mut self,
-        instance_id: &Uuid,
-        committees_answers: &IndexMap<String, Vec<u8>>,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let committees_answers_json = serde_json::to_string(&committees_answers)?;
-
-        let res = sqlx::query!(
-            "UPDATE instance SET committees_answers = ?, updated_at = ? WHERE instance_id = ?",
-            committees_answers_json,
-            current_time,
-            instance_id
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(res.rows_affected() > 0)
     }
 
     pub async fn update_instance_parameters(
@@ -2017,25 +1864,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row)
     }
 
-    pub async fn get_graph_operator(&mut self, graph_id: &Uuid) -> anyhow::Result<Option<String>> {
-        #[derive(sqlx::FromRow)]
-        struct OperatorRow {
-            operator_pubkey: String,
-        }
-        if let Some(operator_raw) = sqlx::query_as!(
-            OperatorRow,
-            "SELECT  operator_pubkey  FROM graph WHERE  graph_id = ?",
-            graph_id
-        )
-        .fetch_optional(self.conn())
-        .await?
-        {
-            Ok(Some(operator_raw.operator_pubkey))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub async fn find_graphs(&mut self, params: GraphQuery) -> anyhow::Result<(Vec<Graph>, i64)> {
         // Build base query
         let mut count_params = params.clone();
@@ -2164,62 +1992,12 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.map(|v| (v.graph_id, v.instance_id, v.cur_prekickoff_txid, v.next_prekickoff)))
     }
 
-    pub async fn get_graphs_ids_and_operator_by_instance_ids(
-        &mut self,
-        ids: &[Uuid],
-    ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
-        #[derive(sqlx::FromRow)]
-        struct GraphIdRow {
-            pub graph_id: Uuid,
-            pub instance_id: Uuid,
-            pub operator: String,
-        }
-        let query_str = format!(
-            "SELECT graph_id, instance_id, operator
-             FROM graph
-             WHERE hex(instance_id)
-                       COLLATE NOCASE IN ({})",
-            create_place_holders(ids)
-        );
-        let mut update_query = sqlx::query_as::<_, GraphIdRow>(&query_str);
-        for id in ids {
-            update_query = update_query.bind(hex::encode(id));
-        }
-        let graph_ids = update_query.fetch_all(self.conn()).await?;
-        Ok(graph_ids.into_iter().map(|v| (v.graph_id, v.instance_id, v.operator)).collect())
-    }
-
     pub async fn get_operator_graphs(&mut self, params: GraphQuery) -> anyhow::Result<Vec<Graph>> {
         let graph_query_builder = params.get_query_builder("SELECT * FROM graph");
         let operator_graph_sql = graph_query_builder.get_sql();
         let mut operator_graphs_query = sqlx::query_as::<_, Graph>(&operator_graph_sql);
         operator_graphs_query = graph_query_builder.query_as(operator_graphs_query);
         Ok(operator_graphs_query.fetch_all(self.conn()).await?)
-    }
-
-    pub async fn get_operator_max_kickoff_index(
-        &mut self,
-        operator_pubkey: &str,
-    ) -> anyhow::Result<(Option<Uuid>, i64)> {
-        #[derive(sqlx::FromRow)]
-        struct MaxPreKickoffIndexRow {
-            pub graph_id: Uuid,
-            pub kickoff_index: i64,
-        }
-
-        let record = sqlx::query_as!(
-            MaxPreKickoffIndexRow,
-            "SELECT graph_id AS  \"graph_id:Uuid\", kickoff_index
-                    FROM graph
-                    WHERE operator_pubkey = ?
-                    ORDER BY kickoff_index DESC
-                    limit 1",
-            operator_pubkey
-        )
-        .fetch_optional(self.conn())
-        .await?;
-
-        Ok(record.map_or((None, 0), |v| (Some(v.graph_id), v.kickoff_index)))
     }
 
     pub async fn update_node_timestamp(
@@ -3503,22 +3281,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn has_graph_compensation_marker(
-        &mut self,
-        graph_id: Uuid,
-        message_id: &str,
-    ) -> anyhow::Result<bool> {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM graph_compensation_marker \
-             WHERE graph_id = ? AND message_id = ?)",
-        )
-        .bind(graph_id)
-        .bind(message_id)
-        .fetch_one(self.conn())
-        .await?;
-        Ok(exists != 0)
-    }
-
     pub async fn upsert_pegin_instance_process_data(
         &mut self,
         pegin_instance_process_data: &PeginInstanceProcessData,
@@ -3607,23 +3369,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row)
     }
 
-    pub async fn update_pegin_graph_endorsed(
-        &mut self,
-        graph_id: &Uuid,
-        is_endorsed: bool,
-    ) -> anyhow::Result<()> {
-        sqlx::query!(
-            r#"UPDATE
-                    pegin_graph_process_data
-               SET  is_endorsed = ?
-               WHERE graph_id = ?"#,
-            is_endorsed,
-            graph_id
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(())
-    }
     pub async fn get_pegin_graph_endorsed_len_by_instance_id(
         &mut self,
         instance_id: &Uuid,
@@ -3959,28 +3704,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row)
     }
 
-    pub async fn update_graph_btc_tx_vout_monitor_data(
-        &mut self,
-        graph_id: &Uuid,
-        txid: &SerializableTxid,
-        monitor_data: String,
-    ) -> anyhow::Result<u64> {
-        let current_time = get_current_timestamp_secs();
-        let res = sqlx::query!(
-            "UPDATE graph_btc_tx_vout_monitor
-             SET monitor_data = ?,
-                 updated_at   = ?
-             WHERE graph_id = ? AND txid = ?",
-            monitor_data,
-            current_time,
-            graph_id,
-            txid
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(res.rows_affected())
-    }
-
     pub async fn create_long_running_task_proof(
         &mut self,
         long_running_task_proof: &LongRunningTaskProof,
@@ -4289,26 +4012,6 @@ impl<'a> StorageProcessor<'a> {
             instance_id,
             graph_id,
             old_proof_state
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(res.rows_affected())
-    }
-
-    pub async fn update_operator_proof_state(
-        &mut self,
-        id: i64,
-        proof_state: i64,
-    ) -> anyhow::Result<u64> {
-        let current_time = get_current_timestamp_secs();
-        let res = sqlx::query!(
-            "UPDATE operator_proof
-             SET proof_state = ?,
-                 updated_at = ?
-             WHERE id = ?",
-            proof_state,
-            current_time,
-            id,
         )
         .execute(self.conn())
         .await?;
@@ -4822,6 +4525,33 @@ mod tests {
         );
         let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
         assert_eq!(stored.status, "CommitteesAnswered");
+    }
+
+    #[tokio::test]
+    async fn test_instance_update_rejects_stale_status_transition() {
+        let db = setup_db().await;
+        let instance_id = Uuid::new_v4();
+        let mut storage = db.acquire().await.unwrap();
+        assert!(
+            storage
+                .insert_instance_if_absent(&pegin_instance(instance_id, "RelayerL2Minted"))
+                .await
+                .unwrap()
+        );
+
+        let updated = storage
+            .update_instance(
+                &InstanceUpdate::new_with_instance_id(instance_id)
+                    .with_status("Timeout".to_string())
+                    .with_only_if_status_in(vec!["Presigned".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert!(!updated);
+        assert_eq!(
+            storage.find_instance(&instance_id).await.unwrap().unwrap().status,
+            "RelayerL2Minted"
+        );
     }
 
     #[tokio::test]

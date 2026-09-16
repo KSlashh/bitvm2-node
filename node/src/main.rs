@@ -3,9 +3,9 @@ use base64::Engine;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use bitvm_noded::env::{
-    self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, check_node_info, get_btc_url_from_env,
-    get_goat_network, get_network, get_node_pubkey, goat_config_from_env,
-    validate_soldering_proof_payload_store_config,
+    self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, actor_needs_soldering_builder,
+    check_node_info, get_btc_url_from_env, get_goat_network, get_network, get_node_pubkey,
+    goat_config_from_env, validate_soldering_proof_payload_store_config,
 };
 use clap::{Parser, Subcommand};
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             env::get_goat_network(),
         )),
         http_client: HttpAsyncClient::new(None),
-        soldering_builder: matches!(actor, Actor::Verifier | Actor::Operator)
+        soldering_builder: actor_needs_soldering_builder(&actor)
             .then(|| Arc::new(BabeBundleBuilder::new())),
         metrics_state: metrics_state.clone(),
         shutdown_token: cancellation_token.clone(),

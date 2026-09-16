@@ -41,6 +41,25 @@ const GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS: i64 = 1800;
 const GRAPH_OPERATOR_KICKOFF_STATUS_DURATION_SECS: i64 = 3600 * 3;
 const GRAPH_OPERATOR_CHALLENGE_STATUS_DURATION_SECS: i64 = 3600 * 9;
 
+#[derive(Clone, Copy, Display, EnumString)]
+enum GraphDisplayStatus {
+    Created,
+    Presigned,
+    L2Recorded,
+    OperatorKickOffing,
+}
+
+#[derive(Clone, Copy, Display, EnumString)]
+enum InstanceDisplayStatus {
+    Initiated,
+    Verified,
+    Submitted,
+    Failed,
+    Processing,
+    Success,
+    Canceled,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct InstanceSettingResponse {
     pub bridge_in_amount: Vec<f32>,
@@ -311,21 +330,17 @@ fn get_bridge_in_status_time_window_secs(status: &str, response_window_blocks: i
         + INSTANCE_RELAYER_L1_BROADCAST_STATUS_DURATION_SECS;
 
     match InstanceBridgeInStatus::from_str(status) {
-        Ok(InstanceBridgeInStatus::UserIniting)
-        | Ok(InstanceBridgeInStatus::Initiated)
-        | Ok(InstanceBridgeInStatus::UserInited) => {
+        Ok(InstanceBridgeInStatus::UserIniting) | Ok(InstanceBridgeInStatus::UserInited) => {
             (response_window_blocks_with_margin * GOAT_BLOCK_INTERVAL_SECS, total_time)
         }
-        Ok(InstanceBridgeInStatus::CommitteesAnswered) | Ok(InstanceBridgeInStatus::Verified) => {
+        Ok(InstanceBridgeInStatus::CommitteesAnswered) => {
             (0, total_time - response_window_blocks_with_margin * GOAT_BLOCK_INTERVAL_SECS)
         }
-        Ok(InstanceBridgeInStatus::Submitted)
-        | Ok(InstanceBridgeInStatus::UserBroadcastPeginPrepare) => (
+        Ok(InstanceBridgeInStatus::UserBroadcastPeginPrepare) => (
             INSTANCE_USER_BROADCAST_PREPARE_STATUS_DURATION_SECS,
             total_time - response_window_blocks_with_margin * GOAT_BLOCK_INTERVAL_SECS,
         ),
-        Ok(InstanceBridgeInStatus::Processing)
-        | Ok(InstanceBridgeInStatus::Presigned)
+        Ok(InstanceBridgeInStatus::Presigned)
         | Ok(InstanceBridgeInStatus::RelayerL1Broadcasted) => (
             INSTANCE_RELAYER_L1_BROADCAST_STATUS_DURATION_SECS,
             total_time
@@ -469,7 +484,7 @@ impl From<GraphQueryParams> for GraphQuery {
         let mut is_init_withdraw_not_null = value
             .status
             .as_ref()
-            .map(|status| status == &GraphStatus::OperatorKickOffing.to_string())
+            .map(|status| status == &GraphDisplayStatus::OperatorKickOffing.to_string())
             .unwrap_or(false);
         is_init_withdraw_not_null = is_init_withdraw_not_null || value.is_pegout_started;
         let mut statuses = vec![];
@@ -647,28 +662,29 @@ trait DisplayStatusConvert {
 impl DisplayStatusConvert for Graph {
     fn convert_to_display_status(&self) -> String {
         match GraphStatus::from_str(&self.status) {
-            Ok(GraphStatus::OperatorPresigned) => GraphStatus::Created.to_string(),
-            Ok(GraphStatus::CommitteePresigned) => GraphStatus::Presigned.to_string(),
+            Ok(GraphStatus::OperatorPresigned) => GraphDisplayStatus::Created.to_string(),
+            Ok(GraphStatus::CommitteePresigned) => GraphDisplayStatus::Presigned.to_string(),
             Ok(GraphStatus::OperatorDataPushed) => {
                 if self.init_withdraw_tx_hash.is_some() {
-                    GraphStatus::OperatorKickOffing.to_string()
+                    GraphDisplayStatus::OperatorKickOffing.to_string()
                 } else {
-                    GraphStatus::L2Recorded.to_string()
+                    GraphDisplayStatus::L2Recorded.to_string()
                 }
             }
             Ok(_) | Err(_) => self.status.clone(),
         }
     }
     fn parse_display_status(ori_status: &str) -> Vec<String> {
-        match GraphStatus::from_str(ori_status) {
-            Ok(GraphStatus::Created) => vec![GraphStatus::OperatorPresigned.to_string()],
-            Ok(GraphStatus::Presigned) => vec![GraphStatus::CommitteePresigned.to_string()],
-            Ok(GraphStatus::L2Recorded) => vec![GraphStatus::OperatorDataPushed.to_string()],
-            Ok(GraphStatus::OperatorKickOffing) => {
+        match GraphDisplayStatus::from_str(ori_status) {
+            Ok(GraphDisplayStatus::Created) => vec![GraphStatus::OperatorPresigned.to_string()],
+            Ok(GraphDisplayStatus::Presigned) => vec![GraphStatus::CommitteePresigned.to_string()],
+            Ok(GraphDisplayStatus::L2Recorded) => vec![GraphStatus::OperatorDataPushed.to_string()],
+            Ok(GraphDisplayStatus::OperatorKickOffing) => {
                 vec![GraphStatus::OperatorDataPushed.to_string()]
             }
-            Ok(v) => vec![v.to_string()],
-            Err(_) => vec![],
+            Err(_) => {
+                GraphStatus::from_str(ori_status).map(|v| vec![v.to_string()]).unwrap_or_default()
+            }
         }
     }
 }
@@ -676,62 +692,63 @@ impl DisplayStatusConvert for Graph {
 impl DisplayStatusConvert for Instance {
     fn convert_to_display_status(&self) -> String {
         match InstanceBridgeInStatus::from_str(&self.status) {
-            Ok(InstanceBridgeInStatus::UserInited) => InstanceBridgeInStatus::Initiated.to_string(),
+            Ok(InstanceBridgeInStatus::UserInited) => InstanceDisplayStatus::Initiated.to_string(),
             Ok(InstanceBridgeInStatus::CommitteesAnswered) => {
-                InstanceBridgeInStatus::Verified.to_string()
+                InstanceDisplayStatus::Verified.to_string()
             }
             Ok(InstanceBridgeInStatus::UserBroadcastPeginPrepare) => {
-                InstanceBridgeInStatus::Submitted.to_string()
+                InstanceDisplayStatus::Submitted.to_string()
             }
-            Ok(InstanceBridgeInStatus::Presigned) => InstanceBridgeInStatus::Processing.to_string(),
+            Ok(InstanceBridgeInStatus::Presigned) => InstanceDisplayStatus::Processing.to_string(),
             Ok(InstanceBridgeInStatus::RelayerL1Broadcasted) => {
-                InstanceBridgeInStatus::Processing.to_string()
+                InstanceDisplayStatus::Processing.to_string()
             }
             Ok(InstanceBridgeInStatus::RelayerL2Minted) => {
-                InstanceBridgeInStatus::Success.to_string()
+                InstanceDisplayStatus::Success.to_string()
             }
             Ok(InstanceBridgeInStatus::PresignedFailed)
             | Ok(InstanceBridgeInStatus::RelayerL2MintedFailed)
-            | Ok(InstanceBridgeInStatus::NoEnoughCommitteesAnswered) => {
-                InstanceBridgeInStatus::Failed.to_string()
+            | Ok(InstanceBridgeInStatus::NoEnoughCommitteesAnswered)
+            | Ok(InstanceBridgeInStatus::UserDiscarded) => {
+                InstanceDisplayStatus::Failed.to_string()
             }
-            Ok(InstanceBridgeInStatus::UserCanceled) => {
-                InstanceBridgeInStatus::Canceled.to_string()
-            }
+            Ok(InstanceBridgeInStatus::UserCanceled) => InstanceDisplayStatus::Canceled.to_string(),
             Ok(_) | Err(_) => self.status.clone(),
         }
     }
 
     fn parse_display_status(ori_status: &str) -> Vec<String> {
-        match InstanceBridgeInStatus::from_str(ori_status) {
-            Ok(InstanceBridgeInStatus::Initiated) => {
+        match InstanceDisplayStatus::from_str(ori_status) {
+            Ok(InstanceDisplayStatus::Initiated) => {
                 vec![InstanceBridgeInStatus::UserInited.to_string()]
             }
-            Ok(InstanceBridgeInStatus::Verified) => {
+            Ok(InstanceDisplayStatus::Verified) => {
                 vec![InstanceBridgeInStatus::CommitteesAnswered.to_string()]
             }
-            Ok(InstanceBridgeInStatus::Submitted) => {
+            Ok(InstanceDisplayStatus::Submitted) => {
                 vec![InstanceBridgeInStatus::UserBroadcastPeginPrepare.to_string()]
             }
-            Ok(InstanceBridgeInStatus::Processing) => {
+            Ok(InstanceDisplayStatus::Processing) => {
                 vec![
                     InstanceBridgeInStatus::RelayerL1Broadcasted.to_string(),
                     InstanceBridgeInStatus::Presigned.to_string(),
                 ]
             }
-            Ok(InstanceBridgeInStatus::Success) => {
+            Ok(InstanceDisplayStatus::Success) => {
                 vec![InstanceBridgeInStatus::RelayerL2Minted.to_string()]
             }
-            Ok(InstanceBridgeInStatus::Canceled) => {
+            Ok(InstanceDisplayStatus::Canceled) => {
                 vec![InstanceBridgeInStatus::UserCanceled.to_string()]
             }
-            Ok(InstanceBridgeInStatus::Failed) => vec![
+            Ok(InstanceDisplayStatus::Failed) => vec![
                 InstanceBridgeInStatus::PresignedFailed.to_string(),
                 InstanceBridgeInStatus::RelayerL2MintedFailed.to_string(),
                 InstanceBridgeInStatus::NoEnoughCommitteesAnswered.to_string(),
+                InstanceBridgeInStatus::UserDiscarded.to_string(),
             ],
-            Ok(v) => vec![v.to_string()],
-            Err(_) => vec![],
+            Err(_) => InstanceBridgeInStatus::from_str(ori_status)
+                .map(|v| vec![v.to_string()])
+                .unwrap_or_default(),
         }
     }
 }

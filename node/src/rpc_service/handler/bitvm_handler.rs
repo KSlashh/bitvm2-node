@@ -1632,15 +1632,6 @@ pub async fn pegout(
                             ),
                         );
                     }
-                    _ => {
-                        return error_response(
-                            "PEGOUT_ERROR".to_string(),
-                            format!(
-                                "graph {} not ready: previous graph {} has unexpected status {}",
-                                graph.graph_id, previous_graph.graph_id, previous_graph.status
-                            ),
-                        );
-                    }
                 }
             }
         }

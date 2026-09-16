@@ -1,6 +1,7 @@
 use crate::action::{
-    ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, KickoffSent, NodeInfo,
-    PreKickoffSent, SolderingProofReady, Take1Sent, Take2Sent, send_to_peer,
+    BusinessRef, ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, HasBusinessRef,
+    KickoffSent, LocalMessageKey, MessageKind, NodeInfo, PreKickoffSent, SolderingProofReady,
+    Take1Sent, Take2Sent, send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
@@ -78,7 +79,6 @@ use crate::rpc_service::routes::v1::{
     NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
 };
 
-use crate::scheduled_tasks::get_goat_message_content_type;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     ChallengeSubStatus, VerifierChallengeStatus,
 };
@@ -98,9 +98,8 @@ use proof_builder::{
 };
 use store::{
     BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, GraphStatusSource,
-    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, Message, MessageState,
-    MessageType, Node, PeginGraphProcessData, PeginInstanceProcessData, SerializableTxid,
-    UInt64Array3,
+    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, Message, MessageState, Node,
+    PeginGraphProcessData, PeginInstanceProcessData, SerializableTxid, UInt64Array3,
 };
 use stun_client::{Attribute, Class, Client};
 use tracing::{error, info, warn};
@@ -713,8 +712,8 @@ pub fn challenge_amount() -> Amount {
     Amount::from_sat(20000)
 }
 pub fn prekickoff_fee_amount(replenish_fee_inputs_num: usize) -> Amount {
-    let tx_vbytes =
-        PRE_KICKOFF_BASE_VBYTES + (replenish_fee_inputs_num as u64 * CHEKSIG_P2WSH_INPUT_VBYTES);
+    let tx_vbytes = PRE_KICKOFF_BASE_VBYTES
+        + (replenish_fee_inputs_num as u64 * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE);
     Amount::from_sat(tx_vbytes)
 }
 pub mod evm_swap_utils {
@@ -1754,8 +1753,7 @@ fn compensation_previous_status(status: GraphStatus) -> Option<GraphStatus> {
         OperatorKickOff => Some(PreKickoff),
         OperatorTake1 | Challenge => Some(OperatorKickOff),
         Disprove | OperatorTake2 => Some(Challenge),
-        OperatorPresigned | Created | Presigned | L2Recorded | OperatorKickOffing | Challenging
-        | Disproving => None,
+        OperatorPresigned => None,
     }
 }
 
@@ -1789,13 +1787,15 @@ fn compensation_events_from(
 
 async fn upsert_graph_compensate_message(
     local_db: &LocalDB,
-    graph_id: Uuid,
-    sub_type: Option<String>,
     actor: Actor,
     message_content: GOATMessageContent,
 ) -> Result<()> {
-    let message_type = get_goat_message_content_type(&message_content);
-    let message_id = generate_message_id(graph_id, message_type.to_string(), sub_type.clone());
+    let key = LocalMessageKey::from_content(actor.clone(), &message_content)?;
+    let graph_id = match message_content.business_ref() {
+        BusinessRef::Graph { graph_id, .. } => graph_id,
+        _ => bail!("graph compensation message must be graph-scoped"),
+    };
+    let message_id = key.message_id();
     let mut storage_processor = local_db.start_transaction().await?;
     if !storage_processor.insert_graph_compensation_marker(graph_id, &message_id).await? {
         storage_processor.commit().await?;
@@ -1805,8 +1805,6 @@ async fn upsert_graph_compensate_message(
     upsert_message(
         &mut storage_processor,
         false,
-        graph_id,
-        sub_type,
         SELF_SENDER.to_string(),
         actor,
         message_content,
@@ -1819,14 +1817,13 @@ async fn upsert_graph_compensate_message(
 
 async fn push_graph_compensate_message(
     local_db: &LocalDB,
-    graph_id: Uuid,
     actor: Actor,
     message_content: GOATMessageContent,
 ) -> Result<()> {
     // Unlike an action retry, an inferred chain event must not reset an
     // existing queued message. This makes compensation safe to retry when the
     // status write committed before the message was persisted.
-    upsert_graph_compensate_message(local_db, graph_id, None, actor, message_content).await
+    upsert_graph_compensate_message(local_db, actor, message_content).await
 }
 
 #[allow(dead_code)]
@@ -1875,7 +1872,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::PreKickoffSent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::Verifier,
                     GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
                 )
@@ -1884,7 +1880,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::KickoffSent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::All,
                     GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
                 )
@@ -1893,7 +1888,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::Take1Sent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::Committee,
                     GOATMessageContent::Take1Sent(Take1Sent { instance_id, graph_id }),
                 )
@@ -1903,7 +1897,6 @@ pub(crate) async fn compensate_graph_events(
                 if let Some(challenge_txid) = scan.challenge_txid {
                     push_graph_compensate_message(
                         local_db,
-                        graph_id,
                         Actor::Operator,
                         GOATMessageContent::ChallengeSent(ChallengeSent {
                             instance_id,
@@ -1922,8 +1915,6 @@ pub(crate) async fn compensate_graph_events(
                 })?;
                 upsert_graph_compensate_message(
                     local_db,
-                    graph_id,
-                    Some(disprove.index.to_string()),
                     Actor::Committee,
                     GOATMessageContent::DisproveSent(DisproveSent {
                         instance_id,
@@ -1939,7 +1930,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::Take2Sent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::Committee,
                     GOATMessageContent::Take2Sent(Take2Sent { instance_id, graph_id }),
                 )
@@ -3066,7 +3056,7 @@ pub async fn get_proper_utxo_set(
     fn estimate_tx_vbytes(base_vbytes: u64, extra_inputs: usize, extra_outputs: usize) -> u64 {
         // p2wsh inputs/outputs
         base_vbytes
-            + (extra_inputs as u64 * CHEKSIG_P2WSH_INPUT_VBYTES)
+            + (extra_inputs as u64 * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE)
             + (extra_outputs as u64 * P2WSH_OUTPUT_VBYTES)
     }
     fn to_input(utxos: Vec<Utxo>) -> Vec<Input> {
@@ -3172,8 +3162,9 @@ pub async fn get_proper_utxo_sets(
 
             let n_inputs = tx_ins.len() as u64;
             let n_outputs = base_outputs.len() as u64 + 1;
-            let est_vbytes =
-                100u64 + n_inputs * CHEKSIG_P2WSH_INPUT_VBYTES + n_outputs * P2WSH_OUTPUT_VBYTES;
+            let est_vbytes = 100u64
+                + n_inputs * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE
+                + n_outputs * P2WSH_OUTPUT_VBYTES;
             let est_fee_sat = (est_vbytes as f64 * fee_rate).ceil() as u64;
 
             if total_available_sat < total_target_sat + est_fee_sat {
@@ -3751,37 +3742,23 @@ pub async fn outpoint_spent_txin(
     }
 }
 
-pub(crate) fn generate_message_id(
-    business_id: Uuid,
-    msg_type: String,
-    sub_type: Option<String>,
-) -> String {
-    match sub_type {
-        Some(sub_type) => {
-            format!("{business_id}_{msg_type}_{sub_type}")
-        }
-        None => format!("{business_id}_{msg_type}"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub async fn upsert_message(
     storage_processor: &mut StorageProcessor<'_>,
     is_update: bool,
-    business_id: Uuid,
-    sub_type: Option<String>,
     from_peer: String,
     actor: Actor,
     message_content: GOATMessageContent,
     weight: i64,
     lock_time: i64,
 ) -> Result<bool> {
+    let key = LocalMessageKey::from_content(actor.clone(), &message_content)?;
+    let business_id = key.business_id();
+    let message_id = key.message_id();
+    let msg_type = message_content.kind();
     let message = GOATMessage::new(actor.clone(), message_content.clone());
-    let msg_type = get_goat_message_content_type(&message_content);
-    let message_id = generate_message_id(business_id, msg_type.to_string().clone(), sub_type);
     if is_update || storage_processor.find_messages_by_id(&message_id).await?.is_none() {
         if let Some(cancel_msg_type) = match msg_type {
-            MessageType::AssertSent => Some(MessageType::WatchtowerChallengeInitSent),
+            MessageKind::AssertSent => Some(MessageKind::WatchtowerChallengeInitSent),
             _ => None,
         } {
             notify_to_cancel_proof_task(storage_processor, business_id, cancel_msg_type).await?;
@@ -3815,10 +3792,10 @@ pub async fn upsert_message(
 pub async fn notify_to_cancel_proof_task(
     storage_processor: &mut StorageProcessor<'_>,
     business_id: Uuid,
-    msg_type: MessageType,
+    msg_type: MessageKind,
 ) -> Result<()> {
     // AssertInitSent is removed; update related logic if needed;
-    if !matches!(msg_type, MessageType::WatchtowerChallengeInitSent) {
+    if !matches!(msg_type, MessageKind::WatchtowerChallengeInitSent) {
         warn!("notify_to_cancel_proof_task: input wrong message type:{msg_type}");
         return Ok(());
     }
@@ -3849,7 +3826,7 @@ pub async fn notify_to_cancel_proof_task(
         // It will only be called a few times under limited conditions, so we just create a new object
         let http_client = HttpAsyncClient::new(None);
         let notify_result = match msg_type {
-            MessageType::WatchtowerChallengeInitSent => {
+            MessageKind::WatchtowerChallengeInitSent => {
                 let url = host.join(PROOFS_WATCHTOWER_PROOF_TIMEOUT)?;
                 let payload = WatchtowerProofTimeoutUpdateRequest {
                     instance_id: graph.instance_id.to_string(),
@@ -4098,7 +4075,7 @@ pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<
     info!("save_node_info for {}", node_info.peer_id);
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut storage_process = local_db.acquire().await?;
-    let _ = storage_process
+    storage_process
         .upsert_node(&Node {
             peer_id: node_info.peer_id.clone(),
             actor: node_info.actor.clone(),
@@ -4112,7 +4089,7 @@ pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<
             updated_at: current_time,
             created_at: current_time,
         })
-        .await;
+        .await?;
     Ok(())
 }
 
@@ -4506,15 +4483,19 @@ pub async fn get_instance_parameters(
     instance_id: Uuid,
 ) -> Result<Option<BitvmGcInstanceParameters>> {
     let mut storage_processor = local_db.acquire().await?;
-    if let Some(instance) = storage_processor.find_instance(&instance_id).await? {
-        Ok(if let Some(parameters) = instance.parameters {
-            Some(serde_json::from_str(&parameters)?)
-        } else {
-            gen_instance_parameters_local(&instance).ok()
-        })
-    } else {
-        Ok(None)
+    let Some(instance) = storage_processor.find_instance(&instance_id).await? else {
+        return Ok(None);
+    };
+
+    if let Some(parameters) = instance.parameters {
+        return Ok(Some(serde_json::from_str(&parameters)?));
     }
+
+    Ok(Some(
+        gen_instance_parameters_local(&instance).with_context(|| {
+            format!("failed to reconstruct parameters for instance {instance_id}")
+        })?,
+    ))
 }
 
 fn convert_graph(
@@ -5903,8 +5884,15 @@ pub fn gen_instance_parameters_local(
     let committee_pubkeys: Vec<PublicKey> = instance
         .committees_answers
         .iter()
-        .map(|(_k, v)| PublicKey::from_slice(v).unwrap())
-        .collect();
+        .map(|(committee, pubkey)| {
+            PublicKey::from_slice(pubkey).with_context(|| {
+                format!(
+                    "invalid committee public key for committee {committee} in instance {}",
+                    instance.instance_id
+                )
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
     let utxos: Vec<client::Utxo> = serde_json::from_str(&instance.input_utxos)?;
@@ -6033,7 +6021,12 @@ pub async fn get_largest_watchtower_challenge_block(
                 if let Some(block_height) = tx_status.block_height {
                     if block_height > largest_watchtower_challenge_block_height {
                         largest_watchtower_challenge_block_height = block_height;
-                        largest_watchtower_challenge_block_hash = tx_status.block_hash.unwrap();
+                        largest_watchtower_challenge_block_hash = tx_status.block_hash.ok_or_else(|| {
+                            anyhow!(
+                                "Watchtower challenge tx {txid} for graph {}, index: {watchtower_index} is confirmed at height {block_height} without a block hash",
+                                graph.parameters.graph_id
+                            )
+                        })?;
                     }
                 } else {
                     anyhow::bail!(

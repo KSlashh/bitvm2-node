@@ -208,15 +208,6 @@ pub enum InstanceBridgeInStatus {
     UserCanceled,               // user broadcast Pegin-cancel tx
     NoEnoughCommitteesAnswered, // no enough committee responsed & window expired
     UserDiscarded,              // pegin prepare tx input uxto been spent in other tx
-
-    // for front end display
-    Initiated,  // UserInited
-    Verified,   // CommitteesAnswered
-    Submitted,  // UserBroadcastPeginPrepare
-    Failed,     // PresignedFailed, RelayerL2MintedFailed, NoEnoughCommitteesAnswered, UserDiscarded
-    Processing, // Presigned, RelayerL1Broadcasted
-    Success,    // RelayerL2Minted
-    Canceled,   // UserCanceled
 }
 
 /// Lifecycle of a swap-based bridge-out escrow.
@@ -325,14 +316,6 @@ pub enum GraphStatus {
     Skipped,
     OperatorTake1,
     OperatorTake2,
-
-    /// frontend use only
-    Created,
-    Presigned,
-    L2Recorded,
-    OperatorKickOffing,
-    Challenging,
-    Disproving,
 }
 
 /// The evidence that authorizes a graph status transition.
@@ -477,8 +460,7 @@ impl GraphStatus {
                 OperatorTake1 => TAKE1,
                 OperatorTake2 | Disprove => TAKE2_OR_DISPROVE,
                 Skipped => SKIPPED,
-                OperatorPresigned | Created | Presigned | L2Recorded | OperatorKickOffing
-                | Challenging | Disproving => &[],
+                OperatorPresigned => &[],
             },
         }
     }
@@ -700,53 +682,6 @@ pub struct PendingGraphInit {
     pub graph_id: Uuid,
     pub updated_at: i64,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Display, EnumString)]
-pub enum MessageType {
-    None,
-    PeginRequest,
-    CreateGraph,
-    ConfirmInstance,
-    InitGraph,
-    GenCircuits,
-    CutCircuits,
-    SolderingProof,
-    VerifierGraphParamsEndorsement,
-    NonceGeneration,
-    AggNonceConsensus,
-    CommitteePresign,
-    GraphFinalize,
-    EndorseGraph,
-    PeginConfirmNonce,
-    PeginConfirmNonceConsensus,
-    PeginConfirmPartialSig,
-    PostReady,
-    KickoffReady,
-    KickoffSent,
-    PreKickoffSent,
-    ChallengeSent,
-    WatchtowerChallengeInitSent,
-    WatchtowerChallengeSent,
-    WatchtowerChallengeTimeout,
-    NackReady,
-    OperatorCommitPubinReady,
-    OperatorCommitPubinTimeout,
-    AssertReady,
-    AssertSent,
-    ChallengeAssertSent,
-    WronglyChallengeTimeout,
-    DisproveSent,
-    Take1Ready,
-    Take1Sent,
-    Take2Ready,
-    Take2Sent,
-    RequestNodeInfo,
-    ResponseNodeInfo,
-    SyncGraphRequest,
-    SyncGraph,
-    InstanceDiscarded,
-    Tick,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, Display, EnumString)]
@@ -992,17 +927,16 @@ mod tests {
 
     #[test]
     fn test_graph_status_from_str() {
-        assert_eq!(GraphStatus::from_str("Created").unwrap(), GraphStatus::Created);
         assert_eq!(
             GraphStatus::from_str("OperatorPresigned").unwrap(),
             GraphStatus::OperatorPresigned
         );
+        assert!(GraphStatus::from_str("Created").is_err());
         assert!(GraphStatus::from_str("Invalid").is_err());
     }
 
     #[test]
     fn test_graph_status_display() {
-        assert_eq!(GraphStatus::Created.to_string(), "Created");
         assert_eq!(GraphStatus::OperatorPresigned.to_string(), "OperatorPresigned");
     }
 
@@ -1013,13 +947,6 @@ mod tests {
             InstanceBridgeInStatus::RelayerL2Minted
         );
         assert!(InstanceBridgeInStatus::from_str("Invalid").is_err());
-    }
-
-    #[test]
-    fn test_message_type_from_str() {
-        assert_eq!(MessageType::from_str("PeginRequest").unwrap(), MessageType::PeginRequest);
-        assert_eq!(MessageType::from_str("CreateGraph").unwrap(), MessageType::CreateGraph);
-        assert!(MessageType::from_str("Invalid").is_err());
     }
 
     #[test]

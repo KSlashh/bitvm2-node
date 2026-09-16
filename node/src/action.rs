@@ -8,7 +8,7 @@ use crate::env::{
 };
 use crate::handle::{
     HandlerContext, HeavyTaskContext, dispatch as handle_dispatch, heavy_task_from_content,
-    is_heavy_task_message_type, run_heavy_task,
+    run_heavy_task,
 };
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
@@ -31,6 +31,7 @@ use futures::FutureExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
+use node_macros::MessageBusinessRef;
 use secp256k1::{
     Keypair, Message as SecpMessage, SECP256K1, schnorr::Signature as SchnorrSignature,
 };
@@ -42,6 +43,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
 use store::{MessageState, P2pInboxMessage};
+use strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoStaticStr};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -363,54 +365,212 @@ impl MessageDeferReason {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusinessRef {
+    Instance { instance_id: Uuid },
+    Graph { instance_id: Uuid, graph_id: Uuid },
+    Unscoped,
+}
+
+impl BusinessRef {
+    pub const fn primary_id(self) -> Option<Uuid> {
+        match self {
+            Self::Instance { instance_id } => Some(instance_id),
+            Self::Graph { graph_id, .. } => Some(graph_id),
+            Self::Unscoped => None,
+        }
+    }
+
+    fn key_part(self) -> String {
+        match self {
+            Self::Instance { instance_id } => format!("instance:{instance_id}"),
+            Self::Graph { instance_id, graph_id } => format!("graph:{instance_id}:{graph_id}"),
+            Self::Unscoped => "unscoped".to_owned(),
+        }
+    }
+}
+
+pub trait HasBusinessRef {
+    fn business_ref(&self) -> BusinessRef;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MessageQualifier {
+    Singleton,
+    Watchtower(usize),
+    Verifier(usize),
+    Disprove { kind: DisproveTxType, index: usize },
+}
+
+impl MessageQualifier {
+    fn key_part(&self) -> String {
+        match self {
+            Self::Singleton => "singleton".to_owned(),
+            Self::Watchtower(index) => format!("watchtower:{index}"),
+            Self::Verifier(index) => format!("verifier:{index}"),
+            Self::Disprove { kind, index } => format!("disprove:{kind}:{index}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalMessageKey {
+    actor: Actor,
+    kind: MessageKind,
+    business_ref: BusinessRef,
+    qualifier: MessageQualifier,
+}
+
+impl LocalMessageKey {
+    pub fn from_content(actor: Actor, content: &GOATMessageContent) -> Result<Self> {
+        let business_ref = content.business_ref();
+        if business_ref.primary_id().is_none() {
+            bail!("cannot persist unscoped {} as a local message", content.event_type());
+        }
+        Ok(Self { actor, kind: content.kind(), business_ref, qualifier: content.qualifier() })
+    }
+
+    pub fn business_id(&self) -> Uuid {
+        match self.business_ref {
+            BusinessRef::Instance { instance_id } => instance_id,
+            BusinessRef::Graph { graph_id, .. } => graph_id,
+            BusinessRef::Unscoped => unreachable!("unscoped messages cannot have a local key"),
+        }
+    }
+
+    pub fn message_id(&self) -> String {
+        format!(
+            "local:v1:{}:{}:{}:{}",
+            self.actor,
+            self.business_ref.key_part(),
+            self.kind,
+            self.qualifier.key_part(),
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, EnumDiscriminants, MessageBusinessRef)]
+#[strum_discriminants(name(MessageKind))]
+#[strum_discriminants(derive(Hash, Display, EnumString, EnumIter, IntoStaticStr))]
 pub enum GOATMessageContent {
+    #[business_ref(instance)]
     PeginRequest(PeginRequest),
+    #[business_ref(graph)]
     CreateGraph(CreateGraph),
+    #[business_ref(instance)]
     ConfirmInstance(ConfirmInstance),
+    #[business_ref(graph)]
     InitGraph(InitGraph),
+    #[business_ref(graph)]
     GenCircuits(GenCircuits),
+    #[business_ref(graph)]
     CutCircuits(CutCircuits),
+    #[business_ref(graph)]
     SolderingProofReady(SolderingProofReady),
+    #[business_ref(graph)]
     GraphSetupAck(GraphSetupAck),
+    #[business_ref(graph)]
     VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement),
+    #[business_ref(graph)]
     NonceGeneration(NonceGeneration),
+    #[business_ref(graph)]
     AggNonceConsensus(AggNonceConsensus),
+    #[business_ref(graph)]
     CommitteePresign(CommitteePresign),
+    #[business_ref(graph)]
     EndorseGraph(EndorseGraph),
+    #[business_ref(graph)]
     GraphFinalize(GraphFinalize),
+    #[business_ref(instance)]
     PeginConfirmNonce(PeginConfirmNonce),
+    #[business_ref(instance)]
     PeginConfirmNonceConsensus(PeginConfirmNonceConsensus),
+    #[business_ref(instance)]
     PeginConfirmPartialSig(PeginConfirmPartialSig),
+    #[business_ref(instance)]
     PostReady(PostReady),
+    #[business_ref(graph)]
     KickoffReady(KickoffReady),
+    #[business_ref(graph)]
     KickoffSent(KickoffSent),
+    #[business_ref(graph)]
     PreKickoffSent(PreKickoffSent),
+    #[business_ref(graph)]
     ChallengeSent(ChallengeSent),
+    #[business_ref(graph)]
     WatchtowerChallengeInitSent(WatchtowerChallengeInitSent),
+    #[business_ref(graph)]
     WatchtowerChallengeSent(WatchtowerChallengeSent),
+    #[business_ref(graph)]
     WatchtowerChallengeTimeout(WatchtowerChallengeTimeout),
+    #[business_ref(graph)]
     NackReady(NackReady),
+    #[business_ref(graph)]
     OperatorCommitPubinReady(OperatorCommitPubinReady),
+    #[business_ref(graph)]
     OperatorCommitPubinTimeout(OperatorCommitPubinTimeout),
+    #[business_ref(graph)]
     AssertReady(AssertReady),
+    #[business_ref(graph)]
     AssertSent(AssertSent),
+    #[business_ref(graph)]
     ChallengeAssertSent(ChallengeAssertSent),
+    #[business_ref(graph)]
     WronglyChallengeTimeout(WronglyChallengeTimeout),
+    #[business_ref(graph)]
     DisproveSent(DisproveSent),
+    #[business_ref(graph)]
     Take1Ready(Take1Ready),
+    #[business_ref(graph)]
     Take1Sent(Take1Sent),
+    #[business_ref(graph)]
     Take2Ready(Take2Ready),
+    #[business_ref(graph)]
     Take2Sent(Take2Sent),
+    #[business_ref(unscoped)]
     RequestNodeInfo(NodeInfo),
+    #[business_ref(unscoped)]
     ResponseNodeInfo(NodeInfo),
+    #[business_ref(graph)]
     SyncGraphRequest(SyncGraphRequest),
+    #[business_ref(graph)]
     SyncGraph(SyncGraph),
+    #[business_ref(unscoped)]
     InstanceDiscarded(InstanceDiscarded),
+    #[business_ref(unscoped)]
     Tick,
 }
 
+impl MessageKind {
+    const fn is_pegin(self) -> bool {
+        matches!(
+            self,
+            Self::PeginRequest
+                | Self::ConfirmInstance
+                | Self::CreateGraph
+                | Self::InitGraph
+                | Self::GenCircuits
+                | Self::CutCircuits
+                | Self::SolderingProofReady
+                | Self::VerifierGraphParamsEndorsement
+                | Self::NonceGeneration
+                | Self::AggNonceConsensus
+                | Self::CommitteePresign
+                | Self::EndorseGraph
+                | Self::GraphFinalize
+                | Self::PeginConfirmNonce
+                | Self::PeginConfirmNonceConsensus
+                | Self::PeginConfirmPartialSig
+                | Self::PostReady
+        )
+    }
+}
+
 impl GOATMessageContent {
+    pub fn kind(&self) -> MessageKind {
+        self.into()
+    }
+
     /// New messages default to the durable inbox and must explicitly opt into
     /// immediate processing when they are safe to drop.
     pub const fn p2p_delivery(&self) -> P2PMessageDelivery {
@@ -424,76 +584,27 @@ impl GOATMessageContent {
         }
     }
 
-    /// Stable message name for logs/metrics.  Keep this independent of `Debug`, whose
+    /// Stable message name for logs/metrics. Keep this independent of `Debug`, whose
     /// output can include protocol payloads (and, for proofs, be very large).
     pub fn event_type(&self) -> &'static str {
-        match self {
-            Self::PeginRequest(_) => "PeginRequest",
-            Self::CreateGraph(_) => "CreateGraph",
-            Self::ConfirmInstance(_) => "ConfirmInstance",
-            Self::InitGraph(_) => "InitGraph",
-            Self::GenCircuits(_) => "GenCircuits",
-            Self::CutCircuits(_) => "CutCircuits",
-            Self::SolderingProofReady(_) => "SolderingProofReady",
-            Self::GraphSetupAck(_) => "GraphSetupAck",
-            Self::VerifierGraphParamsEndorsement(_) => "VerifierGraphParamsEndorsement",
-            Self::NonceGeneration(_) => "NonceGeneration",
-            Self::AggNonceConsensus(_) => "AggNonceConsensus",
-            Self::CommitteePresign(_) => "CommitteePresign",
-            Self::EndorseGraph(_) => "EndorseGraph",
-            Self::GraphFinalize(_) => "GraphFinalize",
-            Self::PeginConfirmNonce(_) => "PeginConfirmNonce",
-            Self::PeginConfirmNonceConsensus(_) => "PeginConfirmNonceConsensus",
-            Self::PeginConfirmPartialSig(_) => "PeginConfirmPartialSig",
-            Self::PostReady(_) => "PostReady",
-            Self::KickoffReady(_) => "KickoffReady",
-            Self::KickoffSent(_) => "KickoffSent",
-            Self::PreKickoffSent(_) => "PreKickoffSent",
-            Self::ChallengeSent(_) => "ChallengeSent",
-            Self::WatchtowerChallengeInitSent(_) => "WatchtowerChallengeInitSent",
-            Self::WatchtowerChallengeSent(_) => "WatchtowerChallengeSent",
-            Self::WatchtowerChallengeTimeout(_) => "WatchtowerChallengeTimeout",
-            Self::NackReady(_) => "NackReady",
-            Self::OperatorCommitPubinReady(_) => "OperatorCommitPubinReady",
-            Self::OperatorCommitPubinTimeout(_) => "OperatorCommitPubinTimeout",
-            Self::AssertReady(_) => "AssertReady",
-            Self::AssertSent(_) => "AssertSent",
-            Self::ChallengeAssertSent(_) => "ChallengeAssertSent",
-            Self::WronglyChallengeTimeout(_) => "WronglyChallengeTimeout",
-            Self::DisproveSent(_) => "DisproveSent",
-            Self::Take1Ready(_) => "Take1Ready",
-            Self::Take1Sent(_) => "Take1Sent",
-            Self::Take2Ready(_) => "Take2Ready",
-            Self::Take2Sent(_) => "Take2Sent",
-            Self::RequestNodeInfo(_) => "RequestNodeInfo",
-            Self::ResponseNodeInfo(_) => "ResponseNodeInfo",
-            Self::SyncGraphRequest(_) => "SyncGraphRequest",
-            Self::SyncGraph(_) => "SyncGraph",
-            Self::InstanceDiscarded(_) => "InstanceDiscarded",
-            Self::Tick => "Tick",
-        }
+        self.kind().into()
     }
 
-    fn pegin_retry_business_id(&self) -> Option<Uuid> {
+    pub fn qualifier(&self) -> MessageQualifier {
         match self {
-            Self::PeginRequest(message) => Some(message.instance_id),
-            Self::ConfirmInstance(message) => Some(message.instance_id),
-            Self::CreateGraph(message) => Some(message.graph_id),
-            Self::InitGraph(message) => Some(message.graph_id),
-            Self::GenCircuits(message) => Some(message.graph_id),
-            Self::CutCircuits(message) => Some(message.graph_id),
-            Self::SolderingProofReady(message) => Some(message.graph_id),
-            Self::VerifierGraphParamsEndorsement(message) => Some(message.graph_id),
-            Self::NonceGeneration(message) => Some(message.graph_id),
-            Self::AggNonceConsensus(message) => Some(message.graph_id),
-            Self::CommitteePresign(message) => Some(message.graph_id),
-            Self::EndorseGraph(message) => Some(message.graph_id),
-            Self::GraphFinalize(message) => Some(message.graph_id),
-            Self::PeginConfirmNonce(message) => Some(message.instance_id),
-            Self::PeginConfirmNonceConsensus(message) => Some(message.instance_id),
-            Self::PeginConfirmPartialSig(message) => Some(message.instance_id),
-            Self::PostReady(message) => Some(message.instance_id),
-            _ => None,
+            Self::WatchtowerChallengeSent(message) => {
+                MessageQualifier::Watchtower(message.watchtower_index)
+            }
+            Self::ChallengeAssertSent(message) => {
+                MessageQualifier::Verifier(message.verifier_index)
+            }
+            Self::WronglyChallengeTimeout(message) => {
+                MessageQualifier::Verifier(message.verifier_index)
+            }
+            Self::DisproveSent(message) => {
+                MessageQualifier::Disprove { kind: message.disprove_type, index: message.index }
+            }
+            _ => MessageQualifier::Singleton,
         }
     }
 }
@@ -505,30 +616,6 @@ fn is_retryable_sqlite_error(error: &anyhow::Error) -> bool {
             || message.contains("database is busy")
             || message.contains("sqlite_busy")
     })
-}
-
-fn is_pegin_message_type(message_type: &str) -> bool {
-    matches!(
-        message_type,
-        "PeginRequest"
-            | "ConfirmInstance"
-            | "CreateGraph"
-            | "InitGraph"
-            | "GenCircuits"
-            | "CutCircuits"
-            | "SolderingProof"
-            | "SolderingProofReady"
-            | "VerifierGraphParamsEndorsement"
-            | "NonceGeneration"
-            | "AggNonceConsensus"
-            | "CommitteePresign"
-            | "EndorseGraph"
-            | "GraphFinalize"
-            | "PeginConfirmNonce"
-            | "PeginConfirmNonceConsensus"
-            | "PeginConfirmPartialSig"
-            | "PostReady"
-    )
 }
 
 /// Pegin
@@ -1076,7 +1163,7 @@ async fn enqueue_p2p_message(
     let message_id = hex::encode(&id.0);
     let inbox_message = P2pInboxMessage {
         message_id: message_id.clone(),
-        business_id: decoded.content.pegin_retry_business_id(),
+        business_id: decoded.content.business_ref().primary_id(),
         actor: actor.to_string(),
         from_peer: from_peer_id.to_string(),
         msg_type: decoded.content.event_type().to_owned(),
@@ -1352,35 +1439,20 @@ async fn handle_p2p_inbox_messages(
                 continue;
             }
         };
-        let is_heavy_task_message = is_heavy_task_message_type(&message.msg_type, &actor);
-        let heavy_task = if is_heavy_task_message {
-            let decoded = match GOATMessage::deserialize_message(&message.content).await {
-                Ok(message) => message,
-                Err(error) => {
-                    fail_p2p_inbox_without_aborting_batch(
-                        local_db,
-                        &message.message_id,
-                        &message.lease_token,
-                        &error.to_string(),
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            let Some(task) = heavy_task_from_content(decoded.content(), &actor) else {
+        let decoded = match GOATMessage::deserialize_message(&message.content).await {
+            Ok(message) => message,
+            Err(error) => {
                 fail_p2p_inbox_without_aborting_batch(
                     local_db,
                     &message.message_id,
                     &message.lease_token,
-                    &format!("inbox message type does not match {} content", message.msg_type),
+                    &error.to_string(),
                 )
                 .await;
                 continue;
-            };
-            Some(task)
-        } else {
-            None
+            }
         };
+        let heavy_task = heavy_task_from_content(decoded.content(), &actor);
 
         if let Some(heavy_task) = heavy_task {
             let local_db = local_db.clone();
@@ -1391,7 +1463,8 @@ async fn handle_p2p_inbox_messages(
             let message_id = message.message_id.clone();
             let lease_token = message.lease_token.clone();
             let attempt_count = message.attempt_count;
-            let task_type = heavy_task.message_type();
+            let task_type = message.msg_type.clone();
+            let task_type_for_task = task_type.clone();
             let task_kind = heavy_task.kind();
             let graph_id = heavy_task.graph_id();
             let Some(permit) = try_acquire_heavy_task_permit(&message_id, &lease_token) else {
@@ -1450,7 +1523,7 @@ async fn handle_p2p_inbox_messages(
                             return;
                         }
                         metrics_state.record_message_dispatch(
-                            task_type,
+                            &task_type_for_task,
                             if result.is_ok() { "success" } else { "failed" },
                         );
                         if let Err(error) = finish_p2p_inbox_attempt(
@@ -1458,7 +1531,7 @@ async fn handle_p2p_inbox_messages(
                             &metrics_state,
                             &message_id,
                             &lease_token,
-                            task_type,
+                            &task_type_for_task,
                             attempt_count,
                             result,
                         )
@@ -1480,13 +1553,13 @@ async fn handle_p2p_inbox_messages(
                         }
                     }
                     DispatchExecution::Panicked(detail) => {
-                        metrics_state.record_message_dispatch(task_type, "failed");
+                        metrics_state.record_message_dispatch(&task_type_for_task, "failed");
                         tracing::error!(
                             event = "heavy_task_panic",
                             outcome = "node_shutdown",
                             message_id,
                             graph_id = %graph_id,
-                            message_type = task_type,
+                            message_type = %task_type_for_task,
                             task_kind,
                             detail,
                             "heavy task panicked; recorded an abandon and stopping the node"
@@ -1507,7 +1580,7 @@ async fn handle_p2p_inbox_messages(
                 outcome = "heavy_task_started",
                 message_id = %message.message_id,
                 graph_id = %graph_id,
-                message_type = task_type,
+                message_type = %task_type,
                 task_kind,
                 "started background heavy task"
             );
@@ -1529,7 +1602,7 @@ async fn handle_p2p_inbox_messages(
 
         // Keep the deeply nested dispatch future out of the enclosing task's
         // inline state machine.
-        let dispatch: BoxedDispatch<'_> = Box::pin(recv_and_dispatch(
+        let dispatch: BoxedDispatch<'_> = Box::pin(dispatch_decoded_p2p_message(
             swarm,
             local_db,
             btc_client,
@@ -1539,7 +1612,7 @@ async fn handle_p2p_inbox_messages(
             actor.clone(),
             from_peer_id,
             raw_message_id,
-            &message.content,
+            decoded,
             metrics_state,
         ));
         let result = match supervise_dispatch(dispatch, shutdown).await {
@@ -1934,7 +2007,9 @@ pub async fn handle_self_p2p_msg(
                 let requested_retry_delay =
                     p2p_retryable_dispatch_error(&err).and_then(|(_, delay)| delay);
                 let lock_time: i64 = requested_retry_delay.unwrap_or_else(|| {
-                    if is_transient && is_pegin_message_type(&message.msg_type) {
+                    if is_transient
+                        && MessageKind::from_str(&message.msg_type).is_ok_and(MessageKind::is_pegin)
+                    {
                         TRANSIENT_PEGIN_RETRY_DELAY_SECS as i64
                     } else {
                         LOCAL_MESSAGE_RETRY_DELAY_SECS
@@ -2272,7 +2347,6 @@ pub async fn send_to_peer(
 
 pub async fn push_local_unhandled_messages_with_reason(
     local_db: &LocalDB,
-    business_id: Uuid,
     message: &GOATMessage,
     delay_secs: usize,
     reason: MessageDeferReason,
@@ -2281,8 +2355,10 @@ pub async fn push_local_unhandled_messages_with_reason(
     let mut storage_processor = local_db.start_immediate_transaction().await?;
     let actor = message.actor.clone();
     let content: GOATMessageContent = message.content().clone();
+    let key = LocalMessageKey::from_content(actor.clone(), &content)?;
+    let business_id = key.business_id();
     let message_type = message.content.event_type();
-    let target_message_id = generate_message_id(business_id, message_type.to_owned(), None);
+    let target_message_id = key.message_id();
     let active_claim = ACTIVE_LOCAL_MESSAGE_CLAIM
         .try_with(|claim| (claim.message_id.clone(), claim.message_version))
         .ok();
@@ -2318,8 +2394,6 @@ pub async fn push_local_unhandled_messages_with_reason(
         let upserted = upsert_message(
             &mut storage_processor,
             true,
-            business_id,
-            None,
             SELF_SENDER.to_string(),
             actor,
             content,
@@ -2406,7 +2480,6 @@ pub(crate) async fn get_graph_or_defer(
             let delay_secs: usize = 60; // 1 min default retry
             if let Err(error) = push_local_unhandled_messages_with_reason(
                 local_db,
-                graph_id,
                 message,
                 delay_secs,
                 MessageDeferReason::GraphSyncPending,
@@ -2519,11 +2592,13 @@ mod tests {
     #[tokio::test]
     async fn non_owner_requeue_reports_processing_conflict() {
         let local_db = store::create_local_db("sqlite::memory:").await;
-        let business_id = Uuid::new_v4();
-        let message = GOATMessage::new(Actor::Operator, GOATMessageContent::Tick);
+        let instance_id = Uuid::new_v4();
+        let message = GOATMessage::new(
+            Actor::Operator,
+            GOATMessageContent::PostReady(PostReady { instance_id }),
+        );
         push_local_unhandled_messages_with_reason(
             &local_db,
-            business_id,
             &message,
             0,
             MessageDeferReason::HandlerError,
@@ -2549,7 +2624,6 @@ mod tests {
 
         let error = push_local_unhandled_messages_with_reason(
             &local_db,
-            business_id,
             &message,
             30,
             MessageDeferReason::HandlerError,
@@ -2571,23 +2645,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_requeue_uses_exact_subtyped_message_id() {
+    async fn owner_requeue_uses_content_derived_message_id() {
         let local_db = store::create_local_db("sqlite::memory:").await;
-        let business_id = Uuid::new_v4();
-        let message = GOATMessage::new(Actor::Operator, GOATMessageContent::Tick);
-        let subtyped_message_id = generate_message_id(
-            business_id,
-            message.content.event_type().to_owned(),
-            Some("7".to_owned()),
+        let instance_id = Uuid::new_v4();
+        let message = GOATMessage::new(
+            Actor::Operator,
+            GOATMessageContent::PostReady(PostReady { instance_id }),
         );
+        let message_id = LocalMessageKey::from_content(message.actor.clone(), &message.content)
+            .unwrap()
+            .message_id();
         {
             let mut storage = local_db.acquire().await.unwrap();
             assert!(
                 upsert_message(
                     &mut storage,
                     false,
-                    business_id,
-                    Some("7".to_owned()),
                     SELF_SENDER.to_owned(),
                     message.actor.clone(),
                     message.content.clone(),
@@ -2613,7 +2686,7 @@ mod tests {
                 .pop()
                 .unwrap()
         };
-        assert_eq!(claimed.message_id, subtyped_message_id);
+        assert_eq!(claimed.message_id, message_id);
 
         ACTIVE_LOCAL_MESSAGE_CLAIM
             .scope(
@@ -2623,7 +2696,6 @@ mod tests {
                 },
                 push_local_unhandled_messages_with_reason(
                     &local_db,
-                    business_id,
                     &message,
                     30,
                     MessageDeferReason::HandlerError,
@@ -2634,10 +2706,7 @@ mod tests {
             .unwrap();
 
         let mut storage = local_db.acquire().await.unwrap();
-        let stored = storage.find_messages_by_id(&subtyped_message_id).await.unwrap().unwrap();
+        let stored = storage.find_messages_by_id(&message_id).await.unwrap().unwrap();
         assert_eq!(stored.state, MessageState::Pending.to_string());
-        let base_message_id =
-            generate_message_id(business_id, message.content.event_type().to_owned(), None);
-        assert!(storage.find_messages_by_id(&base_message_id).await.unwrap().is_none());
     }
 }
