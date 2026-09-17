@@ -114,3 +114,97 @@ fn business_ref_scope(variant: &Variant) -> Result<String> {
         Err(syn::Error::new(attribute.span(), "business_ref must be graph, instance, or unscoped"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn expand_error(input: DeriveInput) -> String {
+        expand_message_business_ref(input).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn rejects_non_enum_input() {
+        let input = parse_quote! {
+            struct Message;
+        };
+
+        assert_eq!(expand_error(input), "MessageBusinessRef can only be derived for enums");
+    }
+
+    #[test]
+    fn requires_a_business_ref_scope_for_every_variant() {
+        let input = parse_quote! {
+            enum Message {
+                Missing(Payload),
+            }
+        };
+
+        assert_eq!(
+            expand_error(input),
+            "each message variant must declare #[business_ref(graph)], #[business_ref(instance)], or #[business_ref(unscoped)]"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_scopes() {
+        let invalid = parse_quote! {
+            enum Message {
+                #[business_ref(other)]
+                Invalid(Payload),
+            }
+        };
+        assert_eq!(expand_error(invalid), "business_ref must be graph, instance, or unscoped");
+
+        let duplicate = parse_quote! {
+            enum Message {
+                #[business_ref(graph)]
+                #[business_ref(instance)]
+                Duplicate(Payload),
+            }
+        };
+        assert_eq!(expand_error(duplicate), "duplicate business_ref attribute");
+    }
+
+    #[test]
+    fn graph_and_instance_scopes_require_one_tuple_payload() {
+        let named = parse_quote! {
+            enum Message {
+                #[business_ref(graph)]
+                Graph { payload: Payload },
+            }
+        };
+        assert_eq!(
+            expand_error(named),
+            "graph and instance business references require exactly one payload field"
+        );
+
+        let multiple = parse_quote! {
+            enum Message {
+                #[business_ref(instance)]
+                Instance(Payload, Payload),
+            }
+        };
+        assert_eq!(
+            expand_error(multiple),
+            "graph and instance business references require exactly one payload field"
+        );
+    }
+
+    #[test]
+    fn accepts_all_unscoped_variant_shapes() {
+        let input = parse_quote! {
+            enum Message {
+                #[business_ref(unscoped)]
+                Unit,
+                #[business_ref(unscoped)]
+                Tuple(u8, u16),
+                #[business_ref(unscoped)]
+                Named { value: u8 },
+            }
+        };
+
+        assert!(expand_message_business_ref(input).is_ok());
+    }
+}
